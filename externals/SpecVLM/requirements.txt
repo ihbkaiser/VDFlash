@@ -1,0 +1,6 @@
+transformers==4.48.0
+datasets
+accelerate
+numpy
+qwen-vl-utils==0.0.10 
+av==14.0.0

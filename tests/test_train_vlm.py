@@ -1,0 +1,536 @@
+from types import MethodType, SimpleNamespace
+
+import torch
+import pytest
+
+from src.train_VLM.data import (
+    build_masked_blocks,
+    make_anchor_generator,
+    make_dense_attention_mask,
+    sample_anchor_positions,
+    select_context_positions,
+)
+from src.train_VLM.decode import speculative_decode
+from src.train_VLM.config import DFlashTrainConfig
+from src.train_VLM.losses import weighted_block_cross_entropy
+from src.train_VLM.model import DFlashVLMModel, MultiModalRotaryEmbedding
+from src.train_VLM.target import Qwen25VLTargetAdapter
+from src.train_VLM.trainer import (
+    load_draft_checkpoint,
+    make_draft_model,
+    save_draft_checkpoint,
+    train_records,
+)
+from src.train_VLM.vlm_decode import Qwen25VLDFlashDecoder
+
+
+def tiny_text_config():
+    return SimpleNamespace(
+        hidden_size=32,
+        intermediate_size=64,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        attention_bias=True,
+        rms_norm_eps=1e-6,
+        hidden_act="silu",
+        initializer_range=0.02,
+        rope_theta=10000.0,
+        rope_parameters={"rope_theta": 10000.0, "mrope_section": [2, 1, 1]},
+    )
+
+
+def test_anchor_blocks_and_causal_context():
+    ids = torch.arange(30)
+    position_ids = torch.arange(30).view(1, 1, 30).expand(3, 1, 30)
+    anchors = sample_anchor_positions(
+        5, 25, 4, 3, generator=torch.Generator().manual_seed(7)
+    )
+    blocks = build_masked_blocks(
+        ids, anchors, block_size=4, mask_token_id=99, position_ids=position_ids
+    )
+    assert torch.equal(blocks.block_input_ids[:, 0], ids[anchors])
+    assert torch.all(blocks.block_input_ids[:, 1:] == 99)
+    assert torch.all(blocks.labels[:, 0] == -100)
+    assert blocks.block_position_ids.shape == (3, 1, 12)
+    mask = make_dense_attention_mask(anchors, torch.arange(30), block_size=4)[0, 0]
+    for block, anchor in enumerate(anchors.tolist()):
+        rows = mask[block * 4 : block * 4 + 4]
+        assert torch.all(rows[:, :anchor])
+        assert not torch.any(rows[:, anchor:30])
+        own = rows[:, 30 + block * 4 : 30 + (block + 1) * 4]
+        assert torch.all(own)
+        other = torch.cat([rows[:, 30 : 30 + block * 4], rows[:, 30 + (block + 1) * 4 :]], dim=1)
+        assert not torch.any(other)
+
+
+def test_weighted_loss_prefers_first_prediction():
+    labels = torch.tensor([[[1, 2, 3]]])
+    logits = torch.zeros(1, 1, 3, 5)
+    logits[0, 0, 0, 1] = 10
+    loss, metrics = weighted_block_cross_entropy(logits, labels, decay=7)
+    assert metrics["valid_tokens"] == 3
+    assert torch.isfinite(loss)
+
+
+def test_dflash_tiny_forward_and_backward():
+    config = tiny_text_config()
+    model = DFlashVLMModel(config, num_draft_layers=2, num_target_features=2, block_size=4)
+    anchors = torch.tensor([3, 5])
+    context_pos = torch.arange(12).view(1, 1, 12).expand(3, 1, 12)
+    block_pos = torch.arange(8).view(1, 1, 8).expand(3, 1, 8)
+    output = model(
+        noise_embeddings=torch.randn(1, 8, 32),
+        target_context=torch.randn(1, 12, 64),
+        context_position_ids=context_pos,
+        block_position_ids=block_pos,
+        anchors=anchors,
+        context_original_positions=torch.arange(12),
+        use_flex_attention=False,
+    )
+    assert output.shape == (1, 8, 32)
+    output.square().mean().backward()
+    assert model.fc.weight.grad is not None
+
+
+def test_draft_context_kv_cache_only_grows_with_new_target_context():
+    config = tiny_text_config()
+    model = DFlashVLMModel(config, num_draft_layers=2, num_target_features=2, block_size=4).eval()
+    first_context = torch.randn(1, 6, 64)
+    first_positions = torch.arange(6).view(1, 1, 6).expand(3, 1, 6)
+    first_hidden, cache = model(
+        noise_embeddings=torch.randn(1, 4, 32),
+        target_context=first_context,
+        context_position_ids=first_positions,
+        block_position_ids=torch.arange(4).view(1, 1, 4).expand(3, 1, 4),
+        anchors=torch.tensor([5]),
+        context_original_positions=torch.arange(6),
+        use_flex_attention=False,
+        return_draft_context_cache=True,
+    )
+    assert first_hidden.shape == (1, 4, 32)
+    assert [item[0].shape[2] for item in cache] == [6, 6]
+    second_context = torch.cat([first_context, torch.randn(1, 2, 64)], dim=1)
+    second_positions = torch.arange(8).view(1, 1, 8).expand(3, 1, 8)
+    second_hidden, grown_cache = model(
+        noise_embeddings=torch.randn(1, 4, 32),
+        target_context=second_context,
+        context_position_ids=second_positions,
+        block_position_ids=torch.arange(4, 8).view(1, 1, 4).expand(3, 1, 4),
+        anchors=torch.tensor([7]),
+        context_original_positions=torch.arange(8),
+        use_flex_attention=False,
+        draft_context_cache=cache,
+        return_draft_context_cache=True,
+    )
+    assert second_hidden.shape == (1, 4, 32)
+    assert [item[0].shape[2] for item in grown_cache] == [8, 8]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA FlexAttention integration test")
+def test_cuda_flex_attention_gqa_forward_and_backward():
+    config = SimpleNamespace(
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        attention_bias=True,
+        rms_norm_eps=1e-6,
+        hidden_act="silu",
+        initializer_range=0.02,
+        rope_theta=10000.0,
+        rope_parameters={"rope_theta": 10000.0, "mrope_section": [4, 2, 2]},
+    )
+    model = DFlashVLMModel(
+        config,
+        num_draft_layers=2,
+        num_target_features=2,
+        block_size=16,
+        compile_flex_attention=True,
+    ).cuda().train()
+    output = model(
+        noise_embeddings=torch.randn(1, 32, 64, device="cuda"),
+        target_context=torch.randn(1, 32, 128, device="cuda"),
+        context_position_ids=torch.arange(32, device="cuda").view(1, 1, 32).expand(3, 1, 32),
+        block_position_ids=torch.arange(32, device="cuda").view(1, 1, 32).expand(3, 1, 32),
+        anchors=torch.tensor([3, 20], device="cuda"),
+        context_original_positions=torch.arange(32, device="cuda"),
+        use_flex_attention=True,
+    )
+    output.square().mean().backward()
+    assert output.shape == (1, 32, 64)
+    assert model.fc.weight.grad is not None
+
+
+def test_callback_decoder_keeps_target_posterior():
+    def draft(prefix, count):
+        return torch.ones(count, dtype=torch.long)
+
+    def verify(prefix, proposals):
+        # Target agrees with every proposal and emits token 2 as the bonus.
+        logits = torch.full((proposals.numel() + 1, 4), -10.0)
+        logits[:-1, 1] = 10.0
+        logits[-1, 2] = 10.0
+        return logits
+
+    output, stats = speculative_decode(
+        torch.tensor([0]),
+        draft_propose=draft,
+        target_verify=verify,
+        max_new_tokens=3,
+        block_size=3,
+    )
+    assert output.tolist() == [0, 1, 1, 2]
+    assert stats.mean_acceptance_length == 3
+
+
+def test_callback_decoder_never_emits_after_eos():
+    def draft(prefix, count):
+        return torch.tensor([1, 2][:count])
+
+    def verify(prefix, proposals):
+        logits = torch.full((proposals.numel() + 1, 5), -10.0)
+        for index, token_id in enumerate(proposals.tolist()):
+            logits[index, token_id] = 10.0
+        logits[-1, 3] = 10.0  # Would be a bonus after EOS without truncation.
+        return logits
+
+    output, stats = speculative_decode(
+        torch.tensor([0]),
+        draft_propose=draft,
+        target_verify=verify,
+        max_new_tokens=3,
+        block_size=3,
+        stop_token_ids=[2],
+    )
+    assert output.tolist() == [0, 1, 2]
+    assert stats.acceptance_lengths == [2]
+
+
+def test_anchor_sampling_is_order_independent_per_epoch_and_id():
+    def anchors_for(sample_id):
+        return sample_anchor_positions(
+            10,
+            100,
+            16,
+            8,
+            generator=make_anchor_generator(42, 3, sample_id),
+        )
+
+    a_first = anchors_for("sample-a")
+    _ = anchors_for("sample-b")
+    a_second = anchors_for("sample-a")
+    assert torch.equal(a_first, a_second)
+    assert not torch.equal(a_first, sample_anchor_positions(
+        10, 100, 16, 8, generator=make_anchor_generator(42, 4, "sample-a")
+    ))
+
+
+def test_text_only_context_keeps_boundaries_and_drops_visual_placeholders():
+    tokens = torch.tensor([11, 98, 96, 99, 97, 12])
+    retained = select_context_positions(
+        tokens,
+        context_mode="text_only",
+        image_token_ids={98},
+        video_token_ids={99},
+    )
+    assert retained.tolist() == [0, 2, 4, 5]
+
+
+def test_mrope_supports_different_query_and_key_lengths():
+    rotary = MultiModalRotaryEmbedding(tiny_text_config())
+    query = torch.randn(1, 4, 3, 8)
+    key = torch.randn(1, 2, 5, 8)
+    query_positions = torch.arange(3).view(1, 1, 3).expand(3, 1, 3)
+    key_positions = torch.arange(5).view(1, 1, 5).expand(3, 1, 5)
+    rotated_query, rotated_key = rotary.apply(query, key, query_positions, key_positions)
+    assert rotated_query.shape == query.shape
+    assert rotated_key.shape == key.shape
+    assert torch.isfinite(rotated_query).all() and torch.isfinite(rotated_key).all()
+
+
+def test_multimodal_position_ids_fail_closed_without_qwen_rope_api():
+    adapter = object.__new__(Qwen25VLTargetAdapter)
+    adapter.model = SimpleNamespace()
+    adapter.device = torch.device("cpu")
+    with pytest.raises(RuntimeError, match="3-axis M-RoPE"):
+        adapter._compute_position_ids(
+            {
+                "input_ids": torch.tensor([[1, 2]]),
+                "pixel_values": torch.randn(1, 3, 2, 2),
+            }
+        )
+
+
+def test_prepared_sequence_is_not_silently_truncated():
+    class Processor:
+        def apply_chat_template(self, *args, **kwargs):
+            return {"input_ids": torch.tensor([[1, 2, 3]])}
+
+    adapter = object.__new__(Qwen25VLTargetAdapter)
+    adapter.processor = Processor()
+    adapter.device = torch.device("cpu")
+    adapter.validate_record_provenance = MethodType(lambda self, record: None, adapter)
+    record = {
+        "id": "long",
+        "messages": [{"role": "user", "content": "x"}],
+        "target_response": {
+            "token_ids": [4, 5, 6],
+            "text": "x",
+            "generation": {"do_sample": False},
+        },
+    }
+    with pytest.raises(ValueError, match="not truncated"):
+        adapter.prepare_record(record, max_seq_length=5)
+
+
+def test_tiny_qwen25vl_decoder_uses_target_cache():
+    transformers = __import__("transformers")
+    if not hasattr(transformers, "Qwen2_5_VLForConditionalGeneration"):
+        import pytest
+
+        pytest.skip("Qwen2.5-VL is unavailable in this Transformers build")
+    from transformers import Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration
+
+    target_config = Qwen2_5_VLConfig(
+        text_config={
+            "vocab_size": 100,
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_hidden_layers": 8,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 4,
+            "rope_parameters": {"mrope_section": [1, 1, 0], "rope_theta": 1_000_000},
+            "pad_token_id": 0,
+        },
+        vision_config={
+            "depth": 2,
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_heads": 2,
+            "out_hidden_size": 16,
+            "spatial_merge_size": 1,
+            "patch_size": 2,
+            "temporal_patch_size": 1,
+        },
+        image_token_id=98,
+        video_token_id=99,
+        vision_start_token_id=96,
+        vision_end_token_id=97,
+    )
+    target = Qwen2_5_VLForConditionalGeneration(target_config)
+
+    class Tokenizer:
+        all_special_ids = [0, 96, 97]
+        name_or_path = "tiny-qwen25vl"
+
+        def __len__(self):
+            return 90
+
+        def get_vocab(self):
+            return {str(index): index for index in range(90)}
+
+    class Processor:
+        tokenizer = Tokenizer()
+
+    adapter = Qwen25VLTargetAdapter(target, Processor(), device=torch.device("cpu"))
+    config = DFlashTrainConfig(
+        target_model="tiny-qwen25vl",
+        block_size=4,
+        num_draft_layers=2,
+        num_target_features=5,
+        mixed_precision="no",
+        use_flex_attention=False,
+    )
+    adapter.freeze()
+    draft = make_draft_model(adapter, config)
+    decoder = Qwen25VLDFlashDecoder(adapter, draft, config)
+    prompt = torch.tensor([[3, 4, 5]])
+    inputs = {
+        "input_ids": prompt,
+        "attention_mask": torch.ones_like(prompt),
+        "position_ids": torch.arange(3).view(1, 1, -1).expand(3, 1, -1),
+    }
+    result = decoder.generate(inputs, max_new_tokens=5)
+    assert result.output_ids.shape == (1, 8)
+    assert sum(result.acceptance_lengths) >= 3
+    assert result.target_forward_calls == len(result.acceptance_lengths) + 1
+    assert result.num_output_tokens == 5
+    assert result.end_to_end_latency_s >= result.prefill_latency_s
+
+
+def test_draft_checkpoint_round_trip_validates_processor_contract(tmp_path):
+    transformers = __import__("transformers")
+    if not hasattr(transformers, "Qwen2_5_VLForConditionalGeneration"):
+        pytest.skip("Qwen2.5-VL is unavailable in this Transformers build")
+    from transformers import Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration
+
+    target = Qwen2_5_VLForConditionalGeneration(
+        Qwen2_5_VLConfig(
+            text_config={
+                "vocab_size": 100,
+                "hidden_size": 16,
+                "intermediate_size": 32,
+                "num_hidden_layers": 8,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 4,
+                "rope_parameters": {"mrope_section": [1, 1, 0], "rope_theta": 1_000_000},
+                "pad_token_id": 0,
+            },
+            vision_config={
+                "depth": 2,
+                "hidden_size": 16,
+                "intermediate_size": 32,
+                "num_heads": 2,
+                "out_hidden_size": 16,
+                "spatial_merge_size": 1,
+                "patch_size": 2,
+                "temporal_patch_size": 1,
+            },
+            image_token_id=98,
+            video_token_id=99,
+        )
+    )
+
+    class Tokenizer:
+        all_special_ids = [0]
+        name_or_path = "tiny-qwen25vl"
+
+        def __len__(self):
+            return 90
+
+        def get_vocab(self):
+            return {str(index): index for index in range(90)}
+
+    class Processor:
+        tokenizer = Tokenizer()
+
+    adapter = Qwen25VLTargetAdapter(target, Processor(), device=torch.device("cpu"))
+    adapter.requested_model = "tiny-qwen25vl"
+    adapter.requested_revision = None
+    config = DFlashTrainConfig(
+        target_model="tiny-qwen25vl",
+        block_size=4,
+        num_draft_layers=2,
+        num_target_features=5,
+        mixed_precision="no",
+        use_flex_attention=False,
+    )
+    draft = make_draft_model(adapter, config)
+    save_draft_checkpoint(tmp_path, draft, config, adapter, step=7)
+    restored = load_draft_checkpoint(tmp_path, adapter, config)
+    for key, value in draft.state_dict().items():
+        assert torch.equal(value, restored.state_dict()[key])
+    mismatched = DFlashTrainConfig(**(config.to_dict() | {"context_mode": "text_only"}))
+    with pytest.raises(ValueError, match="context_mode"):
+        load_draft_checkpoint(tmp_path, adapter, mismatched)
+
+
+def test_tiny_optimizer_step_exports_best_and_resumable_checkpoint(tmp_path):
+    transformers = __import__("transformers")
+    if not hasattr(transformers, "Qwen2_5_VLForConditionalGeneration"):
+        pytest.skip("Qwen2.5-VL is unavailable in this Transformers build")
+    from transformers import Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration
+
+    target = Qwen2_5_VLForConditionalGeneration(
+        Qwen2_5_VLConfig(
+            text_config={
+                "vocab_size": 100,
+                "hidden_size": 16,
+                "intermediate_size": 32,
+                "num_hidden_layers": 8,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 4,
+                "rope_parameters": {"mrope_section": [1, 1, 0], "rope_theta": 1_000_000},
+                "pad_token_id": 0,
+            },
+            vision_config={
+                "depth": 2,
+                "hidden_size": 16,
+                "intermediate_size": 32,
+                "num_heads": 2,
+                "out_hidden_size": 16,
+                "spatial_merge_size": 1,
+                "patch_size": 2,
+                "temporal_patch_size": 1,
+            },
+            image_token_id=98,
+            video_token_id=99,
+        )
+    )
+
+    class Tokenizer:
+        all_special_ids = [0]
+        name_or_path = "tiny-qwen25vl"
+
+        def __len__(self):
+            return 90
+
+        def get_vocab(self):
+            return {str(index): index for index in range(90)}
+
+    class Processor:
+        tokenizer = Tokenizer()
+
+        def apply_chat_template(self, *args, **kwargs):
+            return {"input_ids": torch.tensor([[3, 4, 5]])}
+
+    adapter = Qwen25VLTargetAdapter(target, Processor(), device=torch.device("cpu"))
+    adapter.requested_model = "tiny-qwen25vl"
+    adapter.requested_revision = None
+    config = DFlashTrainConfig(
+        target_model="tiny-qwen25vl",
+        block_size=4,
+        num_anchors=2,
+        anchor_chunk_size=2,
+        min_anchor_chunk_size=1,
+        num_draft_layers=2,
+        num_target_features=5,
+        mixed_precision="no",
+        use_flex_attention=False,
+        epochs=1,
+        gradient_accumulation_steps=1,
+        output_dir=str(tmp_path),
+        validation_manifest="provided-directly",
+    )
+    record = {
+        "id": "train-one",
+        "messages": [{"role": "user", "content": "x"}],
+        "target_response": {
+            "token_ids": [6, 7, 8, 9],
+            "text": "x",
+            "generation": {"do_sample": False},
+        },
+        "provenance": adapter.target_provenance(),
+    }
+    draft = make_draft_model(adapter, config)
+    history = train_records(
+        adapter,
+        draft,
+        [record],
+        config,
+        validation_records=[record],
+    )
+    assert history[0]["usable_records"] == 1
+    assert "validation_accepted_prefix" in history[0]
+    assert all(not parameter.requires_grad for parameter in adapter.model.parameters())
+    assert any(parameter.grad is not None for parameter in draft.parameters())
+    assert (tmp_path / "best" / "model.safetensors").exists()
+    checkpoint_dirs = list((tmp_path / "checkpoints").iterdir())
+    assert len(checkpoint_dirs) == 1
+    assert (checkpoint_dirs[0] / "trainer_state.pt").exists()
+    resumed_config = DFlashTrainConfig(
+        **(config.to_dict() | {"epochs": 2, "resume_from_checkpoint": str(checkpoint_dirs[0])})
+    )
+    resumed_history = train_records(
+        adapter,
+        make_draft_model(adapter, resumed_config),
+        [record],
+        resumed_config,
+        validation_records=[record],
+    )
+    assert [item["epoch"] for item in resumed_history] == [1.0, 2.0]

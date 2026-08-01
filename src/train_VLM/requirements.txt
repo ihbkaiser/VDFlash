@@ -1,0 +1,11 @@
+# Requires Python 3.11. Qwen2.5-VL target and the PyTorch FlexAttention draft
+# implementation; install the CUDA 12.4 build of the pinned Torch release.
+# Install a CUDA-matched torch/torchvision pair first when using a GPU.
+torch>=2.6,<2.7
+transformers==4.57.1
+accelerate>=1.4,<2
+datasets>=3,<4
+safetensors>=0.5
+PyYAML>=6
+qwen-vl-utils>=0.0.10
+av>=14
