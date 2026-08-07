@@ -9,12 +9,14 @@ drafting, glimpsing hay video-token selector.
 
 Workflow mặc định:
 
-1. Stage 1: 68.000 mẫu thật từ
+1. Stage 1: hash-shuffle theo seed rồi lấy 68.000 hội thoại multi-turn thật từ
    [ShareGPT Vicuna unfiltered](https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered).
 2. Stage 2: 68.000 mẫu thật và ảnh từ
    [LLaVA Visual Instruct Pretrain LCS-558K](https://huggingface.co/datasets/liuhaotian/LLaVA-Pretrain).
-3. Target Qwen2.5-VL được freeze hoàn toàn. Cache teacher chứa raw-greedy
-   target responses, token/position IDs và 5 hidden layers đã chọn.
+3. Target Qwen2.5-VL được freeze hoàn toàn. Stage 1 dùng nguyên assistant
+   response cuối của ShareGPT, không append instruction và không generate lại;
+   cache chứa token/position IDs cùng 5 hidden layers đã chọn. Stage 2 vẫn dùng
+   raw-greedy target response theo preset multimodal riêng.
 4. Chỉ projection, 5 draft decoder layers và draft norms được train.
 5. Stage 2 khởi tạo trực tiếp từ final checkpoint của Stage 1.
 
@@ -23,10 +25,24 @@ Preset 8×B200 nằm tại:
 - `src/train_VLM/config_b200_8gpu_stage1_sharegpt.json`
 - `src/train_VLM/config_b200_8gpu_stage2_llava.json`
 
+Preset chạy đồng thời 3B trên GPU 0–3 và 7B trên GPU 4–7 nằm tại:
+
+- `src/train_VLM/config_b200_4gpu_3b_stage1_sharegpt.json`
+- `src/train_VLM/config_b200_4gpu_3b_stage2_llava.json`
+- `src/train_VLM/config_b200_4gpu_7b_stage1_sharegpt.json`
+- `src/train_VLM/config_b200_4gpu_7b_stage2_llava.json`
+
+Hai run dùng chung manifest/ảnh đã prepare, nhưng có teacher cache, checkpoint
+và output riêng. Mỗi preset 4 GPU đặt `gradient_accumulation_steps=16`, nên với
+`micro_batch_size=1` global batch vẫn là 64 records. `selected_target_layers`
+để `null` nhằm tự chọn đúng 5 layer theo kiến trúc local 3B hoặc 7B.
+
 Preset bám Appendix A.1 của DFlash: BF16, 6 epochs, LR `6e-4`, cosine schedule,
-warmup `0.04`, clip `1.0`, sequence length 3072, 512 anchors, block 16, loss
-decay 7, 5 draft layers và 5 target features. `micro_batch_size=1` và
-`gradient_accumulation_steps=8` cho global batch 64 records trên 8 GPU.
+warmup `0.04`, clip `1.0`, 512 anchors, block 16, loss decay 7, 5 draft layers
+và 5 target features. Phase 1 dùng `max_seq_length=2048`,
+`teacher_response_mode="dataset"`, `response_max_new_tokens=0`;
+`micro_batch_size=1` và `gradient_accumulation_steps=8` cho global batch 64
+records trên 8 GPU.
 
 ## 1. Cài môi trường
 
@@ -151,10 +167,11 @@ torchrun --standalone --nproc_per_node=8 \
 ```
 
 Cache lưu BF16 losslessly. Với hidden size 2048, 5 features và mọi sequence đều
-đạt 3072 tokens, upper bound xấp xỉ 4 TiB **mỗi stage**; dữ liệu thực thường
-thấp hơn nhưng vẫn cần dự trù storage ở quy mô TB. Giảm `max_seq_length`,
-`response_max_new_tokens`, `max_samples` hoặc `num_target_features` nếu không đủ
-dung lượng. Những thay đổi này phải nhất quán giữa cache và train.
+đạt giới hạn, upper bound xấp xỉ 2,7 TiB cho Stage 1 ở 2048 tokens và 4 TiB cho
+Stage 2 ở 3072 tokens; dữ liệu thực thường thấp hơn nhưng vẫn cần dự trù storage
+ở quy mô TB. Giảm `max_seq_length`, `max_samples` hoặc `num_target_features` nếu
+không đủ dung lượng. Với mode generate của Stage 2, cũng có thể giảm
+`response_max_new_tokens`. Những thay đổi này phải nhất quán giữa cache và train.
 
 ## 5. Full Stage 1 và exact resume
 

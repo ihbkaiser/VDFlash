@@ -51,14 +51,14 @@ run therefore materializes tens of images rather than downloading the complete
 558K archive. Pass `--no-selective-image-download` to require local media.
 
 `cache_teacher_features` is the only training step that loads the full target.
-By default it first generates a raw-greedy response from the frozen target for
-each real prompt (`teacher_response_mode=target_generate`), matching the DFlash
-paper's target-alignment recipe. A response that reaches its token/sequence
-budget is retained as an exact raw-greedy target prefix and marked truncated;
-enable `teacher_require_eos` only when complete responses are mandatory. Set
-`teacher_response_mode=dataset` only for an explicit ablation that uses the
-source response. It then caches clean token
-labels, three-axis positions,
+Stage 1 uses the final assistant response already present in each multi-turn
+ShareGPT record (`teacher_response_mode=dataset`); it does not append an
+instruction or ask the target VLM to regenerate that response. The full Stage 1
+presets set `max_seq_length=2048` and `response_max_new_tokens=0`. Stage 2 may
+independently use raw-greedy target generation; a generated response that
+reaches its token/sequence budget is retained as an exact prefix and marked
+truncated. Enable `teacher_require_eos` only when complete generated responses
+are mandatory. The cache contains clean token labels, three-axis positions,
 the configured selected hidden layers, context positions, truncation decisions,
 and source provenance in safetensors shards. It also exports only the frozen
 token embedding/LM-head matrix required by vanilla DFlash. `train_draft` then

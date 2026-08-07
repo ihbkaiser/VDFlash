@@ -249,7 +249,60 @@ class Qwen25VLTargetAdapter:
                     f"{recorded_commit!r} != {expected['target_commit']!r}"
                 )
 
+    def _set_input_sequence(
+        self,
+        inputs: dict[str, Any],
+        input_ids: torch.Tensor,
+    ) -> None:
+        """Replace a prompt with an appended text sequence and align its metadata."""
+
+        previous_ids = inputs.get("input_ids")
+        if not torch.is_tensor(previous_ids):
+            raise ValueError("processor inputs must contain tensor input_ids")
+        if previous_ids.ndim != input_ids.ndim or previous_ids.shape[:-1] != input_ids.shape[:-1]:
+            raise ValueError("replacement input_ids must preserve the processor batch dimensions")
+
+        previous_length = int(previous_ids.shape[-1])
+        sequence_length = int(input_ids.shape[-1])
+        if sequence_length < previous_length:
+            raise ValueError("replacement input_ids cannot be shorter than the processor prompt")
+
+        mm_token_type_ids = inputs.get("mm_token_type_ids")
+        if torch.is_tensor(mm_token_type_ids):
+            if (
+                mm_token_type_ids.ndim != input_ids.ndim
+                or mm_token_type_ids.shape[:-1] != input_ids.shape[:-1]
+            ):
+                raise ValueError("mm_token_type_ids must match the input_ids batch dimensions")
+            type_length = int(mm_token_type_ids.shape[-1])
+            if type_length == previous_length and type_length < sequence_length:
+                # Qwen assigns modality 0 to text. Responses appended to the
+                # multimodal prompt are always ordinary text tokens.
+                text_types = mm_token_type_ids.new_zeros(
+                    (*mm_token_type_ids.shape[:-1], sequence_length - type_length)
+                )
+                inputs["mm_token_type_ids"] = torch.cat(
+                    [mm_token_type_ids, text_types], dim=-1
+                )
+            elif type_length != sequence_length:
+                raise ValueError(
+                    "mm_token_type_ids length must match either the processor prompt "
+                    "or the replacement input_ids"
+                )
+
+        inputs["input_ids"] = input_ids
+        inputs["attention_mask"] = torch.ones_like(input_ids)
+
     def _compute_position_ids(self, inputs: dict[str, Any]) -> torch.Tensor:
+        input_ids = inputs.get("input_ids")
+        if torch.is_tensor(input_ids):
+            for key in ("attention_mask", "mm_token_type_ids"):
+                value = inputs.get(key)
+                if torch.is_tensor(value) and value.shape != input_ids.shape:
+                    raise ValueError(
+                        f"{key} shape {tuple(value.shape)} must match input_ids shape "
+                        f"{tuple(input_ids.shape)} before computing M-RoPE positions"
+                    )
         if "position_ids" in inputs and torch.is_tensor(inputs["position_ids"]):
             positions = inputs["position_ids"]
             if positions.ndim == 2:
@@ -338,7 +391,11 @@ class Qwen25VLTargetAdapter:
         messages = record["messages"]
         inputs, _ = self.prepare_messages(messages)
         prompt_ids = inputs["input_ids"]
-        response_tensor = torch.tensor(response_ids, dtype=prompt_ids.dtype).view(1, -1)
+        response_tensor = torch.tensor(
+            response_ids,
+            dtype=prompt_ids.dtype,
+            device=prompt_ids.device,
+        ).view(1, -1)
         response_start = int(prompt_ids.shape[1])
         if response_start >= max_seq_length:
             raise ValueError(
@@ -352,8 +409,7 @@ class Qwen25VLTargetAdapter:
             )
         if response_tensor.shape[1] < 2:
             raise ValueError(f"record {record.get('id')} has an empty/too-short response")
-        inputs["input_ids"] = full_ids
-        inputs["attention_mask"] = torch.ones_like(full_ids)
+        self._set_input_sequence(inputs, full_ids)
         inputs.pop("position_ids", None)
         inputs = _tensor_dict_to_device(inputs, self.device)
         position_ids = self._compute_position_ids(inputs)
@@ -389,14 +445,18 @@ class Qwen25VLTargetAdapter:
 
 def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
     records = []
-    for line_number, line in enumerate(Path(path).read_text().splitlines(), 1):
-        if not line.strip():
-            continue
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Invalid JSON at {path}:{line_number}") from exc
-        if not isinstance(value, dict):
-            raise ValueError(f"Manifest record must be an object at line {line_number}")
-        records.append(value)
+    # Iterate over physical JSONL lines. str.splitlines() also splits on Unicode
+    # separators such as U+2028/U+2029, which are valid inside JSON strings and
+    # occur in real ShareGPT conversations.
+    with Path(path).open(encoding="utf-8") as reader:
+        for line_number, line in enumerate(reader, 1):
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON at {path}:{line_number}") from exc
+            if not isinstance(value, dict):
+                raise ValueError(f"Manifest record must be an object at line {line_number}")
+            records.append(value)
     return records

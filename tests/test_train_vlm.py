@@ -1,4 +1,5 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
 from types import MethodType, SimpleNamespace
 
 import torch
@@ -17,8 +18,8 @@ from src.train_VLM.config import DFlashTrainConfig
 from src.train_VLM.cached_trainer import FrozenTargetTokenIO
 from src.train_VLM.losses import weighted_block_cross_entropy
 from src.train_VLM.model import DFlashVLMModel, MultiModalRotaryEmbedding, RMSNorm
-from src.train_VLM.teacher_cache import _generate_target_response_ids
-from src.train_VLM.target import Qwen25VLTargetAdapter
+from src.train_VLM.teacher_cache import _fit_clean_sequence, _generate_target_response_ids
+from src.train_VLM.target import Qwen25VLTargetAdapter, load_jsonl
 from src.train_VLM.trainer import (
     load_draft_checkpoint,
     make_draft_model,
@@ -27,7 +28,7 @@ from src.train_VLM.trainer import (
 )
 from src.train_VLM.vlm_decode import Qwen25VLDFlashDecoder
 from src.train_VLM.video import _apply_media_defaults
-from src.train_VLM.real_data import select_source_records
+from src.train_VLM.real_data import prepare_real_manifest, select_source_records
 
 
 def tiny_text_config():
@@ -138,6 +139,51 @@ def test_real_dataset_selection_is_deterministic_and_records_source_indices(tmp_
     assert all(records[source_index]["id"] == source_id for _, source_index, source_id in first)
 
 
+def test_concurrent_manifest_writers_never_publish_partial_jsonl(tmp_path):
+    records = [
+        {
+            "id": f"real-{index}",
+            "conversations": [
+                {"from": "human", "value": f"question {index}"},
+                {"from": "gpt", "value": (f"answer {index} " * 100).strip()},
+            ],
+        }
+        for index in range(32)
+    ]
+    annotation = tmp_path / "sharegpt.json"
+    annotation.write_text(json.dumps(records))
+    manifest = tmp_path / "shared" / "manifest.jsonl"
+    config = DFlashTrainConfig(
+        stage="text",
+        data_path=str(annotation),
+        prepared_manifest=str(manifest),
+        max_samples=32,
+        overwrite=True,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: prepare_real_manifest(config), range(2)))
+
+    assert all(result[0] == manifest for result in results)
+    parsed = [json.loads(line) for line in manifest.read_text().splitlines()]
+    assert len(parsed) == 32
+    assert not list(manifest.parent.glob(f".{manifest.name}.*.tmp"))
+
+
+def test_load_jsonl_preserves_unicode_line_and_paragraph_separators(tmp_path):
+    manifest = tmp_path / "manifest.jsonl"
+    expected = [
+        {"id": "line-separator", "text": "before\u2028after"},
+        {"id": "paragraph-separator", "text": "before\u2029after"},
+    ]
+    manifest.write_text(
+        "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in expected),
+        encoding="utf-8",
+    )
+
+    assert load_jsonl(manifest) == expected
+
+
 def test_cached_target_token_io_is_frozen_but_backpropagates_to_draft_hidden():
     token_io = FrozenTargetTokenIO(torch.randn(7, 4), None)
     hidden = torch.randn(2, 4, requires_grad=True)
@@ -155,6 +201,57 @@ def test_pipeline_stage_defaults_and_selected_layers_validation():
     assert DFlashTrainConfig(stage="multimodal").dataset_repo == "liuhaotian/LLaVA-Pretrain"
     with pytest.raises(ValueError, match="exactly num_target_features"):
         DFlashTrainConfig(num_target_features=2, selected_target_layers=[1])
+
+
+def test_dataset_teacher_mode_disables_generation_budget():
+    config = DFlashTrainConfig(
+        teacher_response_mode="dataset",
+        response_max_new_tokens=0,
+        max_seq_length=2048,
+    )
+    assert config.response_max_new_tokens == 0
+    with pytest.raises(ValueError, match="target_generate"):
+        DFlashTrainConfig(
+            teacher_response_mode="target_generate",
+            response_max_new_tokens=0,
+        )
+
+
+def test_sharegpt_manifest_keeps_multi_turn_context_and_final_response(tmp_path):
+    annotation = tmp_path / "sharegpt.json"
+    annotation.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "multi-turn",
+                    "conversations": [
+                        {"from": "human", "value": "first question"},
+                        {"from": "gpt", "value": "first answer"},
+                        {"from": "human", "value": "follow-up"},
+                        {"from": "gpt", "value": "dataset final answer"},
+                    ],
+                }
+            ]
+        )
+    )
+    manifest = tmp_path / "manifest.jsonl"
+    config = DFlashTrainConfig(
+        stage="text",
+        data_path=str(annotation),
+        prepared_manifest=str(manifest),
+        max_samples=1,
+    )
+
+    prepare_real_manifest(config)
+    record = load_jsonl(manifest)[0]
+
+    assert [message["role"] for message in record["messages"]] == [
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert record["messages"][-1]["content"][0]["text"] == "follow-up"
+    assert record["target_text"] == "dataset final answer"
 
 
 def test_dflash_tiny_forward_and_backward():
@@ -323,6 +420,7 @@ def test_vlm_decoder_is_lossless_for_perfect_and_always_wrong_drafts():
     class Adapter:
         device = torch.device("cpu")
         visual_token_ids = (set(), set())
+        _set_input_sequence = Qwen25VLTargetAdapter._set_input_sequence
 
         def __init__(self):
             self.model = Target()
@@ -497,6 +595,52 @@ def test_target_generated_teacher_response_uses_raw_greedy_settings():
     assert calls["do_sample"] is False
     assert calls["repetition_penalty"] == 1.0
     assert calls["temperature"] is None
+
+
+def test_teacher_response_extends_multimodal_token_types_as_text():
+    class Model:
+        generation_config = SimpleNamespace(eos_token_id=9)
+
+        def generate(self, input_ids, **_kwargs):
+            return torch.cat([input_ids, torch.tensor([[4, 9]])], dim=-1)
+
+        def get_rope_index(self, input_ids, attention_mask, mm_token_type_ids, **_kwargs):
+            assert input_ids.shape == attention_mask.shape == mm_token_type_ids.shape
+            positions = torch.arange(input_ids.shape[-1]).view(1, 1, -1)
+            return positions.expand(3, input_ids.shape[0], -1), None
+
+    adapter = object.__new__(Qwen25VLTargetAdapter)
+    adapter.model = Model()
+    adapter.device = torch.device("cpu")
+    adapter.processor = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=9))
+    adapter.prepare_messages = MethodType(
+        lambda self, _messages: (
+            {
+                "input_ids": torch.tensor([[1, 2, 3]]),
+                "attention_mask": torch.ones(1, 3, dtype=torch.long),
+                "mm_token_type_ids": torch.tensor([[1, 1, 0]]),
+            },
+            None,
+        ),
+        adapter,
+    )
+    config = DFlashTrainConfig(
+        max_seq_length=16,
+        block_size=2,
+        response_max_new_tokens=8,
+        teacher_response_mode="target_generate",
+    )
+
+    inputs, position_ids, response_start, response_end, _, _ = _fit_clean_sequence(
+        adapter,
+        {"messages": [{"role": "user", "content": "x"}]},
+        config,
+    )
+
+    assert inputs["mm_token_type_ids"].tolist() == [[1, 1, 0, 0, 0]]
+    assert inputs["attention_mask"].shape == inputs["input_ids"].shape == (1, 5)
+    assert position_ids.shape == (3, 1, 5)
+    assert (response_start, response_end) == (3, 5)
 
 
 def test_multimodal_position_ids_fail_closed_without_qwen_rope_api():

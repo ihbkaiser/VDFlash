@@ -62,7 +62,7 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
         "--teacher-response-mode",
         choices=["target_generate", "dataset"],
         default=None,
-        help="Use raw-greedy target responses (paper-aligned) or source-dataset responses",
+        help="Use raw-greedy target responses or the source-dataset assistant response",
     )
     parser.add_argument("--response-max-new-tokens", type=int, default=None)
     parser.add_argument("--teacher-require-eos", action=argparse.BooleanOptionalAction, default=None)

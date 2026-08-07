@@ -135,7 +135,10 @@ def _fit_clean_sequence(
             config=config,
         )
     else:
-        response_ids = _response_token_ids(adapter, messages, str(record["target_text"]))
+        target_text = record.get("target_text")
+        if not isinstance(target_text, str) or not target_text.strip():
+            raise ValueError("dataset response mode requires a non-empty target_text")
+        response_ids = _response_token_ids(adapter, messages, target_text)
         available = config.max_seq_length - prompt_length
         response_truncated = len(response_ids) > available
         if response_truncated:
@@ -156,8 +159,7 @@ def _fit_clean_sequence(
     ).view(1, -1)
     full_ids = torch.cat([prompt_inputs["input_ids"], response_tensor], dim=1)
     inputs = dict(prompt_inputs)
-    inputs["input_ids"] = full_ids
-    inputs["attention_mask"] = torch.ones_like(full_ids)
+    adapter._set_input_sequence(inputs, full_ids)
     inputs.pop("position_ids", None)
     inputs.pop("cache_position", None)
     position_ids = adapter._compute_position_ids(inputs)

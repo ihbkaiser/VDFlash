@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import heapq
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import tempfile
 from typing import Any, Iterator
 import zipfile
 
@@ -25,6 +27,59 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: reader.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_write_text(path: Path, value: str) -> None:
+    """Durably replace a text file without sharing a temporary filename."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as writer:
+            temporary_path = Path(writer.name)
+            writer.write(value)
+            writer.flush()
+            os.fsync(writer.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+        _fsync_directory(path.parent)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _validate_jsonl(path: Path, *, expected_records: int) -> None:
+    records = 0
+    with path.open(encoding="utf-8") as reader:
+        for line_number, line in enumerate(reader, 1):
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"generated invalid JSON at {path}:{line_number}") from exc
+            if not isinstance(value, dict):
+                raise RuntimeError(f"generated non-object JSON at {path}:{line_number}")
+            records += 1
+    if records != expected_records:
+        raise RuntimeError(
+            f"generated manifest contains {records} records; expected {expected_records}"
+        )
 
 
 def _iter_json_array(path: Path) -> Iterator[dict[str, Any]]:
@@ -340,39 +395,56 @@ def prepare_real_manifest(config: DFlashTrainConfig) -> tuple[Path, Path]:
         )
 
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
     selected_ids: list[dict[str, Any]] = []
-    with temporary.open("w") as writer:
-        for rank, ((score, source_index, source_id), raw) in enumerate(zip(selected, raw_selected)):
-            assert raw is not None
-            messages, target_text, image_relative = _normalize_selected_record(
-                raw,
-                stage=config.stage,
-                image_root=image_root,
-            )
-            manifest_id = f"{config.stage}:{source_id}:{source_index}"
-            item = {
-                "id": manifest_id,
-                "messages": messages,
-                "target_text": target_text,
-                "source": {
-                    "dataset_repo": config.dataset_repo,
-                    "dataset_revision": resolved_revision,
-                    "annotation_file": annotation_path.name,
-                    "annotation_sha256": annotation_sha,
-                    "split": config.split,
-                    "source_id": source_id,
-                    "source_index": source_index,
-                    "shuffle_rank": rank,
-                    "shuffle_score": f"{score:032x}",
-                    "image": image_relative,
-                },
-            }
-            writer.write(json.dumps(item, ensure_ascii=False) + "\n")
-            selected_ids.append(
-                {"manifest_id": manifest_id, "source_id": source_id, "source_index": source_index}
-            )
-    temporary.replace(manifest_path)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=manifest_path.parent,
+            prefix=f".{manifest_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as writer:
+            temporary_path = Path(writer.name)
+            for rank, ((score, source_index, source_id), raw) in enumerate(zip(selected, raw_selected)):
+                assert raw is not None
+                messages, target_text, image_relative = _normalize_selected_record(
+                    raw,
+                    stage=config.stage,
+                    image_root=image_root,
+                )
+                manifest_id = f"{config.stage}:{source_id}:{source_index}"
+                item = {
+                    "id": manifest_id,
+                    "messages": messages,
+                    "target_text": target_text,
+                    "source": {
+                        "dataset_repo": config.dataset_repo,
+                        "dataset_revision": resolved_revision,
+                        "annotation_file": annotation_path.name,
+                        "annotation_sha256": annotation_sha,
+                        "split": config.split,
+                        "source_id": source_id,
+                        "source_index": source_index,
+                        "shuffle_rank": rank,
+                        "shuffle_score": f"{score:032x}",
+                        "image": image_relative,
+                    },
+                }
+                writer.write(json.dumps(item, ensure_ascii=False) + "\n")
+                selected_ids.append(
+                    {"manifest_id": manifest_id, "source_id": source_id, "source_index": source_index}
+                )
+            writer.flush()
+            os.fsync(writer.fileno())
+        _validate_jsonl(temporary_path, expected_records=len(selected_ids))
+        os.replace(temporary_path, manifest_path)
+        temporary_path = None
+        _fsync_directory(manifest_path.parent)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
     metadata = {
         "format": "video-dflash-real-manifest-v1",
         "stage": config.stage,
@@ -390,7 +462,10 @@ def prepare_real_manifest(config: DFlashTrainConfig) -> tuple[Path, Path]:
         "image_root": str(image_root) if image_root is not None else None,
         "selective_image_download": config.selective_image_download,
     }
-    metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False, sort_keys=True))
+    _atomic_write_text(
+        metadata_path,
+        json.dumps(metadata, indent=2, ensure_ascii=False, sort_keys=True),
+    )
     print(
         f"[manifest] records={len(selected_ids)} valid_source={valid_count} "
         f"path={manifest_path} metadata={metadata_path}"

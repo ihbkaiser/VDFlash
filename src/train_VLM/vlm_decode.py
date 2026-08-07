@@ -148,8 +148,7 @@ class Qwen25VLDFlashDecoder:
             key: (value.clone() if torch.is_tensor(value) else value)
             for key, value in base_inputs.items()
         }
-        inputs["input_ids"] = sequence
-        inputs["attention_mask"] = torch.ones_like(sequence)
+        self.adapter._set_input_sequence(inputs, sequence)
         inputs.pop("cache_position", None)
         inputs.pop("position_ids", None)
         inputs["position_ids"] = self.adapter._compute_position_ids(inputs)

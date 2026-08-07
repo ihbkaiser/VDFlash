@@ -132,8 +132,16 @@ class DFlashTrainConfig:
             raise ValueError("micro_batch_size and gradient_accumulation_steps must be positive")
         if self.max_train_steps < 0 or self.eval_cache_samples < 1:
             raise ValueError("max_train_steps must be non-negative and eval_cache_samples positive")
-        if self.response_max_new_tokens < self.block_size:
-            raise ValueError("response_max_new_tokens must be at least block_size")
+        if self.response_max_new_tokens < 0:
+            raise ValueError("response_max_new_tokens must be non-negative")
+        if (
+            self.teacher_response_mode == "target_generate"
+            and self.response_max_new_tokens < self.block_size
+        ):
+            raise ValueError(
+                "response_max_new_tokens must be at least block_size when "
+                "teacher_response_mode='target_generate'"
+            )
         if self.selected_target_layers is not None:
             self.selected_target_layers = [int(layer) for layer in self.selected_target_layers]
             if len(self.selected_target_layers) != self.num_target_features:
