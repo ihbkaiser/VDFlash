@@ -527,7 +527,7 @@ def train_records(
                 sums[key] += group_metrics[key]
             if used_chunk != config.anchor_chunk_size:
                 print(f"[oom-recovery] optimizer_step={step}, anchor_chunk_size={used_chunk}")
-            if step % config.save_every_steps == 0 and is_main:
+            if config.save_every_steps and step % config.save_every_steps == 0 and is_main:
                 checkpoint_dir = checkpoint_root / f"step-{step:08d}"
                 save_draft_checkpoint(
                     checkpoint_dir,

@@ -7,9 +7,11 @@ import shutil
 from typing import Any
 
 import torch
+import torch.distributed as dist
 
 from .config import DFlashTrainConfig
 from .data import select_context_positions
+from .distributed import initialize_distributed
 from .model import build_target_layer_ids
 from .real_data import sha256_file
 from .target import Qwen25VLTargetAdapter, load_jsonl
@@ -171,12 +173,18 @@ def _write_shard(
     directory: Path,
     shard_index: int,
     records: list[tuple[int, dict[str, torch.Tensor]]],
+    *,
+    rank: int | None = None,
 ) -> tuple[str, dict[int, str]]:
     try:
         from safetensors.torch import save_file
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("safetensors is required for teacher feature shards") from exc
-    filename = f"shard-{shard_index:05d}.safetensors"
+    filename = (
+        f"rank-{rank:05d}-shard-{shard_index:05d}.safetensors"
+        if rank is not None
+        else f"shard-{shard_index:05d}.safetensors"
+    )
     tensors: dict[str, torch.Tensor] = {}
     prefixes: dict[int, str] = {}
     for sample_index, values in records:
@@ -205,6 +213,8 @@ def _save_static_target_io(directory: Path, adapter: Qwen25VLTargetAdapter) -> t
 
 
 def cache_teacher_features(config: DFlashTrainConfig) -> Path:
+    distributed = initialize_distributed(config.device, config.distributed_backend)
+    device = distributed.device
     manifest_path = Path(config.prepared_manifest).expanduser().resolve()
     if not manifest_path.is_file():
         raise FileNotFoundError(manifest_path)
@@ -217,17 +227,20 @@ def cache_teacher_features(config: DFlashTrainConfig) -> Path:
 
     cache_dir = Path(config.teacher_cache_dir).expanduser().resolve()
     temporary = cache_dir.with_name(cache_dir.name + ".tmp")
-    if cache_dir.exists():
-        if not config.overwrite:
-            raise FileExistsError(f"teacher cache already exists: {cache_dir}; pass --overwrite")
-        if cache_dir == cache_dir.parent:
-            raise RuntimeError("refusing to overwrite a filesystem root")
-        shutil.rmtree(cache_dir)
-    if temporary.exists():
-        shutil.rmtree(temporary)
-    temporary.mkdir(parents=True)
+    if distributed.is_main:
+        if cache_dir.exists():
+            if not config.overwrite:
+                raise FileExistsError(
+                    f"teacher cache already exists: {cache_dir}; pass --overwrite"
+                )
+            if cache_dir == cache_dir.parent:
+                raise RuntimeError("refusing to overwrite a filesystem root")
+            shutil.rmtree(cache_dir)
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        temporary.mkdir(parents=True)
+    distributed.barrier()
 
-    device = torch.device(config.device)
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "no": torch.float32}[
         config.mixed_precision
     ]
@@ -244,20 +257,22 @@ def cache_teacher_features(config: DFlashTrainConfig) -> Path:
     )
     if max(layer_ids) >= int(adapter.text_config.num_hidden_layers):
         raise ValueError("selected_target_layers contains an index outside the target model")
-    print(
-        f"[teacher-setup] model={config.target_model} device={device} "
-        f"dtype={config.mixed_precision} frozen=True layers={layer_ids} "
-        f"response_mode={config.teacher_response_mode}"
-    )
+    if distributed.is_main:
+        print(
+            f"[teacher-setup] model={config.target_model} world_size={distributed.world_size} "
+            f"dtype={config.mixed_precision} frozen=True layers={layer_ids} "
+            f"response_mode={config.teacher_response_mode}"
+        )
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
     image_ids, video_ids = adapter.visual_token_ids
     index_entries: list[dict[str, Any]] = []
-    skipped: list[dict[str, str]] = []
+    skipped: list[dict[str, Any]] = []
     pending: list[tuple[int, dict[str, torch.Tensor]]] = []
     shard_index = 0
-    for source_offset, record in enumerate(records):
+    for source_offset in range(distributed.rank, len(records), distributed.world_size):
+        record = records[source_offset]
         try:
             (
                 inputs,
@@ -282,11 +297,10 @@ def cache_teacher_features(config: DFlashTrainConfig) -> Path:
                 "context_hidden": selected[context_original].to(dtype=dtype),
                 "context_original_positions": context_original.to(dtype=torch.int32),
             }
-            cache_index = len(index_entries)
-            pending.append((cache_index, cached_tensors))
+            pending.append((source_offset, cached_tensors))
             index_entries.append(
                 {
-                    "cache_index": cache_index,
+                    "source_offset": source_offset,
                     "manifest_id": str(record["id"]),
                     "source": record.get("source", {}),
                     "response_start": response_start,
@@ -297,89 +311,147 @@ def cache_teacher_features(config: DFlashTrainConfig) -> Path:
                     "teacher_response_mode": config.teacher_response_mode,
                     "dropped_prompt_turns": dropped_turns,
                     "shard": None,
-                    "tensor_prefix": _tensor_prefix(cache_index),
+                    "tensor_prefix": _tensor_prefix(source_offset),
                 }
             )
             if len(pending) >= config.cache_shard_size:
-                filename, _ = _write_shard(temporary, shard_index, pending)
-                for pending_index, _ in pending:
-                    index_entries[pending_index]["shard"] = filename
+                filename, _ = _write_shard(
+                    temporary,
+                    shard_index,
+                    pending,
+                    rank=distributed.rank if distributed.enabled else None,
+                )
+                for entry in index_entries[-len(pending) :]:
+                    entry["shard"] = filename
                 pending.clear()
                 shard_index += 1
-            print(
-                f"[teacher {source_offset + 1}/{len(records)}] id={record['id']} "
-                f"seq={response_end} context={int(context_original.numel())} "
-                f"truncated={response_truncated} dropped_turns={dropped_turns}"
-            )
+            local_done = len(index_entries) + len(skipped)
+            if local_done == 1 or local_done % config.cache_log_every == 0:
+                print(
+                    f"[teacher rank={distributed.rank} source={source_offset + 1}/{len(records)}] "
+                    f"id={record['id']} seq={response_end} "
+                    f"context={int(context_original.numel())} truncated={response_truncated} "
+                    f"dropped_turns={dropped_turns}"
+                )
             del outputs, selected, inputs, cached_tensors
         except ValueError as exc:
-            skipped.append({"manifest_id": str(record.get("id", source_offset)), "reason": str(exc)})
-            print(f"[teacher-skip] id={record.get('id', source_offset)} reason={exc}")
+            skipped.append(
+                {
+                    "source_offset": source_offset,
+                    "manifest_id": str(record.get("id", source_offset)),
+                    "reason": str(exc),
+                }
+            )
+            print(
+                f"[teacher-skip rank={distributed.rank}] "
+                f"id={record.get('id', source_offset)} reason={exc}"
+            )
     if pending:
-        filename, _ = _write_shard(temporary, shard_index, pending)
-        for pending_index, _ in pending:
-            index_entries[pending_index]["shard"] = filename
-    if not index_entries:
-        raise RuntimeError("no real dataset records could be cached")
+        filename, _ = _write_shard(
+            temporary,
+            shard_index,
+            pending,
+            rank=distributed.rank if distributed.enabled else None,
+        )
+        for entry in index_entries[-len(pending) :]:
+            entry["shard"] = filename
 
-    static_filename, tied_token_io = _save_static_target_io(temporary, adapter)
-    manifest_sha = sha256_file(manifest_path)
-    manifest_metadata = json.loads(manifest_metadata_path.read_text())
-    cache_metadata = {
-        "format": "video-dflash-teacher-cache-v2",
-        "stage": config.stage,
-        "target_model": config.target_model,
-        "target_revision": config.target_revision,
-        "target_provenance": adapter.target_provenance(),
-        "target_commit": adapter.target_provenance().get("target_commit"),
-        "target_text_config": adapter.text_config.to_dict(),
-        "target_hidden_size": adapter.hidden_size,
-        "target_vocab_size": adapter.vocab_size,
-        "target_layer_ids": layer_ids,
-        "num_target_features": len(layer_ids),
-        "teacher_response_mode": config.teacher_response_mode,
-        "teacher_generation": (
-            {
-                "do_sample": False,
-                "temperature": 0.0,
-                "repetition_penalty": 1.0,
-                "max_new_tokens": config.response_max_new_tokens,
-                "require_eos": config.teacher_require_eos,
-                "eos_token_ids": sorted(_eos_token_ids(adapter)),
-            }
-            if config.teacher_response_mode == "target_generate"
-            else None
-        ),
-        "mask_token_id": adapter.resolve_mask_token_id(),
-        "tokenizer_fingerprint": adapter.tokenizer_fingerprint(),
-        "processor_fingerprint": adapter.processor_fingerprint(),
-        "context_mode": config.context_mode,
-        "dtype": config.mixed_precision,
-        "max_seq_length": config.max_seq_length,
-        "source_manifest": str(manifest_path),
-        "source_manifest_sha256": manifest_sha,
-        "source_manifest_metadata": manifest_metadata,
-        "cached_count": len(index_entries),
-        "cached_sample_ids": [entry["manifest_id"] for entry in index_entries],
-        "skipped": skipped,
-        "static_token_io": static_filename,
-        "tied_token_io": tied_token_io,
-    }
-    (temporary / "metadata.json").write_text(
-        json.dumps(cache_metadata, indent=2, ensure_ascii=False, sort_keys=True)
-    )
-    (temporary / "index.json").write_text(
-        json.dumps(index_entries, indent=2, ensure_ascii=False, sort_keys=True)
-    )
-    del adapter
+    local_index_path = temporary / f"index.rank-{distributed.rank:05d}.json"
+    local_skipped_path = temporary / f"skipped.rank-{distributed.rank:05d}.json"
+    local_index_path.write_text(json.dumps(index_entries, ensure_ascii=False, sort_keys=True))
+    local_skipped_path.write_text(json.dumps(skipped, ensure_ascii=False, sort_keys=True))
+    distributed.barrier()
+
+    merged_entries: list[dict[str, Any]] = []
+    merged_skipped: list[dict[str, Any]] = []
+    if distributed.is_main:
+        for rank in range(distributed.world_size):
+            rank_index = temporary / f"index.rank-{rank:05d}.json"
+            rank_skipped = temporary / f"skipped.rank-{rank:05d}.json"
+            merged_entries.extend(json.loads(rank_index.read_text()))
+            merged_skipped.extend(json.loads(rank_skipped.read_text()))
+            rank_index.unlink()
+            rank_skipped.unlink()
+        merged_entries.sort(key=lambda entry: int(entry["source_offset"]))
+        merged_skipped.sort(key=lambda entry: int(entry["source_offset"]))
+        for cache_index, entry in enumerate(merged_entries):
+            entry["cache_index"] = cache_index
+            entry.pop("source_offset", None)
+        for entry in merged_skipped:
+            entry.pop("source_offset", None)
+        if not merged_entries:
+            raise RuntimeError("no real dataset records could be cached")
+
+        static_filename, tied_token_io = _save_static_target_io(temporary, adapter)
+        manifest_sha = sha256_file(manifest_path)
+        manifest_metadata = json.loads(manifest_metadata_path.read_text())
+        target_provenance = adapter.target_provenance()
+        cache_metadata = {
+            "format": "video-dflash-teacher-cache-v2",
+            "stage": config.stage,
+            "target_model": config.target_model,
+            "target_revision": config.target_revision,
+            "target_provenance": target_provenance,
+            "target_commit": target_provenance.get("target_commit"),
+            "target_text_config": adapter.text_config.to_dict(),
+            "target_hidden_size": adapter.hidden_size,
+            "target_vocab_size": adapter.vocab_size,
+            "target_layer_ids": layer_ids,
+            "num_target_features": len(layer_ids),
+            "teacher_response_mode": config.teacher_response_mode,
+            "teacher_generation": (
+                {
+                    "do_sample": False,
+                    "temperature": 0.0,
+                    "repetition_penalty": 1.0,
+                    "max_new_tokens": config.response_max_new_tokens,
+                    "require_eos": config.teacher_require_eos,
+                    "eos_token_ids": sorted(_eos_token_ids(adapter)),
+                }
+                if config.teacher_response_mode == "target_generate"
+                else None
+            ),
+            "mask_token_id": adapter.resolve_mask_token_id(),
+            "tokenizer_fingerprint": adapter.tokenizer_fingerprint(),
+            "processor_fingerprint": adapter.processor_fingerprint(),
+            "context_mode": config.context_mode,
+            "dtype": config.mixed_precision,
+            "max_seq_length": config.max_seq_length,
+            "source_manifest": str(manifest_path),
+            "source_manifest_sha256": manifest_sha,
+            "source_manifest_metadata": manifest_metadata,
+            "cache_world_size": distributed.world_size,
+            "cached_count": len(merged_entries),
+            "cached_sample_ids": [entry["manifest_id"] for entry in merged_entries],
+            "skipped": merged_skipped,
+            "static_token_io": static_filename,
+            "tied_token_io": tied_token_io,
+        }
+        (temporary / "metadata.json").write_text(
+            json.dumps(cache_metadata, indent=2, ensure_ascii=False, sort_keys=True)
+        )
+        (temporary / "index.json").write_text(
+            json.dumps(merged_entries, indent=2, ensure_ascii=False, sort_keys=True)
+        )
+
     if device.type == "cuda":
         peak = torch.cuda.max_memory_allocated(device) / (1024**3)
         torch.cuda.empty_cache()
     else:
         peak = 0.0
-    temporary.replace(cache_dir)
-    print(
-        f"[teacher-cache] cached={len(index_entries)} skipped={len(skipped)} "
-        f"layers={layer_ids} peak_vram={peak:.2f}GiB path={cache_dir}"
-    )
+    if distributed.enabled:
+        peak_tensor = torch.tensor(peak, device=device)
+        dist.all_reduce(peak_tensor, op=dist.ReduceOp.MAX)
+        peak = float(peak_tensor.item())
+    distributed.barrier()
+    if distributed.is_main:
+        temporary.replace(cache_dir)
+        print(
+            f"[teacher-cache] cached={len(merged_entries)} skipped={len(merged_skipped)} "
+            f"layers={layer_ids} world_size={distributed.world_size} "
+            f"peak_vram={peak:.2f}GiB path={cache_dir}"
+        )
+    distributed.barrier()
+    del adapter
+    distributed.close()
     return cache_dir

@@ -1,0 +1,24 @@
+# Runtime and test environment for src/train_VLM.
+# Supported environment: Python 3.11, Linux x86_64, NVIDIA CUDA 12.8 wheels.
+# The extra index and local version suffix force the CUDA 12.8 wheels.
+
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.7.1+cu128
+torchvision==0.22.1+cu128
+transformers==4.57.1
+accelerate>=1.4,<2
+datasets>=3,<4
+huggingface-hub>=0.34,<1
+fsspec[http]>=2023.1
+ijson>=3.3,<4
+safetensors>=0.5
+PyYAML>=6
+qwen-vl-utils==0.0.10
+av>=14
+numpy>=1.26,<3
+
+# Triton, used by torch.compile/FlexAttention, imports setuptools at runtime.
+setuptools>=70
+
+# tests/
+pytest>=8,<10

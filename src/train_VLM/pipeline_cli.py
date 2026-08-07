@@ -39,6 +39,12 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--lr", dest="learning_rate", type=float, default=None)
+    parser.add_argument("--weight-decay", type=float, default=None)
+    parser.add_argument("--adam-beta1", type=float, default=None)
+    parser.add_argument("--adam-beta2", type=float, default=None)
+    parser.add_argument("--adam-eps", type=float, default=None)
+    parser.add_argument("--warmup-ratio", type=float, default=None)
+    parser.add_argument("--gradient-clip-norm", type=float, default=None)
     parser.add_argument("--micro-batch-size", type=int, default=None)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=None)
     parser.add_argument("--dtype", dest="mixed_precision", choices=["no", "bf16", "fp16"], default=None)
@@ -50,6 +56,7 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--num-draft-layers", type=int, default=None)
     parser.add_argument("--num-target-features", type=int, default=None)
     parser.add_argument("--selected-target-layers", type=_csv_ints, default=None)
+    parser.add_argument("--loss-decay", type=float, default=None)
     parser.add_argument("--context-mode", choices=["full", "text_only"], default=None)
     parser.add_argument(
         "--teacher-response-mode",
@@ -72,7 +79,11 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-train-steps", type=int, default=None)
     parser.add_argument("--eval-cache-samples", type=int, default=None)
     parser.add_argument("--save-every-steps", type=int, default=None)
+    parser.add_argument("--save-every-epochs", type=float, default=None)
     parser.add_argument("--keep-last-checkpoints", type=int, default=None)
+    parser.add_argument("--auto-resume", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--distributed-backend", choices=["nccl", "gloo"], default=None)
+    parser.add_argument("--cache-log-every", type=int, default=None)
     parser.add_argument(
         "--selective-image-download",
         action=argparse.BooleanOptionalAction,

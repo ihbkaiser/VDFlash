@@ -64,8 +64,8 @@ and source provenance in safetensors shards. It also exports only the frozen
 token embedding/LM-head matrix required by vanilla DFlash. `train_draft` then
 loads the shards, frozen token I/O, and draft model; the Qwen transformer and
 vision encoder are absent from GPU memory. Checkpoints contain only draft and
-projection weights plus a separate optimizer/scheduler/RNG/progress state for
-resume.
+projection weights plus optimizer/scheduler, per-rank RNG, exact sampler
+permutation and in-epoch progress for resume.
 
 Run the complete real-data smoke path, including both stages and final decode
 on a real TorchVision MP4, with:
@@ -92,6 +92,31 @@ shard/cache/output paths, weights-only `--checkpoint`, full
 `--overwrite` is explicit. Launch scripts reuse completed stage artifacts; set
 `VIDEO_DFLASH_OVERWRITE=1` to rebuild them from the source manifests.
 
+## Full offline pipeline for 8×NVIDIA B200
+
+The canonical copy-paste workflow is documented in the repository-root
+`README.md`. The two full presets select 68K real records per stage and use
+BF16 distributed teacher caching/training:
+
+- `config_b200_8gpu_stage1_sharegpt.json`
+- `config_b200_8gpu_stage2_llava.json`
+
+Launch both caching and training with `torchrun --standalone
+--nproc_per_node=8`. Training partitions each shuffled global batch without
+padding/repeating the last batch and manually all-reduces weighted gradients.
+Every completed optimizer step is durably committed to an atomic recovery
+checkpoint before `checkpoints/latest` advances. Long-lived snapshots default
+to every 0.5 epoch. Resume restores model, AdamW, cosine scheduler, global
+step, exact sample offset/permutation and Python/NumPy/Torch/CUDA RNG state for
+each rank; changes to the mathematical training contract are rejected.
+
+Stage 2's `checkpoint` field points directly to the final Stage 1 export. A
+Stage 2 `--resume auto`, by contrast, restores Stage 2's own full training
+state. Use `python -m src.train_VLM.infer_video` for one-pass greedy
+Video-DFlash generation on a real MP4; it reads the architecture contract from
+the final Stage 2 checkpoint and prints decoded text plus acceptance/timing
+metrics.
+
 ## Minimal Video-DFlash smoke test
 
 The video path is vanilla DFlash: Qwen2.5-VL processes the video once during
@@ -101,7 +126,8 @@ with one parallel target forward, crops rejected cache entries, and continues
 from the target bonus token. No Sparrow attention, glimpsing, tree decoding, or
 video-token selector is used.
 
-After installing `requirements.txt`, run the self-contained 3090 smoke test:
+After installing the repository-root `requirements.txt` as described in
+`README.md`, run the self-contained 3090 smoke test:
 
 ```bash
 python -m src.train_VLM.smoke_video
@@ -218,5 +244,5 @@ python -m src.train_VLM.train --config src/train_VLM/config_qwen25vl_7b.json \
 
 The final export remains in `output_dir/`, and the highest validation accepted
 prefix checkpoint is at `output_dir/best/`. Use Python 3.11 with the pinned
-Torch 2.6 / Transformers 4.57.1 dependencies in `requirements.txt` for real
-Qwen2.5-VL runs.
+Torch 2.7.1 / Transformers 4.57.1 dependencies in the repository-root
+`requirements.txt` for real Qwen2.5-VL runs.

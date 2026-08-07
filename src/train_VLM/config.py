@@ -65,7 +65,11 @@ class DFlashTrainConfig:
     response_max_new_tokens: int = 1024
     temperature: float = 0.0
     save_every_steps: int = 1000
+    save_every_epochs: float = 0.5
     keep_last_checkpoints: int = 3
+    auto_resume: bool = True
+    distributed_backend: str = "nccl"
+    cache_log_every: int = 50
     resume_from_checkpoint: str = ""
     checkpoint: str = ""
     device: str = "cuda:0"
@@ -106,6 +110,14 @@ class DFlashTrainConfig:
             self.anchor_chunk_size = self.num_anchors
         if self.keep_last_checkpoints < 1:
             raise ValueError("keep_last_checkpoints must be positive")
+        if self.save_every_steps < 0:
+            raise ValueError("save_every_steps must be non-negative")
+        if self.save_every_epochs < 0:
+            raise ValueError("save_every_epochs must be non-negative")
+        if self.distributed_backend not in {"nccl", "gloo"}:
+            raise ValueError("distributed_backend must be 'nccl' or 'gloo'")
+        if self.cache_log_every < 1:
+            raise ValueError("cache_log_every must be positive")
         if self.loss_decay is None:
             self.loss_decay = {16: 7.0, 10: 5.0, 8: 4.0}.get(
                 self.block_size, max(1.0, self.block_size / 2)
