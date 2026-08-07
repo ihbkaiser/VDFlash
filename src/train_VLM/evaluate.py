@@ -103,18 +103,8 @@ def evaluate_records(
 
 def _prompt_inputs(adapter: Qwen25VLTargetAdapter, record: dict[str, Any]) -> dict[str, Any]:
     validate_manifest_record(record, require_target_response=False)
-    inputs = adapter.processor.apply_chat_template(
-        record["messages"],
-        tokenize=True,
-        add_generation_prompt=True,
-        return_dict=True,
-        return_tensors="pt",
-        **getattr(adapter.processor, "dflash_processor_kwargs", {}),
-    )
-    return {
-        key: value.to(adapter.device) if torch.is_tensor(value) else value
-        for key, value in dict(inputs).items()
-    }
+    inputs, _ = adapter.prepare_messages(record["messages"])
+    return inputs
 
 
 @torch.inference_mode()
@@ -129,6 +119,8 @@ def benchmark_decode_records(
 ) -> dict[str, float]:
     """Benchmark target autoregressive generation and lossless DFlash decoding."""
 
+    if temperature > 1e-5:
+        raise NotImplementedError("The Qwen2.5-VL DFlash decoder currently supports greedy mode only")
     decoder = Qwen25VLDFlashDecoder(adapter, draft_model, config)
     eos = getattr(adapter.processor.tokenizer, "eos_token_id", None)
     stop_token_ids = [int(eos)] if eos is not None else None
@@ -144,11 +136,11 @@ def benchmark_decode_records(
         generation_kwargs = {
             **inputs,
             "max_new_tokens": max_new_tokens,
-            "do_sample": temperature > 1e-5,
+            "do_sample": False,
+            "repetition_penalty": 1.0,
+            "temperature": None,
             "use_cache": True,
         }
-        if temperature > 1e-5:
-            generation_kwargs["temperature"] = temperature
         baseline_ids = adapter.model.generate(**generation_kwargs)
         baseline_latency += _now(adapter.device) - started
         baseline_tokens += int(baseline_ids.shape[1] - prompt_length)

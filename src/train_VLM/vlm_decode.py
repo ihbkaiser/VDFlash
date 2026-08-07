@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import torch
 
@@ -29,6 +29,8 @@ class VLMDecodeResult:
     end_to_end_latency_s: float
     peak_memory_bytes: int
     num_input_tokens: int
+    final_cache_length: int
+    steps: list["VLMDecodeStep"]
 
     @property
     def mean_acceptance_length(self) -> float:
@@ -61,6 +63,70 @@ class VLMDecodeResult:
             "end_to_end_tokens_per_second": self.end_to_end_tokens_per_second,
             "peak_memory_bytes": float(self.peak_memory_bytes),
         }
+
+
+@dataclass(frozen=True)
+class VLMDecodeStep:
+    iteration: int
+    proposed_token_ids: tuple[int, ...]
+    accepted_proposals: int
+    emitted_token_ids: tuple[int, ...]
+    target_cache_length: int
+    target_cache_key_shape: tuple[int, ...]
+
+
+_VISION_INPUT_KEYS = {
+    "pixel_values",
+    "pixel_values_videos",
+    "image_grid_thw",
+    "video_grid_thw",
+    "second_per_grid_ts",
+}
+
+
+def _cache_key_tensor(cache: Any) -> torch.Tensor | None:
+    key_cache = getattr(cache, "key_cache", None)
+    if key_cache:
+        return key_cache[0]
+    layers = getattr(cache, "layers", None)
+    if layers:
+        key = getattr(layers[0], "keys", None)
+        if torch.is_tensor(key):
+            return key
+    try:
+        key = cache[0][0]
+    except (IndexError, KeyError, TypeError, AttributeError):
+        return None
+    return key if torch.is_tensor(key) else None
+
+
+def cache_length_and_shape(cache: Any) -> tuple[int, tuple[int, ...]]:
+    """Return a version-tolerant target cache length and first-layer K shape."""
+
+    get_seq_length = getattr(cache, "get_seq_length", None)
+    if callable(get_seq_length):
+        length = int(get_seq_length())
+    else:
+        key = _cache_key_tensor(cache)
+        if key is None or key.ndim < 2:
+            raise RuntimeError("Unable to inspect the target KV cache")
+        length = int(key.shape[-2])
+    key = _cache_key_tensor(cache)
+    shape = tuple(int(x) for x in key.shape) if key is not None else ()
+    if shape and shape[-2] != length:
+        raise RuntimeError(
+            f"Target cache reports length={length}, but first-layer key shape is {shape}"
+        )
+    return length, shape
+
+
+def _validate_cache(cache: Any, expected_length: int, *, stage: str) -> tuple[int, ...]:
+    length, shape = cache_length_and_shape(cache)
+    if length != expected_length:
+        raise RuntimeError(
+            f"Invalid target cache after {stage}: length={length}, expected={expected_length}"
+        )
+    return shape
 
 
 class Qwen25VLDFlashDecoder:
@@ -100,6 +166,8 @@ class Qwen25VLDFlashDecoder:
         verify_latency_s: float,
         started_at: float,
         prompt_length: int,
+        target_cache: Any,
+        steps: list[VLMDecodeStep],
     ) -> VLMDecodeResult:
         finished_at = _now(self.adapter.device)
         peak_memory = (
@@ -118,6 +186,8 @@ class Qwen25VLDFlashDecoder:
             end_to_end_latency_s=finished_at - started_at,
             peak_memory_bytes=int(peak_memory),
             num_input_tokens=prompt_length,
+            final_cache_length=cache_length_and_shape(target_cache)[0],
+            steps=steps,
         )
 
     @torch.inference_mode()
@@ -129,9 +199,14 @@ class Qwen25VLDFlashDecoder:
         temperature: float = 0.0,
         stop_token_ids: Iterable[int] | None = None,
         generator: torch.Generator | None = None,
+        trace_callback: Callable[[VLMDecodeStep], None] | None = None,
     ) -> VLMDecodeResult:
         if prompt_inputs["input_ids"].shape[0] != 1:
             raise ValueError("The v1 VLM decoder supports batch size one")
+        if temperature > 1e-5:
+            raise NotImplementedError(
+                "Qwen25VLDFlashDecoder currently guarantees lossless decoding only at temperature=0"
+            )
         self.adapter.model.eval()
         self.draft_model.eval()
         if self.adapter.device.type == "cuda":
@@ -153,6 +228,7 @@ class Qwen25VLDFlashDecoder:
         target_cache = target_outputs.past_key_values
         if target_cache is None:
             raise RuntimeError("Target model did not return a KV cache")
+        _validate_cache(target_cache, prompt_length, stage="multimodal prefill")
         target_calls = 1
         pending_anchor = _sample_logits(target_outputs.logits[:, -1], temperature, generator=generator)[0]
         acceptance_lengths: list[int] = []
@@ -170,11 +246,16 @@ class Qwen25VLDFlashDecoder:
             image_token_ids=self.image_ids,
             video_token_ids=self.video_ids,
         )
-        context_hidden = selected[:, context_positions]
-        context_position_ids = full_position_ids[:, :, context_positions]
+        # The draft cache stores the already-projected per-layer K/V entries.
+        # Keep only the raw target features that have not been injected yet;
+        # this matches upstream DFlash and avoids re-projecting the full video
+        # context on every decode iteration.
+        pending_context_hidden = selected[:, context_positions]
+        pending_context_position_ids = full_position_ids[:, :, context_positions]
         context_original_positions = context_positions
         full_context_length = prompt_length
         last_position = full_position_ids[:, :, -1:]
+        steps: list[VLMDecodeStep] = []
 
         if max_new_tokens <= 0:
             return self._result(
@@ -184,6 +265,8 @@ class Qwen25VLDFlashDecoder:
                 verify_latency_s=verify_latency_s,
                 started_at=started_at,
                 prompt_length=prompt_length,
+                target_cache=target_cache,
+                steps=steps,
             )
         output = torch.cat([output, pending_anchor.view(1, 1)], dim=1)
         if int(pending_anchor) in stop:
@@ -194,8 +277,11 @@ class Qwen25VLDFlashDecoder:
                 verify_latency_s=verify_latency_s,
                 started_at=started_at,
                 prompt_length=prompt_length,
+                target_cache=target_cache,
+                steps=steps,
             )
 
+        iteration = 0
         while output.shape[1] - prompt_length < max_new_tokens:
             generated = int(output.shape[1] - prompt_length)
             remaining = max_new_tokens - generated
@@ -212,8 +298,8 @@ class Qwen25VLDFlashDecoder:
                 anchors = torch.tensor([full_context_length], device=output.device, dtype=torch.long)
                 draft_hidden, draft_context_cache = self.draft_model(
                     noise_embeddings=noise_embeddings,
-                    target_context=context_hidden,
-                    context_position_ids=context_position_ids,
+                    target_context=pending_context_hidden,
+                    context_position_ids=pending_context_position_ids,
                     block_position_ids=block_position_ids,
                     anchors=anchors,
                     context_original_positions=context_original_positions,
@@ -239,6 +325,12 @@ class Qwen25VLDFlashDecoder:
                     device=output.device,
                 ),
             }
+            unexpected_vision = _VISION_INPUT_KEYS.intersection(verify_inputs)
+            if unexpected_vision:
+                raise RuntimeError(
+                    f"Vision inputs are only allowed during target prefill: {sorted(unexpected_vision)}"
+                )
+            _validate_cache(target_cache, full_context_length, stage="pre-verification")
             verify_started = _now(self.adapter.device)
             target_outputs = self.adapter.model(
                 **verify_inputs,
@@ -249,6 +341,14 @@ class Qwen25VLDFlashDecoder:
             )
             verify_latency_s += _now(self.adapter.device) - verify_started
             target_calls += 1
+            verified_cache = target_outputs.past_key_values
+            if verified_cache is None:
+                raise RuntimeError("Target verification did not return a KV cache")
+            _validate_cache(
+                verified_cache,
+                full_context_length + verify_length,
+                stage="parallel verification",
+            )
             posterior_logits = target_outputs.logits[0, : proposal_count + 1]
             posterior = _sample_logits(posterior_logits, temperature, generator=generator)
             matches = proposals.eq(posterior[:-1])
@@ -256,13 +356,25 @@ class Qwen25VLDFlashDecoder:
             while accepted < proposal_count and bool(matches[accepted]):
                 accepted += 1
             bonus = posterior[accepted]
-            accepted_input = torch.cat([pending_anchor.view(1), proposals[:accepted]], dim=0)
+            emitted = torch.cat([proposals[:accepted], bonus.view(1)])
+            stop_index = next(
+                (idx for idx, token in enumerate(emitted.tolist()) if int(token) in stop), None
+            )
+            if stop_index is not None:
+                emitted = emitted[: stop_index + 1]
+            # The pending anchor was already emitted before this iteration. It
+            # and only the accepted proposals emitted before EOS belong in the
+            # persistent target cache; the bonus remains the next pending input.
+            emitted_accepted = accepted
+            if stop_index is not None:
+                emitted_accepted = min(accepted, stop_index + 1)
+            accepted_input = torch.cat(
+                [pending_anchor.view(1), proposals[:emitted_accepted]], dim=0
+            )
             accepted_input_count = int(accepted_input.numel())
             new_selected = self.adapter.selected_hidden_features(target_outputs, layer_ids)
-            context_hidden = torch.cat([context_hidden, new_selected[:, :accepted_input_count]], dim=1)
-            context_position_ids = torch.cat(
-                [context_position_ids, block_position_ids[:, :, :accepted_input_count]], dim=2
-            )
+            pending_context_hidden = new_selected[:, :accepted_input_count]
+            pending_context_position_ids = block_position_ids[:, :, :accepted_input_count]
             context_original_positions = torch.cat(
                 [
                     context_original_positions,
@@ -275,17 +387,28 @@ class Qwen25VLDFlashDecoder:
             )
             full_context_length += accepted_input_count
             last_position = block_position_ids[:, :, accepted_input_count - 1 : accepted_input_count]
-            target_cache = target_outputs.past_key_values
+            target_cache = verified_cache
             if target_cache is None or not hasattr(target_cache, "crop"):
                 raise RuntimeError("Target verification cache does not support exact crop rollback")
             target_cache.crop(full_context_length)
+            cache_shape = _validate_cache(
+                target_cache, full_context_length, stage="accept/reject rollback"
+            )
 
-            emitted = torch.cat([proposals[:accepted], bonus.view(1)])
-            stop_index = next((idx for idx, token in enumerate(emitted.tolist()) if int(token) in stop), None)
-            if stop_index is not None:
-                emitted = emitted[: stop_index + 1]
             output = torch.cat([output, emitted.view(1, -1)], dim=1)
             acceptance_lengths.append(int(emitted.numel()))
+            step = VLMDecodeStep(
+                iteration=iteration,
+                proposed_token_ids=tuple(int(x) for x in proposals.detach().cpu().tolist()),
+                accepted_proposals=int(accepted),
+                emitted_token_ids=tuple(int(x) for x in emitted.detach().cpu().tolist()),
+                target_cache_length=full_context_length,
+                target_cache_key_shape=cache_shape,
+            )
+            steps.append(step)
+            if trace_callback is not None:
+                trace_callback(step)
+            iteration += 1
             if stop_index is not None:
                 break
             pending_anchor = bonus
@@ -296,4 +419,6 @@ class Qwen25VLDFlashDecoder:
             verify_latency_s=verify_latency_s,
             started_at=started_at,
             prompt_length=prompt_length,
+            target_cache=target_cache,
+            steps=steps,
         )

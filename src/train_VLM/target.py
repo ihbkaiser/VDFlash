@@ -9,6 +9,7 @@ from typing import Any, Iterable
 import torch
 
 from .config import DFlashTrainConfig
+from .video import VideoProcessorMetadata, prepare_qwen_messages
 
 
 def _tensor_dict_to_device(values: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -82,10 +83,18 @@ class Qwen25VLTargetAdapter:
             raise RuntimeError("Transformers is required to load Qwen2.5-VL") from exc
         processor = AutoProcessor.from_pretrained(config.target_model, revision=config.target_revision)
         model_cls = AutoModelForImageTextToText
-        kwargs: dict[str, Any] = {"revision": config.target_revision}
+        kwargs: dict[str, Any] = {
+            "revision": config.target_revision,
+            "low_cpu_mem_usage": True,
+            "attn_implementation": config.target_attn_implementation,
+        }
         if dtype is None:
-            dtype = torch.bfloat16 if config.mixed_precision == "bf16" else torch.float32
-        kwargs["torch_dtype"] = dtype
+            dtype = {
+                "bf16": torch.bfloat16,
+                "fp16": torch.float16,
+                "no": torch.float32,
+            }[config.mixed_precision]
+        kwargs["dtype"] = dtype
         try:
             model = model_cls.from_pretrained(config.target_model, **kwargs)
         except (AttributeError, ValueError):  # older Transformers releases
@@ -100,6 +109,12 @@ class Qwen25VLTargetAdapter:
         adapter.requested_model = config.target_model
         adapter.requested_revision = config.target_revision
         adapter.processor.dflash_processor_kwargs = dict(config.processor_kwargs)
+        adapter.image_min_pixels = config.image_min_pixels
+        adapter.image_max_pixels = config.image_max_pixels
+        adapter.video_reader = config.video_reader
+        adapter.video_num_frames = config.video_num_frames
+        adapter.video_min_pixels = config.video_min_pixels
+        adapter.video_max_pixels = config.video_max_pixels
         return adapter
 
     def freeze(self) -> None:
@@ -178,6 +193,14 @@ class Qwen25VLTargetAdapter:
             "class": f"{type(self.processor).__module__}.{type(self.processor).__qualname__}",
             "serialized": serialized,
             "processor_kwargs": getattr(self.processor, "dflash_processor_kwargs", {}),
+            "video_preprocessing": {
+                "image_min_pixels": getattr(self, "image_min_pixels", None),
+                "image_max_pixels": getattr(self, "image_max_pixels", None),
+                "num_frames": getattr(self, "video_num_frames", None),
+                "min_pixels": getattr(self, "video_min_pixels", None),
+                "max_pixels": getattr(self, "video_max_pixels", None),
+                "reader": getattr(self, "video_reader", None),
+            },
             "tokenizer_fingerprint": self.tokenizer_fingerprint(),
         }
         return hashlib.sha256(
@@ -234,7 +257,6 @@ class Qwen25VLTargetAdapter:
             if positions.ndim == 3 and positions.shape[0] == 3:
                 return positions
 
-        model_core = getattr(self.model, "model", self.model)
         candidates = ["compute_3d_position_ids", "get_rope_index"]
         kwargs = {
             key: inputs[key]
@@ -251,21 +273,32 @@ class Qwen25VLTargetAdapter:
             if key in inputs
         }
         failures: list[str] = []
-        for method_name in candidates:
-            method = getattr(model_core, method_name, None)
-            if method is None:
-                continue
-            try:
-                positions = method(**kwargs)
-                if isinstance(positions, tuple):
-                    positions = positions[0]
-                if positions.ndim == 2:
-                    positions = positions.unsqueeze(0).expand(3, -1, -1)
-                if positions.ndim == 3 and positions.shape[0] == 3:
-                    return positions
-            except (TypeError, ValueError, RuntimeError) as exc:
-                failures.append(f"{method_name}: {exc}")
-                continue
+        model_objects = [self.model]
+        for attribute in ("model", "language_model"):
+            candidate = getattr(self.model, attribute, None)
+            if candidate is not None and candidate not in model_objects:
+                model_objects.append(candidate)
+        nested = getattr(getattr(self.model, "model", None), "language_model", None)
+        if nested is not None and nested not in model_objects:
+            model_objects.append(nested)
+        for model_object in model_objects:
+            for method_name in candidates:
+                method = getattr(model_object, method_name, None)
+                if method is None:
+                    continue
+                try:
+                    positions = method(**kwargs)
+                    if isinstance(positions, tuple):
+                        positions = positions[0]
+                    if positions.ndim == 2:
+                        positions = positions.unsqueeze(0).expand(3, -1, -1)
+                    if positions.ndim == 3 and positions.shape[0] == 3:
+                        return positions
+                except (TypeError, ValueError, RuntimeError) as exc:
+                    failures.append(
+                        f"{type(model_object).__name__}.{method_name}: {exc}"
+                    )
+                    continue
         visual_keys = {"pixel_values", "pixel_values_videos", "image_grid_thw", "video_grid_thw"}
         if any(key in inputs for key in visual_keys):
             detail = "; ".join(failures) or "no compatible Qwen2.5-VL RoPE API was found"
@@ -277,6 +310,24 @@ class Qwen25VLTargetAdapter:
         position = torch.arange(length, device=self.device).view(1, 1, -1)
         return position.expand(3, 1, -1)
 
+    def prepare_messages(
+        self, messages: list[dict[str, Any]]
+    ) -> tuple[dict[str, Any], VideoProcessorMetadata]:
+        """Create one batch-size-one processor input on the target device."""
+
+        return prepare_qwen_messages(
+            self.processor,
+            messages,
+            device=self.device,
+            processor_kwargs=getattr(self.processor, "dflash_processor_kwargs", {}),
+            video_reader=getattr(self, "video_reader", "torchvision"),
+            image_min_pixels=getattr(self, "image_min_pixels", None),
+            image_max_pixels=getattr(self, "image_max_pixels", None),
+            video_num_frames=getattr(self, "video_num_frames", None),
+            video_min_pixels=getattr(self, "video_min_pixels", None),
+            video_max_pixels=getattr(self, "video_max_pixels", None),
+        )
+
     def prepare_record(self, record: dict[str, Any], *, max_seq_length: int) -> PreparedExample:
         validate_manifest_record(record, require_target_response=True)
         self.validate_record_provenance(record)
@@ -285,15 +336,7 @@ class Qwen25VLTargetAdapter:
         if response_ids is None:
             raise ValueError("target_response.token_ids is required; run prepare_responses first")
         messages = record["messages"]
-        inputs = self.processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt",
-            **getattr(self.processor, "dflash_processor_kwargs", {}),
-        )
-        inputs = dict(inputs)
+        inputs, _ = self.prepare_messages(messages)
         prompt_ids = inputs["input_ids"]
         response_tensor = torch.tensor(response_ids, dtype=prompt_ids.dtype).view(1, -1)
         response_start = int(prompt_ids.shape[1])

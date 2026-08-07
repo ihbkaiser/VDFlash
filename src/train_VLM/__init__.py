@@ -14,7 +14,7 @@ from .data import (
 )
 from .losses import weighted_block_cross_entropy
 from .model import DFlashVLMModel
-from .vlm_decode import Qwen25VLDFlashDecoder, VLMDecodeResult
+from .vlm_decode import Qwen25VLDFlashDecoder, VLMDecodeResult, VLMDecodeStep
 
 __all__ = [
     "DFlashTrainConfig",
@@ -26,4 +26,5 @@ __all__ = [
     "weighted_block_cross_entropy",
     "Qwen25VLDFlashDecoder",
     "VLMDecodeResult",
+    "VLMDecodeStep",
 ]

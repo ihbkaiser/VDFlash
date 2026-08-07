@@ -44,18 +44,7 @@ def prepare_responses(
         for index, record in enumerate(records):
             validate_manifest_record(record, require_target_response=False)
             messages = record["messages"]
-            inputs = adapter.processor.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=True,
-                return_tensors="pt",
-                **getattr(adapter.processor, "dflash_processor_kwargs", {}),
-            )
-            inputs = {
-                key: value.to(adapter.device) if torch.is_tensor(value) else value
-                for key, value in dict(inputs).items()
-            }
+            inputs, media_metadata = adapter.prepare_messages(messages)
             prompt_length = int(inputs["input_ids"].shape[1])
             if prompt_length >= max_seq_length:
                 skipped_length += 1
@@ -69,6 +58,8 @@ def prepare_responses(
                     **inputs,
                     max_new_tokens=max_new_tokens,
                     do_sample=False,
+                    repetition_penalty=1.0,
+                    temperature=None,
                     use_cache=True,
                 )
             response_ids = generated[0, prompt_length:].detach().cpu().tolist()
@@ -96,12 +87,19 @@ def prepare_responses(
                 "generation": {
                     "do_sample": False,
                     "temperature": 0.0,
+                    "repetition_penalty": 1.0,
                     "max_new_tokens": max_new_tokens,
                     "use_cache": True,
                     "eos_token_ids": sorted(eos_token_ids),
                 },
             }
             output["provenance"] = adapter.target_provenance()
+            if media_metadata.frame_counts or media_metadata.video_grid_thw:
+                output["video_preprocessing"] = {
+                    "frame_counts": list(media_metadata.frame_counts),
+                    "video_grid_thw": [list(row) for row in media_metadata.video_grid_thw],
+                    "video_reader": getattr(adapter, "video_reader", "torchvision"),
+                }
             writer.write(json.dumps(output, ensure_ascii=False) + "\n")
             written += 1
             print(f"[{index + 1}/{len(records)}] {record.get('id', index)} -> {len(response_ids)} tokens")

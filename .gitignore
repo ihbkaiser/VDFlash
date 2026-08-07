@@ -23,6 +23,7 @@ Thumbs.db
 
 # DFlash benchmark cache (generated datasets)
 cache/
+artifacts/
 
 # Environment / venv
 .venv/

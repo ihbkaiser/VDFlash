@@ -18,7 +18,7 @@ from .data import (
     select_context_positions,
 )
 from .losses import weighted_block_cross_entropy
-from .model import DFlashVLMModel, build_target_layer_ids
+from .model import DFLASH_IMPLEMENTATION_VERSION, DFlashVLMModel, build_target_layer_ids
 from .target import PreparedExample, Qwen25VLTargetAdapter, load_jsonl
 
 
@@ -36,9 +36,11 @@ def _autocast_context(device: torch.device, config: DFlashTrainConfig):
 
 
 def make_draft_model(adapter: Qwen25VLTargetAdapter, config: DFlashTrainConfig) -> DFlashVLMModel:
-    layer_ids = build_target_layer_ids(
+    layer_ids = list(config.selected_target_layers or build_target_layer_ids(
         int(adapter.text_config.num_hidden_layers), config.num_target_features
-    )
+    ))
+    if max(layer_ids) >= int(adapter.text_config.num_hidden_layers):
+        raise ValueError("selected_target_layers contains an index outside the target model")
     model = DFlashVLMModel(
         adapter.text_config,
         num_draft_layers=config.num_draft_layers,
@@ -174,6 +176,7 @@ def _checkpoint_metadata(
     metadata = config.to_dict()
     metadata.update(
         {
+            "implementation_version": DFLASH_IMPLEMENTATION_VERSION,
             "target_layer_ids": list(getattr(draft_model, "target_layer_ids", [])),
             "mask_token_id": int(getattr(draft_model, "mask_token_id", -1)),
             "target_vocab_size": adapter.vocab_size,
@@ -234,6 +237,7 @@ def load_draft_checkpoint(
     checkpoint_dir = Path(checkpoint_dir)
     metadata = json.loads((checkpoint_dir / "dflash_config.json").read_text())
     for key, expected in (
+        ("implementation_version", DFLASH_IMPLEMENTATION_VERSION),
         ("target_model", config.target_model),
         ("target_revision", config.target_revision),
         ("target_hidden_size", adapter.hidden_size),

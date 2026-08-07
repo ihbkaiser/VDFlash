@@ -1,6 +1,8 @@
+import json
 from types import MethodType, SimpleNamespace
 
 import torch
+import torch.nn.functional as F
 import pytest
 
 from src.train_VLM.data import (
@@ -12,8 +14,10 @@ from src.train_VLM.data import (
 )
 from src.train_VLM.decode import speculative_decode
 from src.train_VLM.config import DFlashTrainConfig
+from src.train_VLM.cached_trainer import FrozenTargetTokenIO
 from src.train_VLM.losses import weighted_block_cross_entropy
-from src.train_VLM.model import DFlashVLMModel, MultiModalRotaryEmbedding
+from src.train_VLM.model import DFlashVLMModel, MultiModalRotaryEmbedding, RMSNorm
+from src.train_VLM.teacher_cache import _generate_target_response_ids
 from src.train_VLM.target import Qwen25VLTargetAdapter
 from src.train_VLM.trainer import (
     load_draft_checkpoint,
@@ -22,6 +26,8 @@ from src.train_VLM.trainer import (
     train_records,
 )
 from src.train_VLM.vlm_decode import Qwen25VLDFlashDecoder
+from src.train_VLM.video import _apply_media_defaults
+from src.train_VLM.real_data import select_source_records
 
 
 def tiny_text_config():
@@ -73,6 +79,84 @@ def test_weighted_loss_prefers_first_prediction():
     assert torch.isfinite(loss)
 
 
+def test_video_defaults_are_parameterized_without_mutating_messages():
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "video", "video": "clip.mp4"},
+                {"type": "video", "video": "fixed.mp4", "nframes": 6, "max_pixels": 20000},
+            ],
+        }
+    ]
+    materialized = _apply_media_defaults(
+        messages,
+        video_num_frames=8,
+        video_min_pixels=12544,
+        video_max_pixels=12544,
+    )
+    assert "nframes" not in messages[0]["content"][0]
+    assert materialized[0]["content"][0] == {
+        "type": "video",
+        "video": "clip.mp4",
+        "nframes": 8,
+        "min_pixels": 12544,
+        "max_pixels": 12544,
+    }
+    assert materialized[0]["content"][1]["nframes"] == 6
+    assert materialized[0]["content"][1]["max_pixels"] == 20000
+
+
+def test_real_dataset_selection_is_deterministic_and_records_source_indices(tmp_path):
+    records = [
+        {
+            "id": f"real-{index}",
+            "conversations": [
+                {"from": "human", "value": f"question {index}"},
+                {"from": "gpt", "value": f"answer {index}"},
+            ],
+        }
+        for index in range(8)
+    ]
+    annotation = tmp_path / "sharegpt.json"
+    annotation.write_text(json.dumps(records))
+    first, valid = select_source_records(
+        annotation,
+        stage="text",
+        seed=42,
+        max_samples=4,
+    )
+    second, _ = select_source_records(
+        annotation,
+        stage="text",
+        seed=42,
+        max_samples=4,
+    )
+    assert first == second
+    assert valid == 8
+    assert len(first) == 4
+    assert all(records[source_index]["id"] == source_id for _, source_index, source_id in first)
+
+
+def test_cached_target_token_io_is_frozen_but_backpropagates_to_draft_hidden():
+    token_io = FrozenTargetTokenIO(torch.randn(7, 4), None)
+    hidden = torch.randn(2, 4, requires_grad=True)
+    token_io.logits(hidden).sum().backward()
+    assert hidden.grad is not None
+    assert token_io.embedding_weight.grad is None
+    assert not token_io.requires_grad
+
+
+def test_pipeline_stage_defaults_and_selected_layers_validation():
+    assert DFlashTrainConfig().target_model == "Qwen/Qwen2.5-VL-3B-Instruct"
+    assert DFlashTrainConfig(stage="text").dataset_repo == (
+        "anon8231489123/ShareGPT_Vicuna_unfiltered"
+    )
+    assert DFlashTrainConfig(stage="multimodal").dataset_repo == "liuhaotian/LLaVA-Pretrain"
+    with pytest.raises(ValueError, match="exactly num_target_features"):
+        DFlashTrainConfig(num_target_features=2, selected_target_layers=[1])
+
+
 def test_dflash_tiny_forward_and_backward():
     config = tiny_text_config()
     model = DFlashVLMModel(config, num_draft_layers=2, num_target_features=2, block_size=4)
@@ -110,12 +194,12 @@ def test_draft_context_kv_cache_only_grows_with_new_target_context():
     )
     assert first_hidden.shape == (1, 4, 32)
     assert [item[0].shape[2] for item in cache] == [6, 6]
-    second_context = torch.cat([first_context, torch.randn(1, 2, 64)], dim=1)
+    second_context = torch.randn(1, 2, 64)
     second_positions = torch.arange(8).view(1, 1, 8).expand(3, 1, 8)
     second_hidden, grown_cache = model(
         noise_embeddings=torch.randn(1, 4, 32),
         target_context=second_context,
-        context_position_ids=second_positions,
+        context_position_ids=second_positions[:, :, -2:],
         block_position_ids=torch.arange(4, 8).view(1, 1, 4).expand(3, 1, 4),
         anchors=torch.tensor([7]),
         context_original_positions=torch.arange(8),
@@ -208,6 +292,90 @@ def test_callback_decoder_never_emits_after_eos():
     assert stats.acceptance_lengths == [2]
 
 
+def test_vlm_decoder_is_lossless_for_perfect_and_always_wrong_drafts():
+    vocab_size = 32
+
+    class Cache:
+        def __init__(self):
+            self.key_cache = [torch.zeros(1, 1, 0, 1)]
+
+        def get_seq_length(self):
+            return self.key_cache[0].shape[-2]
+
+        def append(self, count):
+            self.key_cache[0] = torch.zeros(1, 1, self.get_seq_length() + count, 1)
+
+        def crop(self, length):
+            self.key_cache[0] = self.key_cache[0][..., :length, :]
+
+    class Target:
+        def eval(self):
+            return self
+
+        def __call__(self, input_ids, past_key_values=None, **_kwargs):
+            cache = past_key_values or Cache()
+            cache.append(input_ids.shape[1])
+            next_ids = (input_ids + 1) % vocab_size
+            logits = torch.full((*input_ids.shape, vocab_size), -1_000.0)
+            logits.scatter_(-1, next_ids.unsqueeze(-1), 1_000.0)
+            return SimpleNamespace(logits=logits, past_key_values=cache)
+
+    class Adapter:
+        device = torch.device("cpu")
+        visual_token_ids = (set(), set())
+
+        def __init__(self):
+            self.model = Target()
+            self.input_embeddings = lambda token_ids: F.one_hot(
+                token_ids, num_classes=vocab_size
+            ).float()
+            self.lm_head = lambda hidden: hidden
+
+        def _compute_position_ids(self, inputs):
+            positions = torch.arange(inputs["input_ids"].shape[1]).view(1, 1, -1)
+            return positions.expand(3, 1, -1)
+
+        def selected_hidden_features(self, outputs, layer_ids):
+            return torch.zeros(1, outputs.logits.shape[1], 4 * len(layer_ids))
+
+    class Draft:
+        mask_token_id = vocab_size - 1
+        target_layer_ids = [0]
+
+        def __init__(self, perfect):
+            self.perfect = perfect
+
+        def eval(self):
+            return self
+
+        def __call__(self, noise_embeddings, return_draft_context_cache=False, **_kwargs):
+            hidden = torch.zeros_like(noise_embeddings)
+            anchor = noise_embeddings[:, 0].argmax(dim=-1)
+            for offset in range(hidden.shape[1]):
+                token = (anchor + offset) % vocab_size if self.perfect else anchor * 0
+                hidden[:, offset] = F.one_hot(token, num_classes=vocab_size).float()
+            return (hidden, []) if return_draft_context_cache else hidden
+
+    config = SimpleNamespace(block_size=4, context_mode="full", use_flex_attention=False)
+    prompt = torch.tensor([[1]])
+    inputs = {
+        "input_ids": prompt,
+        "attention_mask": torch.ones_like(prompt),
+        "position_ids": torch.zeros(3, 1, 1, dtype=torch.long),
+    }
+    expected = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 9]])
+    perfect = Qwen25VLDFlashDecoder(Adapter(), Draft(True), config).generate(
+        inputs, max_new_tokens=8
+    )
+    wrong = Qwen25VLDFlashDecoder(Adapter(), Draft(False), config).generate(
+        inputs, max_new_tokens=8
+    )
+    assert torch.equal(perfect.output_ids, expected)
+    assert [step.accepted_proposals for step in perfect.steps] == [3, 2]
+    assert torch.equal(wrong.output_ids, expected)
+    assert all(step.accepted_proposals == 0 for step in wrong.steps)
+
+
 def test_anchor_sampling_is_order_independent_per_epoch_and_id():
     def anchors_for(sample_id):
         return sample_anchor_positions(
@@ -248,6 +416,87 @@ def test_mrope_supports_different_query_and_key_lengths():
     assert rotated_query.shape == query.shape
     assert rotated_key.shape == key.shape
     assert torch.isfinite(rotated_query).all() and torch.isfinite(rotated_key).all()
+
+
+def test_mrope_numerically_matches_qwen25vl_for_visual_positions():
+    from transformers import Qwen2_5_VLTextConfig
+    from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+        Qwen2_5_VLRotaryEmbedding,
+        apply_multimodal_rotary_pos_emb,
+    )
+
+    config = Qwen2_5_VLTextConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        rope_theta=10_000.0,
+        rope_scaling={"type": "mrope", "mrope_section": [2, 1, 1]},
+    )
+    query = torch.randn(1, 4, 7, 8)
+    key = torch.randn(1, 2, 7, 8)
+    positions = torch.stack(
+        [torch.arange(7), torch.arange(7) % 3, torch.arange(7) % 5]
+    ).unsqueeze(1)
+    official_rotary = Qwen2_5_VLRotaryEmbedding(config)
+    cos, sin = official_rotary(query, positions)
+    expected_query, expected_key = apply_multimodal_rotary_pos_emb(
+        query,
+        key,
+        cos,
+        sin,
+        config.rope_scaling["mrope_section"],
+    )
+    actual_query, actual_key = MultiModalRotaryEmbedding(config).apply(
+        query, key, positions, positions
+    )
+    assert torch.equal(actual_query, expected_query)
+    assert torch.equal(actual_key, expected_key)
+
+
+def test_rmsnorm_numerically_matches_qwen_in_bf16():
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
+
+    hidden = torch.randn(4, 32).bfloat16()
+    expected_norm = Qwen2RMSNorm(32, eps=1e-6).to(dtype=torch.bfloat16)
+    actual_norm = RMSNorm(32, eps=1e-6).to(dtype=torch.bfloat16)
+    with torch.no_grad():
+        actual_norm.weight.copy_(expected_norm.weight)
+    assert torch.equal(actual_norm(hidden), expected_norm(hidden))
+
+
+def test_target_generated_teacher_response_uses_raw_greedy_settings():
+    calls = {}
+
+    class Model:
+        generation_config = SimpleNamespace(eos_token_id=9)
+
+        def generate(self, **kwargs):
+            calls.update(kwargs)
+            return torch.tensor([[1, 2, 3, 4, 9]])
+
+    adapter = SimpleNamespace(
+        model=Model(),
+        processor=SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=9)),
+    )
+    config = DFlashTrainConfig(
+        max_seq_length=16,
+        block_size=2,
+        response_max_new_tokens=8,
+        teacher_response_mode="target_generate",
+    )
+    response, reached_limit = _generate_target_response_ids(
+        adapter,
+        {"input_ids": torch.tensor([[1, 2, 3]])},
+        prompt_length=3,
+        config=config,
+    )
+    assert response == [4, 9]
+    assert not reached_limit
+    assert calls["do_sample"] is False
+    assert calls["repetition_penalty"] == 1.0
+    assert calls["temperature"] is None
 
 
 def test_multimodal_position_ids_fail_closed_without_qwen_rope_api():
@@ -302,7 +551,8 @@ def test_tiny_qwen25vl_decoder_uses_target_cache():
             "num_attention_heads": 4,
             "num_key_value_heads": 2,
             "head_dim": 4,
-            "rope_parameters": {"mrope_section": [1, 1, 0], "rope_theta": 1_000_000},
+            "rope_theta": 1_000_000,
+            "rope_scaling": {"type": "mrope", "mrope_section": [1, 1, 0]},
             "pad_token_id": 0,
         },
         vision_config={
@@ -359,6 +609,8 @@ def test_tiny_qwen25vl_decoder_uses_target_cache():
     assert result.target_forward_calls == len(result.acceptance_lengths) + 1
     assert result.num_output_tokens == 5
     assert result.end_to_end_latency_s >= result.prefill_latency_s
+    assert result.final_cache_length == result.output_ids.shape[1] - 1
+    assert all(step.target_cache_length == step.target_cache_key_shape[-2] for step in result.steps)
 
 
 def test_draft_checkpoint_round_trip_validates_processor_contract(tmp_path):
@@ -377,7 +629,8 @@ def test_draft_checkpoint_round_trip_validates_processor_contract(tmp_path):
                 "num_attention_heads": 4,
                 "num_key_value_heads": 2,
                 "head_dim": 4,
-                "rope_parameters": {"mrope_section": [1, 1, 0], "rope_theta": 1_000_000},
+                "rope_theta": 1_000_000,
+                "rope_scaling": {"type": "mrope", "mrope_section": [1, 1, 0]},
                 "pad_token_id": 0,
             },
             vision_config={
@@ -427,6 +680,12 @@ def test_draft_checkpoint_round_trip_validates_processor_contract(tmp_path):
     mismatched = DFlashTrainConfig(**(config.to_dict() | {"context_mode": "text_only"}))
     with pytest.raises(ValueError, match="context_mode"):
         load_draft_checkpoint(tmp_path, adapter, mismatched)
+    metadata_path = tmp_path / "dflash_config.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.pop("implementation_version")
+    metadata_path.write_text(json.dumps(metadata))
+    with pytest.raises(ValueError, match="implementation_version"):
+        load_draft_checkpoint(tmp_path, adapter, config)
 
 
 def test_tiny_optimizer_step_exports_best_and_resumable_checkpoint(tmp_path):
@@ -445,7 +704,8 @@ def test_tiny_optimizer_step_exports_best_and_resumable_checkpoint(tmp_path):
                 "num_attention_heads": 4,
                 "num_key_value_heads": 2,
                 "head_dim": 4,
-                "rope_parameters": {"mrope_section": [1, 1, 0], "rope_theta": 1_000_000},
+                "rope_theta": 1_000_000,
+                "rope_scaling": {"type": "mrope", "mrope_section": [1, 1, 0]},
                 "pad_token_id": 0,
             },
             vision_config={

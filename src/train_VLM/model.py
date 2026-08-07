@@ -11,6 +11,9 @@ from torch.utils.checkpoint import checkpoint
 from .data import make_dense_attention_mask, make_flex_block_mask
 
 
+DFLASH_IMPLEMENTATION_VERSION = "video-dflash-qwen25vl-v2"
+
+
 def build_target_layer_ids(num_target_layers: int, num_features: int = 5) -> list[int]:
     """Select layers from the second through the third-to-last layer."""
 
@@ -31,9 +34,15 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        variance = x.float().pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps).to(dtype=x.dtype)
-        return self.weight * x
+        # Match Qwen2/Qwen3 RMSNorm exactly: normalize in FP32, then cast the
+        # normalized activations back to the input dtype before applying the
+        # learned weight. Quantizing the reciprocal RMS before multiplication
+        # produces materially different BF16 activations.
+        input_dtype = x.dtype
+        normalized = x.to(torch.float32)
+        variance = normalized.pow(2).mean(-1, keepdim=True)
+        normalized = normalized * torch.rsqrt(variance + self.eps)
+        return self.weight * normalized.to(input_dtype)
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -79,7 +88,10 @@ class MultiModalRotaryEmbedding(nn.Module):
     def mix_axes(self, values: torch.Tensor) -> torch.Tensor:
         # values: [3, batch, length, head_dim]. Qwen2-VL interleaves the three
         # axes by channel section; text positions have equal values on all axes.
-        sections = [2 * s for s in self.mrope_section]
+        # Qwen deliberately repeats the section list; it does not double each
+        # section size. For [16, 24, 24], the correct split is therefore
+        # [16, 24, 24, 16, 24, 24], not [32, 48, 48].
+        sections = list(self.mrope_section) * 2
         chunks = values.split(sections, dim=-1)
         return torch.cat([chunk[i % 3] for i, chunk in enumerate(chunks)], dim=-1)
 
@@ -151,7 +163,9 @@ class DFlashAttention(nn.Module):
         return_context_kv: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         batch, query_len, _ = hidden_states.shape
-        context_len = target_context.shape[1]
+        new_context_len = target_context.shape[1]
+        if context_position_ids.shape[-1] != new_context_len:
+            raise ValueError("context_position_ids must describe only the newly supplied target context")
         q = self.q_proj(hidden_states).view(batch, query_len, self.num_heads, self.head_dim).transpose(1, 2)
         k_noise = self.k_proj(hidden_states).view(batch, query_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v_noise = self.v_proj(hidden_states).view(batch, query_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -162,29 +176,25 @@ class DFlashAttention(nn.Module):
             if cached_key.shape[:2] != (batch, self.num_kv_heads) or cached_value.shape != cached_key.shape:
                 raise ValueError("invalid cached DFlash context K/V shape")
             cached_context_len = int(cached_key.shape[2])
-            if cached_context_len > context_len:
-                raise ValueError("cached DFlash context is longer than the supplied target context")
-        if cached_context_len < context_len:
-            new_context = target_context[:, cached_context_len:]
-            new_positions = context_position_ids[:, :, cached_context_len:]
-            new_len = int(new_context.shape[1])
-            k_new = self.k_proj(new_context).view(
-                batch, new_len, self.num_kv_heads, self.head_dim
+        if new_context_len:
+            k_new = self.k_proj(target_context).view(
+                batch, new_context_len, self.num_kv_heads, self.head_dim
             ).transpose(1, 2)
-            v_new = self.v_proj(new_context).view(
-                batch, new_len, self.num_kv_heads, self.head_dim
+            v_new = self.v_proj(target_context).view(
+                batch, new_context_len, self.num_kv_heads, self.head_dim
             ).transpose(1, 2)
             _, k_new = self.rotary.apply(
-                q[:, :, :0], k_new, block_position_ids[:, :, :0], new_positions
+                q[:, :, :0], k_new, block_position_ids[:, :, :0], context_position_ids
             )
             if context_kv_cache is None:
                 k_context, v_context = k_new, v_new
             else:
                 k_context = torch.cat([cached_key, k_new], dim=2)
                 v_context = torch.cat([cached_value, v_new], dim=2)
-        else:
-            assert context_kv_cache is not None
+        elif context_kv_cache is not None:
             k_context, v_context = context_kv_cache
+        else:
+            raise ValueError("DFlash attention requires non-empty target context or a context cache")
         key = torch.cat([k_context, k_noise], dim=2)
         value = torch.cat([v_context, v_noise], dim=2)
 
@@ -354,6 +364,19 @@ class DFlashVLMModel(nn.Module):
         next_context_cache: list[tuple[torch.Tensor, torch.Tensor]] = []
         if draft_context_cache is not None and len(draft_context_cache) != len(self.layers):
             raise ValueError("draft_context_cache must contain one K/V entry per draft layer")
+        cached_context_len = 0
+        if draft_context_cache is not None:
+            cached_lengths = {int(key.shape[2]) for key, _ in draft_context_cache}
+            if len(cached_lengths) != 1:
+                raise ValueError("all draft layer context caches must have the same length")
+            cached_context_len = cached_lengths.pop()
+        expected_context_len = int(context_original_positions.numel())
+        if cached_context_len + int(target_context.shape[1]) != expected_context_len:
+            raise ValueError(
+                "incremental DFlash context mismatch: "
+                f"cached={cached_context_len}, new={target_context.shape[1]}, "
+                f"expected={expected_context_len}"
+            )
         for layer_index, layer in enumerate(self.layers):
             layer_cache = draft_context_cache[layer_index] if draft_context_cache is not None else None
             if self.training and self.gradient_checkpointing and not return_draft_context_cache:
