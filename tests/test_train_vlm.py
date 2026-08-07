@@ -15,7 +15,11 @@ from src.train_VLM.data import (
 )
 from src.train_VLM.decode import speculative_decode
 from src.train_VLM.config import DFlashTrainConfig
-from src.train_VLM.cached_trainer import FrozenTargetTokenIO
+from src.train_VLM.cached_trainer import (
+    FrozenTargetTokenIO,
+    _epoch_order,
+    _train_or_eval_batch,
+)
 from src.train_VLM.losses import weighted_block_cross_entropy
 from src.train_VLM.model import DFlashVLMModel, MultiModalRotaryEmbedding, RMSNorm
 from src.train_VLM.teacher_cache import (
@@ -74,6 +78,27 @@ def test_anchor_blocks_and_causal_context():
         assert torch.all(own)
         other = torch.cat([rows[:, 30 : 30 + block * 4], rows[:, 30 + (block + 1) * 4 :]], dim=1)
         assert not torch.any(other)
+
+
+def test_batched_dense_attention_masks_padded_context_per_record():
+    anchors = torch.tensor([[2, 4], [5, 7]])
+    context_positions = torch.tensor(
+        [
+            [0, 1, 2, 0, 0, 0],
+            [0, 1, 2, 3, 4, 5],
+        ]
+    )
+    mask = make_dense_attention_mask(
+        anchors,
+        context_positions,
+        block_size=2,
+        context_lengths=torch.tensor([3, 6]),
+    )[:, 0]
+    assert mask.shape == (2, 4, 10)
+    assert torch.equal(mask[0, 0, :6], torch.tensor([True, True, False, False, False, False]))
+    assert torch.equal(mask[1, 0, :6], torch.tensor([True, True, True, True, True, False]))
+    assert torch.all(mask[:, :2, 6:8])
+    assert not torch.any(mask[:, :2, 8:10])
 
 
 def test_weighted_loss_prefers_first_prediction():
@@ -198,6 +223,18 @@ def test_cached_target_token_io_is_frozen_but_backpropagates_to_draft_hidden():
     assert not token_io.requires_grad
 
 
+def test_shard_local_epoch_order_is_deterministic_and_keeps_shards_together():
+    cache = SimpleNamespace(
+        index=[{"shard": shard} for shard in ("a", "a", "b", "b", "c", "c")]
+    )
+    first = _epoch_order(cache, 42, shuffle_by_shard=True)
+    second = _epoch_order(cache, 42, shuffle_by_shard=True)
+    assert first == second
+    assert sorted(first) == list(range(6))
+    positions = {index: offset for offset, index in enumerate(first)}
+    assert all(abs(positions[left] - positions[right]) == 1 for left, right in ((0, 1), (2, 3), (4, 5)))
+
+
 def test_pipeline_stage_defaults_and_selected_layers_validation():
     assert DFlashTrainConfig().target_model == "Qwen/Qwen2.5-VL-3B-Instruct"
     assert DFlashTrainConfig(stage="text").dataset_repo == (
@@ -283,6 +320,56 @@ def test_dflash_tiny_forward_and_backward():
     assert model.fc.weight.grad is not None
 
 
+def test_cached_training_uses_real_two_record_microbatch():
+    config = DFlashTrainConfig(
+        max_seq_length=12,
+        block_size=4,
+        num_anchors=2,
+        anchor_chunk_size=2,
+        min_anchor_chunk_size=1,
+        num_draft_layers=2,
+        num_target_features=2,
+        micro_batch_size=2,
+        gradient_accumulation_steps=1,
+        mixed_precision="no",
+        use_flex_attention=False,
+        gradient_checkpointing=False,
+        static_context_padding=True,
+    )
+    model = DFlashVLMModel(
+        tiny_text_config(), num_draft_layers=2, num_target_features=2, block_size=4
+    )
+    model.mask_token_id = 20
+    token_io = FrozenTargetTokenIO(torch.randn(24, 32), None)
+    examples = []
+    for index, length in enumerate((9, 12)):
+        positions = torch.arange(length).view(1, length).expand(3, length)
+        examples.append(
+            {
+                "manifest_id": f"batch-{index}",
+                "input_ids": torch.arange(length, dtype=torch.int32),
+                "position_ids": positions.to(torch.int32),
+                "context_hidden": torch.randn(length, 64),
+                "context_original_positions": torch.arange(length, dtype=torch.int32),
+                "response_start": 2,
+                "response_end": length,
+            }
+        )
+    metrics = _train_or_eval_batch(
+        examples,
+        model,
+        token_io,
+        config,
+        epoch=0,
+        anchor_chunk_size=2,
+        backward_scale=1.0,
+        backward=True,
+    )
+    assert all(torch.isfinite(value) for value in metrics.values())
+    assert metrics["valid_tokens"] == 6
+    assert model.fc.weight.grad is not None
+
+
 def test_draft_context_kv_cache_only_grows_with_new_target_context():
     config = tiny_text_config()
     model = DFlashVLMModel(config, num_draft_layers=2, num_target_features=2, block_size=4).eval()
@@ -339,17 +426,26 @@ def test_cuda_flex_attention_gqa_forward_and_backward():
         block_size=16,
         compile_flex_attention=True,
     ).cuda().train()
+    context_original = torch.stack(
+        [
+            torch.cat(
+                [torch.arange(24, device="cuda"), torch.zeros(8, device="cuda", dtype=torch.long)]
+            ),
+            torch.arange(32, device="cuda"),
+        ]
+    )
     output = model(
-        noise_embeddings=torch.randn(1, 32, 64, device="cuda"),
-        target_context=torch.randn(1, 32, 128, device="cuda"),
-        context_position_ids=torch.arange(32, device="cuda").view(1, 1, 32).expand(3, 1, 32),
-        block_position_ids=torch.arange(32, device="cuda").view(1, 1, 32).expand(3, 1, 32),
-        anchors=torch.tensor([3, 20], device="cuda"),
-        context_original_positions=torch.arange(32, device="cuda"),
+        noise_embeddings=torch.randn(2, 32, 64, device="cuda"),
+        target_context=torch.randn(2, 32, 128, device="cuda"),
+        context_position_ids=torch.arange(32, device="cuda").view(1, 1, 32).expand(3, 2, 32),
+        block_position_ids=torch.arange(32, device="cuda").view(1, 1, 32).expand(3, 2, 32),
+        anchors=torch.tensor([[3, 20], [7, 24]], device="cuda"),
+        context_original_positions=context_original,
+        context_lengths=torch.tensor([24, 32], device="cuda"),
         use_flex_attention=True,
     )
     output.square().mean().backward()
-    assert output.shape == (1, 32, 64)
+    assert output.shape == (2, 32, 64)
     assert model.fc.weight.grad is not None
 
 

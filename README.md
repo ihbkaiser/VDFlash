@@ -33,9 +33,12 @@ Preset chạy đồng thời 3B trên GPU 0–3 và 7B trên GPU 4–7 nằm t�
 - `src/train_VLM/config_b200_4gpu_7b_stage2_llava.json`
 
 Hai run dùng chung manifest/ảnh đã prepare, nhưng có teacher cache, checkpoint
-và output riêng. Mỗi preset 4 GPU đặt `gradient_accumulation_steps=16`, nên với
-`micro_batch_size=1` global batch vẫn là 64 records. `selected_target_layers`
-để `null` nhằm tự chọn đúng 5 layer theo kiến trúc local 3B hoặc 7B.
+và output riêng. Preset 4 GPU 3B dùng micro-batch 1 × accumulation 16; preset
+4 GPU 7B dành cho B200 180 GB dùng micro-batch thật 4 × accumulation 4. Cả hai
+giữ global batch 64 records. Preset 7B đồng thời chạy đủ 512 anchors mỗi
+forward, pad context tới chiều dài tĩnh và tắt activation checkpointing để đổi
+VRAM lấy throughput. `selected_target_layers` để `null` nhằm tự chọn đúng 5
+layer theo kiến trúc local 3B hoặc 7B.
 
 Preset bám Appendix A.1 của DFlash: BF16, 6 epochs, LR `6e-4`, cosine schedule,
 warmup `0.04`, clip `1.0`, 512 anchors, block 16, loss decay 7, 5 draft layers
@@ -241,13 +244,14 @@ torchrun --standalone --nproc_per_node=8 \
   --resume auto
 ```
 
-## 7. Exact-resume contract và checkpoint layout
+## 7. Resume contract và checkpoint layout
 
-Sau **mỗi optimizer step**, trainer ghi một recovery checkpoint vào thư mục tạm,
-fsync toàn bộ file/thư mục, atomic-rename thư mục rồi atomic-update symlink
-`checkpoints/latest`. Vì vậy một step chỉ được coi là committed sau khi model,
-optimizer, scheduler và progress đã cùng tồn tại. SIGTERM/SIGINT sẽ hoàn thành
-step hiện tại, commit recovery rồi dừng.
+`recovery_save_every_steps` điều khiển chu kỳ ghi recovery checkpoint. Giá trị
+mặc định `1` fsync sau mỗi optimizer step. Preset 4×B200 7B đặt `50` để việc ghi
+model/AdamW nhiều GB không làm GPU chờ ở mọi step; SIGTERM/SIGINT, snapshot,
+`max_train_steps` và step cuối vẫn luôn ép commit. Mất điện/SIGKILL có thể quay
+lại tối đa 49 step với preset này. Mỗi lần commit đều ghi vào thư mục tạm,
+fsync, atomic-rename rồi atomic-update symlink `checkpoints/latest`.
 
 `trainer_state.pt` lưu:
 
@@ -258,10 +262,11 @@ step hiện tại, commit recovery rồi dừng.
 - Python, NumPy, Torch CPU và CUDA RNG state riêng cho từng rank;
 - history và immutable training contract.
 
-Snapshot dài hạn được tạo mặc định mỗi `save_every_epochs=0.5`; `latest` vẫn
-được cập nhật mỗi step. `keep_last_checkpoints=3` xoay vòng snapshot nhưng luôn
-giữ recovery mới nhất. Batch cuối không bị pad/lặp record: các rank có thể nhận
-số record khác nhau và gradient được weighted all-reduce theo số record thật.
+Snapshot dài hạn được tạo mặc định mỗi `save_every_epochs=0.5`; `latest` được
+cập nhật ở mỗi recovery commit. `keep_last_checkpoints=3` xoay vòng snapshot
+nhưng luôn giữ recovery mới nhất. Batch cuối không bị pad/lặp record: các rank
+có thể nhận số record khác nhau và gradient được weighted all-reduce theo số
+record thật.
 
 Resume exact sẽ từ chối nếu đổi world size, epochs, sample/cache fingerprint,
 batch/accumulation, LR/optimizer/scheduler, seed, block/anchor/loss, dtype hoặc

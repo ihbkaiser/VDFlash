@@ -143,19 +143,47 @@ def make_dense_attention_mask(
     context_original_positions: torch.Tensor,
     *,
     block_size: int,
+    context_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Create a boolean ``[1, 1, Q, KV]`` mask for CPU/tests/fallback."""
+    """Create a boolean ``[batch, 1, Q, KV]`` mask for CPU/tests/fallback."""
 
-    num_blocks = anchors.numel()
-    context_len = context_original_positions.numel()
+    if anchors.ndim == 1:
+        anchors = anchors.unsqueeze(0)
+    if context_original_positions.ndim == 1:
+        context_original_positions = context_original_positions.unsqueeze(0)
+    if anchors.ndim != 2 or context_original_positions.ndim != 2:
+        raise ValueError("anchors and context_original_positions must be one- or two-dimensional")
+    if anchors.shape[0] != context_original_positions.shape[0]:
+        raise ValueError("anchors and context positions must have the same batch size")
+    batch_size, num_blocks = anchors.shape
+    context_len = context_original_positions.shape[1]
+    if context_lengths is None:
+        context_lengths = torch.full(
+            (batch_size,), context_len, dtype=torch.long, device=anchors.device
+        )
+    else:
+        context_lengths = context_lengths.to(device=anchors.device, dtype=torch.long).view(-1)
+    if context_lengths.shape[0] != batch_size:
+        raise ValueError("context_lengths must contain one value per batch item")
     q_len = num_blocks * block_size
     kv_len = context_len + q_len
     q_block = torch.arange(q_len, device=anchors.device) // block_size
-    ctx_allowed = context_original_positions[None, :] < anchors[q_block, None]
+    context_index = torch.arange(context_len, device=anchors.device)
+    context_valid = context_index.unsqueeze(0) < context_lengths.unsqueeze(1)
+    ctx_allowed = (
+        context_valid[:, None, :]
+        & (
+            context_original_positions[:, None, :]
+            < anchors[:, q_block, None]
+        )
+    )
     noise_index = torch.arange(q_len, device=anchors.device)
     noise_allowed = (noise_index[None, :] // block_size) == q_block[:, None]
+    noise_allowed = noise_allowed.unsqueeze(0).expand(batch_size, -1, -1)
     mask = torch.cat([ctx_allowed, noise_allowed], dim=-1)
-    return mask.unsqueeze(0).unsqueeze(0)
+    if mask.shape != (batch_size, q_len, kv_len):
+        raise RuntimeError("constructed dense attention mask has an invalid shape")
+    return mask.unsqueeze(1)
 
 
 def make_flex_block_mask(
@@ -165,6 +193,7 @@ def make_flex_block_mask(
     block_size: int,
     device: torch.device,
     compile_mask: bool = True,
+    context_lengths: torch.Tensor | None = None,
 ):
     """Build a PyTorch FlexAttention BlockMask for packed DFlash blocks."""
 
@@ -173,19 +202,42 @@ def make_flex_block_mask(
     except ImportError as exc:  # pragma: no cover - depends on torch build
         raise RuntimeError("PyTorch FlexAttention is unavailable") from exc
 
-    num_blocks = int(anchors.numel())
-    context_len = int(context_original_positions.numel())
+    if anchors.ndim == 1:
+        anchors = anchors.unsqueeze(0)
+    if context_original_positions.ndim == 1:
+        context_original_positions = context_original_positions.unsqueeze(0)
+    if anchors.ndim != 2 or context_original_positions.ndim != 2:
+        raise ValueError("anchors and context_original_positions must be one- or two-dimensional")
+    if anchors.shape[0] != context_original_positions.shape[0]:
+        raise ValueError("anchors and context positions must have the same batch size")
+    batch_size, num_blocks = (int(value) for value in anchors.shape)
+    context_len = int(context_original_positions.shape[1])
     q_len = num_blocks * block_size
     kv_len = context_len + q_len
     anchors = anchors.to(device)
     context_original_positions = context_original_positions.to(device)
+    if context_lengths is None:
+        context_lengths = torch.full(
+            (batch_size,), context_len, dtype=torch.long, device=device
+        )
+    else:
+        context_lengths = context_lengths.to(device=device, dtype=torch.long).view(-1)
+    if context_lengths.shape[0] != batch_size:
+        raise ValueError("context_lengths must contain one value per batch item")
 
     def mask_mod(batch, head, q_idx, kv_idx):
         block = q_idx // block_size
         is_context = kv_idx < context_len
         if context_len:
             context_index = torch.clamp(kv_idx, 0, context_len - 1)
-            context_ok = is_context & (context_original_positions[context_index] < anchors[block])
+            context_ok = (
+                is_context
+                & (context_index < context_lengths[batch])
+                & (
+                    context_original_positions[batch, context_index]
+                    < anchors[batch, block]
+                )
+            )
         else:
             context_ok = torch.zeros_like(is_context)
         noise_index = kv_idx - context_len
@@ -200,7 +252,7 @@ def make_flex_block_mask(
         creator = _COMPILED_CREATE_BLOCK_MASK
     return creator(
         mask_mod,
-        B=1,
+        B=batch_size,
         H=None,
         Q_LEN=q_len,
         KV_LEN=kv_len,

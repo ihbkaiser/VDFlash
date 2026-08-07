@@ -336,14 +336,42 @@ class DFlashVLMModel(nn.Module):
         block_position_ids: torch.Tensor,
         anchors: torch.Tensor,
         context_original_positions: torch.Tensor,
+        context_lengths: torch.Tensor | None = None,
         use_flex_attention: bool = True,
         draft_context_cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         return_draft_context_cache: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
         if noise_embeddings.ndim != 3 or target_context.ndim != 3:
             raise ValueError("noise_embeddings and target_context must be [batch, length, hidden]")
-        if noise_embeddings.shape[0] != 1 or target_context.shape[0] != 1:
-            raise ValueError("the v1 trainer uses batch size one")
+        if noise_embeddings.shape[0] != target_context.shape[0]:
+            raise ValueError("noise embeddings and target context must have the same batch size")
+        batch_size = int(noise_embeddings.shape[0])
+        if anchors.ndim == 1:
+            anchors = anchors.unsqueeze(0)
+        if context_original_positions.ndim == 1:
+            context_original_positions = context_original_positions.unsqueeze(0)
+        if anchors.ndim != 2 or anchors.shape[0] != batch_size:
+            raise ValueError("anchors must have shape [batch, num_blocks]")
+        if (
+            context_original_positions.ndim != 2
+            or context_original_positions.shape[0] != batch_size
+        ):
+            raise ValueError(
+                "context_original_positions must have shape [batch, context_length]"
+            )
+        if context_lengths is None:
+            context_lengths = torch.full(
+                (batch_size,),
+                context_original_positions.shape[1],
+                dtype=torch.long,
+                device=noise_embeddings.device,
+            )
+        else:
+            context_lengths = context_lengths.to(
+                device=noise_embeddings.device, dtype=torch.long
+            ).view(-1)
+        if context_lengths.shape[0] != batch_size:
+            raise ValueError("context_lengths must contain one value per batch item")
         context = self.hidden_norm(self.fc(target_context))
         q_len = noise_embeddings.shape[1]
         if block_position_ids.shape[-1] != q_len:
@@ -355,10 +383,14 @@ class DFlashVLMModel(nn.Module):
                 block_size=self.block_size,
                 device=noise_embeddings.device,
                 compile_mask=self.compile_flex_attention,
+                context_lengths=context_lengths,
             )
         else:
             attention_mask = make_dense_attention_mask(
-                anchors, context_original_positions, block_size=self.block_size
+                anchors,
+                context_original_positions,
+                block_size=self.block_size,
+                context_lengths=context_lengths,
             ).to(device=noise_embeddings.device)
         hidden_states = noise_embeddings
         next_context_cache: list[tuple[torch.Tensor, torch.Tensor]] = []
@@ -370,7 +402,7 @@ class DFlashVLMModel(nn.Module):
             if len(cached_lengths) != 1:
                 raise ValueError("all draft layer context caches must have the same length")
             cached_context_len = cached_lengths.pop()
-        expected_context_len = int(context_original_positions.numel())
+        expected_context_len = int(context_original_positions.shape[1])
         if cached_context_len + int(target_context.shape[1]) != expected_context_len:
             raise ValueError(
                 "incremental DFlash context mismatch: "

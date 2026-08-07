@@ -112,11 +112,14 @@ BF16 distributed teacher caching/training:
 Launch both caching and training with `torchrun --standalone
 --nproc_per_node=8`. Training partitions each shuffled global batch without
 padding/repeating the last batch and manually all-reduces weighted gradients.
-Every completed optimizer step is durably committed to an atomic recovery
-checkpoint before `checkpoints/latest` advances. Long-lived snapshots default
-to every 0.5 epoch. Resume restores model, AdamW, cosine scheduler, global
-step, exact sample offset/permutation and Python/NumPy/Torch/CUDA RNG state for
-each rank; changes to the mathematical training contract are rejected.
+`recovery_save_every_steps` controls atomic recovery frequency and defaults to
+one. The 4×B200 7B presets use real four-record micro-batches, all 512 anchors
+per forward, static context padding, no activation checkpointing, and a
+50-step recovery interval. Graceful signals and the final step still force a
+commit; a hard failure can roll back to the latest interval. Long-lived
+snapshots default to every 0.5 epoch. Resume restores model, AdamW, cosine
+scheduler, global step, exact sample offset/permutation and per-rank RNG state;
+changes to the mathematical training contract are rejected.
 
 Stage 2's `checkpoint` field points directly to the final Stage 1 export. A
 Stage 2 `--resume auto`, by contrast, restores Stage 2's own full training

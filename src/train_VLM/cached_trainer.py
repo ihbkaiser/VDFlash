@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from contextlib import nullcontext
 import json
 import math
@@ -8,6 +9,7 @@ from pathlib import Path
 import random
 import signal
 import shutil
+import time
 from typing import Any
 import uuid
 
@@ -33,23 +35,43 @@ class TeacherCache:
             raise ValueError(f"unsupported teacher cache format in {self.directory}")
         if len(self.index) != int(self.metadata["cached_count"]):
             raise ValueError("teacher cache index count does not match metadata")
+        self._reader_cache: OrderedDict[Path, tuple[Any, Any]] = OrderedDict()
+        self._reader_cache_size = 4
 
-    def load_example(self, index: int, device: torch.device) -> dict[str, Any]:
+    def _reader(self, shard: str):
         try:
             from safetensors import safe_open
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("safetensors is required to load teacher shards") from exc
+        path = self.directory / shard
+        cached = self._reader_cache.pop(path, None)
+        if cached is None:
+            manager = safe_open(str(path), framework="pt", device="cpu")
+            reader = manager.__enter__()
+            cached = (manager, reader)
+        self._reader_cache[path] = cached
+        while len(self._reader_cache) > self._reader_cache_size:
+            _, (manager, _) = self._reader_cache.popitem(last=False)
+            manager.__exit__(None, None, None)
+        return cached[1]
+
+    def close(self) -> None:
+        while self._reader_cache:
+            _, (manager, _) = self._reader_cache.popitem(last=False)
+            manager.__exit__(None, None, None)
+
+    def load_example(self, index: int, device: torch.device) -> dict[str, Any]:
         entry = self.index[index]
         prefix = entry["tensor_prefix"]
         values: dict[str, torch.Tensor] = {}
-        with safe_open(str(self.directory / entry["shard"]), framework="pt", device="cpu") as reader:
-            for name in (
-                "input_ids",
-                "position_ids",
-                "context_hidden",
-                "context_original_positions",
-            ):
-                values[name] = reader.get_tensor(f"{prefix}.{name}").to(device)
+        reader = self._reader(entry["shard"])
+        for name in (
+            "input_ids",
+            "position_ids",
+            "context_hidden",
+            "context_original_positions",
+        ):
+            values[name] = reader.get_tensor(f"{prefix}.{name}").to(device)
         return {**entry, **values}
 
     def load_token_io(self, device: torch.device, dtype: torch.dtype) -> "FrozenTargetTokenIO":
@@ -148,8 +170,52 @@ def _autocast(device: torch.device, config: DFlashTrainConfig):
     return torch.autocast(device_type="cuda", dtype=_dtype(config))
 
 
-def _train_or_eval_example(
-    example: dict[str, Any],
+def _metric_zeros(device: torch.device) -> dict[str, torch.Tensor]:
+    return {
+        key: torch.zeros((), dtype=torch.float32, device=device)
+        for key in ("loss", "token_accuracy", "valid_tokens")
+    }
+
+
+def _collate_context(
+    examples: list[dict[str, Any]],
+    config: DFlashTrainConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pad cached context tensors into one real training micro-batch."""
+
+    if not examples:
+        raise ValueError("cannot collate an empty cached batch")
+    lengths = [int(example["context_original_positions"].numel()) for example in examples]
+    padded_length = config.max_seq_length if config.static_context_padding else max(lengths)
+    if max(lengths) > padded_length:
+        raise ValueError("cached context is longer than the configured padding length")
+    first_hidden = examples[0]["context_hidden"]
+    feature_width = int(first_hidden.shape[-1])
+    batch_size = len(examples)
+    target_context = first_hidden.new_zeros((batch_size, padded_length, feature_width))
+    first_positions = examples[0]["position_ids"]
+    context_positions = first_positions.new_zeros((3, batch_size, padded_length))
+    context_original = examples[0]["context_original_positions"].new_zeros(
+        (batch_size, padded_length)
+    )
+    for batch_index, (example, length) in enumerate(zip(examples, lengths)):
+        hidden = example["context_hidden"]
+        original = example["context_original_positions"]
+        if hidden.shape != (length, feature_width):
+            raise ValueError("cached context hidden tensor has an inconsistent shape")
+        target_context[batch_index, :length].copy_(hidden)
+        context_original[batch_index, :length].copy_(original)
+        context_positions[:, batch_index, :length].copy_(
+            example["position_ids"][:, original.long()]
+        )
+    context_lengths = torch.tensor(
+        lengths, dtype=torch.long, device=first_hidden.device
+    )
+    return target_context, context_positions, context_original, context_lengths
+
+
+def _train_or_eval_batch(
+    examples: list[dict[str, Any]],
     draft: DFlashVLMModel,
     token_io: FrozenTargetTokenIO,
     config: DFlashTrainConfig,
@@ -158,74 +224,98 @@ def _train_or_eval_example(
     anchor_chunk_size: int,
     backward_scale: float,
     backward: bool,
-) -> dict[str, float]:
-    input_ids = example["input_ids"].long().view(1, -1)
-    position_ids = example["position_ids"].long().unsqueeze(1)
-    context_original = example["context_original_positions"].long()
-    context_positions = position_ids[:, :, context_original]
-    context_hidden = example["context_hidden"].unsqueeze(0).clone()
-    generator = make_anchor_generator(
-        config.seed,
-        epoch,
-        str(example["manifest_id"]),
-        device=input_ids.device,
+) -> dict[str, torch.Tensor]:
+    if not examples:
+        raise ValueError("cannot train an empty cached batch")
+    device = examples[0]["input_ids"].device
+    anchors = torch.stack(
+        [
+            sample_anchor_positions(
+                int(example["response_start"]),
+                int(example["response_end"]),
+                config.block_size,
+                config.num_anchors,
+                generator=make_anchor_generator(
+                    config.seed,
+                    epoch,
+                    str(example["manifest_id"]),
+                    device=device,
+                ),
+                device=device,
+            )
+            for example in examples
+        ]
     )
-    anchors = sample_anchor_positions(
-        int(example["response_start"]),
-        int(example["response_end"]),
-        config.block_size,
-        config.num_anchors,
-        generator=generator,
-        device=input_ids.device,
+    target_context, context_positions, context_original, context_lengths = _collate_context(
+        examples, config
     )
     total_anchors = int(anchors.numel())
-    totals = {"loss": 0.0, "token_accuracy": 0.0, "valid_tokens": 0.0}
-    for start in range(0, total_anchors, anchor_chunk_size):
-        chunk = anchors[start : start + anchor_chunk_size]
-        blocks = build_masked_blocks(
-            input_ids,
-            chunk,
-            block_size=config.block_size,
-            mask_token_id=int(draft.mask_token_id),
-            position_ids=position_ids,
+    anchors_per_example = int(anchors.shape[1])
+    if total_anchors != len(examples) * anchors_per_example:
+        raise RuntimeError("batched anchors have an invalid shape")
+    totals = _metric_zeros(device)
+    for start in range(0, anchors_per_example, anchor_chunk_size):
+        chunk = anchors[:, start : start + anchor_chunk_size]
+        per_example_blocks = [
+            build_masked_blocks(
+                example["input_ids"],
+                chunk[batch_index],
+                block_size=config.block_size,
+                mask_token_id=int(draft.mask_token_id),
+                position_ids=example["position_ids"].unsqueeze(1),
+            )
+            for batch_index, example in enumerate(examples)
+        ]
+        block_input_ids = torch.stack(
+            [blocks.block_input_ids for blocks in per_example_blocks]
         )
+        labels = torch.stack([blocks.labels for blocks in per_example_blocks])
+        block_position_ids = torch.cat(
+            [blocks.block_position_ids for blocks in per_example_blocks], dim=1
+        )
+        chunk_anchors = int(chunk.shape[1])
         with torch.no_grad():
-            noise_embeddings = token_io.embed(blocks.block_input_ids.reshape(1, -1))
-        with _autocast(input_ids.device, config):
+            noise_embeddings = token_io.embed(
+                block_input_ids.reshape(len(examples), -1)
+            )
+        with _autocast(device, config):
             hidden = draft(
                 noise_embeddings=noise_embeddings,
-                target_context=context_hidden,
+                target_context=target_context,
                 context_position_ids=context_positions,
-                block_position_ids=blocks.block_position_ids,
-                anchors=blocks.anchors,
+                block_position_ids=block_position_ids,
+                anchors=chunk,
                 context_original_positions=context_original,
+                context_lengths=context_lengths,
                 use_flex_attention=config.use_flex_attention,
             )
-            logits = token_io.logits(hidden).reshape(
-                1,
-                chunk.numel(),
-                config.block_size,
-                -1,
+            # The anchor itself has no label. Slice before the 152K-vocabulary
+            # projection to save one sixteenth of LM-head work and logits RAM.
+            predicted_hidden = hidden.reshape(
+                len(examples), chunk_anchors, config.block_size, -1
             )[:, :, 1:, :]
-            labels = blocks.labels[:, 1:].unsqueeze(0).long()
+            logits = token_io.logits(predicted_hidden)
+            predicted_labels = labels[:, :, 1:].long()
             loss, metrics = weighted_block_cross_entropy(
                 logits,
-                labels,
+                predicted_labels,
                 decay=float(config.loss_decay),
+                tensor_metrics=True,
             )
-        if not torch.isfinite(loss):
-            raise FloatingPointError(f"non-finite DFlash loss for {example['manifest_id']}")
-        anchor_scale = float(chunk.numel()) / float(total_anchors)
+        anchor_scale = float(chunk_anchors) / float(anchors_per_example)
         if backward:
             (loss * anchor_scale * backward_scale).backward()
-        for key in totals:
-            totals[key] += metrics[key] * anchor_scale
+        totals["loss"] += metrics["loss"] * anchor_scale
+        totals["token_accuracy"] += metrics["token_accuracy"] * anchor_scale
+        totals["valid_tokens"] += metrics["valid_tokens"] / float(len(examples))
     return totals
 
 
-def _chunk_candidates(config: DFlashTrainConfig) -> list[int]:
+def _chunk_candidates(
+    config: DFlashTrainConfig, initial_chunk_size: int | None = None
+) -> list[int]:
     candidates: list[int] = []
-    value = min(config.anchor_chunk_size, config.num_anchors)
+    value = min(initial_chunk_size or config.anchor_chunk_size, config.num_anchors)
     while True:
         candidates.append(value)
         if value <= config.min_anchor_chunk_size:
@@ -247,22 +337,22 @@ def _run_group(
     *,
     epoch: int,
     device: torch.device,
-) -> tuple[dict[str, float], int]:
+    anchor_chunk_size: int | None = None,
+) -> tuple[dict[str, torch.Tensor], int]:
     if not indices:
         optimizer.zero_grad(set_to_none=True)
-        return {"loss": 0.0, "token_accuracy": 0.0, "valid_tokens": 0.0}, min(
-            config.anchor_chunk_size, config.num_anchors
-        )
+        return _metric_zeros(device), min(config.anchor_chunk_size, config.num_anchors)
     last_oom: BaseException | None = None
-    for chunk_size in _chunk_candidates(config):
+    for chunk_size in _chunk_candidates(config, anchor_chunk_size):
         optimizer.zero_grad(set_to_none=True)
-        totals = {"loss": 0.0, "token_accuracy": 0.0, "valid_tokens": 0.0}
+        totals = _metric_zeros(device)
         try:
-            scale = 1.0 / len(indices)
-            for index in indices:
-                example = cache.load_example(index, device)
-                metrics = _train_or_eval_example(
-                    example,
+            for batch_start in range(0, len(indices), config.micro_batch_size):
+                batch_indices = indices[batch_start : batch_start + config.micro_batch_size]
+                examples = [cache.load_example(index, device) for index in batch_indices]
+                scale = float(len(examples)) / float(len(indices))
+                metrics = _train_or_eval_batch(
+                    examples,
                     draft,
                     token_io,
                     config,
@@ -273,7 +363,7 @@ def _run_group(
                 )
                 for key in totals:
                     totals[key] += metrics[key] * scale
-                del example
+                del examples
             return totals, chunk_size
         except (RuntimeError, torch.cuda.OutOfMemoryError) as exc:
             if not _is_oom(exc):
@@ -298,23 +388,41 @@ def evaluate_cached_loss(
     was_training = draft.training
     draft.eval()
     count = min(config.eval_cache_samples, len(cache.index))
-    total = 0.0
-    for index in range(count):
-        example = cache.load_example(index, device)
-        metrics = _train_or_eval_example(
-            example,
-            draft,
-            token_io,
-            config,
-            epoch=0,
-            anchor_chunk_size=min(config.anchor_chunk_size, config.num_anchors),
-            backward_scale=1.0,
-            backward=False,
-        )
-        total += metrics["loss"]
+    total: torch.Tensor | None = None
+    last_oom: BaseException | None = None
+    for chunk_size in _chunk_candidates(config):
+        total = torch.zeros((), dtype=torch.float32, device=device)
+        try:
+            for batch_start in range(0, count, config.micro_batch_size):
+                batch_indices = list(
+                    range(batch_start, min(batch_start + config.micro_batch_size, count))
+                )
+                examples = [cache.load_example(index, device) for index in batch_indices]
+                metrics = _train_or_eval_batch(
+                    examples,
+                    draft,
+                    token_io,
+                    config,
+                    epoch=0,
+                    anchor_chunk_size=chunk_size,
+                    backward_scale=1.0,
+                    backward=False,
+                )
+                total += metrics["loss"] * (float(len(examples)) / float(count))
+            break
+        except (RuntimeError, torch.cuda.OutOfMemoryError) as exc:
+            if not _is_oom(exc):
+                raise
+            last_oom = exc
+            total = None
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            print(f"[eval-oom] retry with smaller anchor_chunk_size after {chunk_size}")
+    if total is None:
+        raise RuntimeError("cached evaluation OOM at minimum anchor chunk size") from last_oom
     if was_training:
         draft.train()
-    return total / count
+    return float(total.item())
 
 
 def _checkpoint_metadata(
@@ -497,7 +605,7 @@ def _broadcast_model(draft: DFlashVLMModel, distributed: DistributedContext) -> 
 
 def _synchronize_step(
     draft: DFlashVLMModel,
-    metrics: dict[str, float],
+    metrics: dict[str, torch.Tensor],
     local_records: int,
     global_records: int,
     chunk_size: int,
@@ -539,16 +647,18 @@ def _synchronize_step(
             bucket_bytes += gradient_bytes
         reduce_bucket()
 
-    packed = torch.tensor(
+    metric_values = torch.stack(
+        [metrics["loss"], metrics["token_accuracy"], metrics["valid_tokens"]]
+    ).to(device=distributed.device, dtype=torch.float64)
+    packed = torch.cat(
         [
-            metrics["loss"] * local_records,
-            metrics["token_accuracy"] * local_records,
-            metrics["valid_tokens"] * local_records,
-            float(local_records),
-            float(chunk_size),
-        ],
-        dtype=torch.float64,
-        device=distributed.device,
+            metric_values * float(local_records),
+            torch.tensor(
+                [float(local_records), float(chunk_size)],
+                dtype=torch.float64,
+                device=distributed.device,
+            ),
+        ]
     )
     if distributed.enabled:
         dist.all_reduce(packed[:4], op=dist.ReduceOp.SUM)
@@ -602,6 +712,8 @@ def _training_contract(
         "seed": config.seed,
         "micro_batch_size": config.micro_batch_size,
         "gradient_accumulation_steps": config.gradient_accumulation_steps,
+        "static_context_padding": config.static_context_padding,
+        "shuffle_by_shard": config.shuffle_by_shard,
         "learning_rate": config.learning_rate,
         "weight_decay": config.weight_decay,
         "adam_beta1": config.adam_beta1,
@@ -632,11 +744,12 @@ def _validate_training_contract(saved: Any, current: dict[str, Any]) -> None:
         raise ValueError(
             "checkpoint predates the exact-resume training contract and cannot be resumed safely"
         )
-    differences = {
-        key: {"checkpoint": saved.get(key), "current": value}
-        for key, value in current.items()
-        if saved.get(key) != value
-    }
+    false_when_missing = {"static_context_padding", "shuffle_by_shard"}
+    differences = {}
+    for key, value in current.items():
+        saved_value = saved.get(key, False) if key in false_when_missing else saved.get(key)
+        if saved_value != value:
+            differences[key] = {"checkpoint": saved_value, "current": value}
     if differences:
         raise ValueError(
             "exact resume rejected changed training parameters: "
@@ -730,7 +843,7 @@ def _commit_recovery_checkpoint(
     step: int,
     snapshot_name: str | None,
 ) -> None:
-    """Commit every completed optimizer step and atomically advance ``latest``."""
+    """Commit a recoverable optimizer state and atomically advance ``latest``."""
 
     rng_states = _gather_rng_states(distributed)
     if distributed.is_main:
@@ -839,6 +952,29 @@ def _reload_checkpoint_on_cpu(
     print("[reload] checkpoint weights are bit-exact")
 
 
+def _epoch_order(
+    cache: TeacherCache,
+    seed: int,
+    *,
+    shuffle_by_shard: bool,
+) -> list[int]:
+    rng = random.Random(seed)
+    if not shuffle_by_shard:
+        order = list(range(len(cache.index)))
+        rng.shuffle(order)
+        return order
+    by_shard: dict[str, list[int]] = {}
+    for index, entry in enumerate(cache.index):
+        by_shard.setdefault(str(entry["shard"]), []).append(index)
+    groups = list(by_shard.values())
+    rng.shuffle(groups)
+    order: list[int] = []
+    for group in groups:
+        rng.shuffle(group)
+        order.extend(group)
+    return order
+
+
 def train_cached_draft(config: DFlashTrainConfig) -> list[dict[str, Any]]:
     global _STOP_REQUESTED
     _STOP_REQUESTED = False
@@ -863,6 +999,7 @@ def train_cached_draft(config: DFlashTrainConfig) -> list[dict[str, Any]]:
         betas=(config.adam_beta1, config.adam_beta2),
         eps=config.adam_eps,
         weight_decay=config.weight_decay,
+        fused=device.type == "cuda",
     )
     local_records_per_step = config.micro_batch_size * config.gradient_accumulation_steps
     global_records_per_step = local_records_per_step * distributed.world_size
@@ -947,8 +1084,11 @@ def train_cached_draft(config: DFlashTrainConfig) -> list[dict[str, Any]]:
             raise ValueError("sampler epoch does not match trainer progress")
         if int(saved_sampler_state.get("next_sample_offset", -1)) != next_sample_offset:
             raise ValueError("sampler offset does not match trainer progress")
-        expected_order = list(range(len(cache.index)))
-        random.Random(config.seed + start_epoch).shuffle(expected_order)
+        expected_order = _epoch_order(
+            cache,
+            config.seed + start_epoch,
+            shuffle_by_shard=config.shuffle_by_shard,
+        )
         if list(saved_sampler_state.get("order", [])) != expected_order:
             raise ValueError("saved sampler permutation does not match seed/cache contract")
         rng_states = state.get("rng_states")
@@ -974,6 +1114,9 @@ def train_cached_draft(config: DFlashTrainConfig) -> list[dict[str, Any]]:
             f"micro_batch_per_rank={config.micro_batch_size} "
             f"grad_accum={config.gradient_accumulation_steps} "
             f"global_records_per_step={global_records_per_step} params={trainable_parameters} "
+            f"anchor_chunk={config.anchor_chunk_size} "
+            f"static_context_padding={config.static_context_padding} "
+            f"recovery_every={config.recovery_save_every_steps} "
             f"target_transformer_loaded=False initial_loss={initial_eval_loss:.6f}"
         )
 
@@ -981,6 +1124,11 @@ def train_cached_draft(config: DFlashTrainConfig) -> list[dict[str, Any]]:
     resume_epoch = start_epoch
     resume_next_sample = next_sample_offset
     interrupted = False
+    runtime_anchor_chunk_size = (
+        int(history[-1].get("anchor_chunk_size", config.anchor_chunk_size))
+        if history
+        else config.anchor_chunk_size
+    )
     previous_handlers = {
         signum: signal.getsignal(signum) for signum in (signal.SIGTERM, signal.SIGINT)
     }
@@ -990,15 +1138,16 @@ def train_cached_draft(config: DFlashTrainConfig) -> list[dict[str, Any]]:
         for epoch in range(start_epoch, config.epochs):
             if stop:
                 break
-            order = list(range(len(cache.index)))
-            random.Random(config.seed + epoch).shuffle(order)
+            order = _epoch_order(
+                cache,
+                config.seed + epoch,
+                shuffle_by_shard=config.shuffle_by_shard,
+            )
             first = next_sample_offset if epoch == start_epoch else 0
             if epoch == start_epoch and saved_sampler_state is not None:
                 order = list(saved_sampler_state["order"])
             for group_start in range(first, len(order), global_records_per_step):
-                if _stop_requested(distributed):
-                    interrupted = True
-                    break
+                step_started_at = time.perf_counter()
                 global_indices = order[
                     group_start : group_start + global_records_per_step
                 ]
@@ -1015,6 +1164,7 @@ def train_cached_draft(config: DFlashTrainConfig) -> list[dict[str, Any]]:
                     optimizer,
                     epoch=epoch,
                     device=device,
+                    anchor_chunk_size=runtime_anchor_chunk_size,
                 )
                 metrics, chunk_size = _synchronize_step(
                     draft,
@@ -1024,6 +1174,7 @@ def train_cached_draft(config: DFlashTrainConfig) -> list[dict[str, Any]]:
                     local_chunk_size,
                     distributed,
                 )
+                runtime_anchor_chunk_size = chunk_size
                 if global_step == 0:
                     _validate_gradients(draft, token_io)
                     if distributed.is_main:
@@ -1036,6 +1187,8 @@ def train_cached_draft(config: DFlashTrainConfig) -> list[dict[str, Any]]:
                     raise FloatingPointError("gradient norm is NaN or Inf")
                 optimizer.step()
                 scheduler.step()
+                grad_norm_value = float(torch.as_tensor(grad_norm).detach().cpu())
+                compute_seconds = max(time.perf_counter() - step_started_at, 1e-9)
                 global_step += 1
                 samples_seen += len(global_indices)
                 next_offset = min(group_start + len(global_indices), len(order))
@@ -1047,9 +1200,12 @@ def train_cached_draft(config: DFlashTrainConfig) -> list[dict[str, Any]]:
                     "loss": metrics["loss"],
                     "token_accuracy": metrics["token_accuracy"],
                     "lr": scheduler.get_last_lr()[0],
-                    "grad_norm": float(torch.as_tensor(grad_norm).detach().cpu()),
+                    "grad_norm": grad_norm_value,
                     "anchor_chunk_size": chunk_size,
+                    "micro_batch_size": config.micro_batch_size,
                     "records": len(global_indices),
+                    "compute_seconds": compute_seconds,
+                    "compute_records_per_s": len(global_indices) / compute_seconds,
                     "samples_seen": samples_seen,
                 }
                 history.append(row)
@@ -1076,26 +1232,39 @@ def train_cached_draft(config: DFlashTrainConfig) -> list[dict[str, Any]]:
                     epoch_size=len(order),
                     step=global_step,
                 )
-                _commit_recovery_checkpoint(
-                    checkpoint_root,
-                    cache,
-                    draft,
-                    config,
-                    optimizer,
-                    scheduler,
-                    progress,
-                    distributed,
-                    step=global_step,
-                    snapshot_name=snapshot,
+                stop_after_step = _stop_requested(distributed)
+                max_steps_reached = bool(
+                    config.max_train_steps and global_step >= config.max_train_steps
                 )
+                training_finished = next_offset == len(order) and epoch + 1 >= config.epochs
+                recovery_due = global_step % config.recovery_save_every_steps == 0
+                if (
+                    recovery_due
+                    or snapshot is not None
+                    or stop_after_step
+                    or max_steps_reached
+                    or training_finished
+                ):
+                    _commit_recovery_checkpoint(
+                        checkpoint_root,
+                        cache,
+                        draft,
+                        config,
+                        optimizer,
+                        scheduler,
+                        progress,
+                        distributed,
+                        step=global_step,
+                        snapshot_name=snapshot,
+                    )
                 if distributed.is_main:
                     print("[step] " + json.dumps(row, sort_keys=True))
                     if snapshot is not None:
                         print(f"[checkpoint] snapshot={checkpoint_root / snapshot}")
-                if config.max_train_steps and global_step >= config.max_train_steps:
+                if max_steps_reached:
                     stop = True
                     break
-                if _stop_requested(distributed):
+                if stop_after_step:
                     interrupted = True
                     break
             next_sample_offset = 0
@@ -1113,6 +1282,7 @@ def train_cached_draft(config: DFlashTrainConfig) -> list[dict[str, Any]]:
                 f"resume={checkpoint_root / 'latest'}"
             )
         distributed.barrier()
+        cache.close()
         distributed.close()
         return history
 
@@ -1122,8 +1292,11 @@ def train_cached_draft(config: DFlashTrainConfig) -> list[dict[str, Any]]:
         # boundary; retain the completed epoch state rather than inventing a
         # permutation which was never consumed.
         pass
-    final_order = list(range(len(cache.index)))
-    random.Random(config.seed + resume_epoch).shuffle(final_order)
+    final_order = _epoch_order(
+        cache,
+        config.seed + resume_epoch,
+        shuffle_by_shard=config.shuffle_by_shard,
+    )
     final_progress = {
         "global_step": global_step,
         "epoch": resume_epoch,
@@ -1167,6 +1340,7 @@ def train_cached_draft(config: DFlashTrainConfig) -> list[dict[str, Any]]:
         peak_tensor = torch.tensor(peak, device=device)
         dist.all_reduce(peak_tensor, op=dist.ReduceOp.MAX)
         peak = float(peak_tensor.item())
+    cache.close()
     decreased = final_eval_loss < initial_eval_loss
     if distributed.is_main:
         print(

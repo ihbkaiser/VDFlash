@@ -51,6 +51,10 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--gradient-clip-norm", type=float, default=None)
     parser.add_argument("--micro-batch-size", type=int, default=None)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=None)
+    parser.add_argument(
+        "--static-context-padding", action=argparse.BooleanOptionalAction, default=None
+    )
+    parser.add_argument("--shuffle-by-shard", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--dtype", dest="mixed_precision", choices=["no", "bf16", "fp16"], default=None)
     parser.add_argument("--max-seq-len", dest="max_seq_length", type=int, default=None)
     parser.add_argument("--block-size", type=int, default=None)
@@ -84,6 +88,7 @@ def add_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--eval-cache-samples", type=int, default=None)
     parser.add_argument("--save-every-steps", type=int, default=None)
     parser.add_argument("--save-every-epochs", type=float, default=None)
+    parser.add_argument("--recovery-save-every-steps", type=int, default=None)
     parser.add_argument("--keep-last-checkpoints", type=int, default=None)
     parser.add_argument("--auto-resume", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--distributed-backend", choices=["nccl", "gloo"], default=None)

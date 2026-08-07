@@ -23,7 +23,8 @@ def weighted_block_cross_entropy(
     *,
     decay: float,
     ignore_index: int = -100,
-) -> tuple[torch.Tensor, dict[str, float]]:
+    tensor_metrics: bool = False,
+) -> tuple[torch.Tensor, dict[str, float] | dict[str, torch.Tensor]]:
     """Compute DFlash's position-weighted CE.
 
     ``logits`` is ``[..., block_size - 1, vocab]`` and ``labels`` is
@@ -52,9 +53,19 @@ def weighted_block_cross_entropy(
     with torch.no_grad():
         predictions = logits.argmax(dim=-1)
         accuracy = (predictions.eq(labels) & valid).sum() / valid.sum().clamp_min(1)
-        metrics = {
-            "loss": float(loss.detach().cpu()),
-            "token_accuracy": float(accuracy.detach().cpu()),
-            "valid_tokens": float(valid.sum().detach().cpu()),
-        }
+        if tensor_metrics:
+            # Cached training aggregates these on device and transfers only one
+            # packed metric tensor per optimizer step. Calling ``.cpu()`` for
+            # every anchor chunk otherwise serializes the CUDA pipeline.
+            metrics = {
+                "loss": loss.detach(),
+                "token_accuracy": accuracy.detach(),
+                "valid_tokens": valid.sum().detach(),
+            }
+        else:
+            metrics = {
+                "loss": float(loss.detach().cpu()),
+                "token_accuracy": float(accuracy.detach().cpu()),
+                "valid_tokens": float(valid.sum().detach().cpu()),
+            }
     return loss, metrics

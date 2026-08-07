@@ -57,6 +57,8 @@ class DFlashTrainConfig:
     gradient_clip_norm: float = 1.0
     gradient_accumulation_steps: int = 8
     micro_batch_size: int = 1
+    static_context_padding: bool = False
+    shuffle_by_shard: bool = False
     max_train_steps: int = 0
     eval_cache_samples: int = 4
     require_loss_decrease: bool = False
@@ -70,6 +72,7 @@ class DFlashTrainConfig:
     temperature: float = 0.0
     save_every_steps: int = 1000
     save_every_epochs: float = 0.5
+    recovery_save_every_steps: int = 1
     keep_last_checkpoints: int = 3
     auto_resume: bool = True
     distributed_backend: str = "nccl"
@@ -118,6 +121,8 @@ class DFlashTrainConfig:
             raise ValueError("save_every_steps must be non-negative")
         if self.save_every_epochs < 0:
             raise ValueError("save_every_epochs must be non-negative")
+        if self.recovery_save_every_steps < 1:
+            raise ValueError("recovery_save_every_steps must be positive")
         if self.distributed_backend not in {"nccl", "gloo"}:
             raise ValueError("distributed_backend must be 'nccl' or 'gloo'")
         if self.cache_log_every < 1:
