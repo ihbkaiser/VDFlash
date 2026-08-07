@@ -18,7 +18,12 @@ from src.train_VLM.config import DFlashTrainConfig
 from src.train_VLM.cached_trainer import FrozenTargetTokenIO
 from src.train_VLM.losses import weighted_block_cross_entropy
 from src.train_VLM.model import DFlashVLMModel, MultiModalRotaryEmbedding, RMSNorm
-from src.train_VLM.teacher_cache import _fit_clean_sequence, _generate_target_response_ids
+from src.train_VLM.teacher_cache import (
+    _PreparedTeacherExample,
+    _batch_text_inputs,
+    _fit_clean_sequence,
+    _generate_target_response_ids,
+)
 from src.train_VLM.target import Qwen25VLTargetAdapter, load_jsonl
 from src.train_VLM.trainer import (
     load_draft_checkpoint,
@@ -215,6 +220,10 @@ def test_dataset_teacher_mode_disables_generation_budget():
             teacher_response_mode="target_generate",
             response_max_new_tokens=0,
         )
+    batched = DFlashTrainConfig(teacher_batch_size=8)
+    assert batched.teacher_length_bucket_size == 128
+    with pytest.raises(ValueError, match="bucket_size"):
+        DFlashTrainConfig(teacher_batch_size=8, teacher_length_bucket_size=4)
 
 
 def test_sharegpt_manifest_keeps_multi_turn_context_and_final_response(tmp_path):
@@ -643,6 +652,54 @@ def test_teacher_response_extends_multimodal_token_types_as_text():
     assert (response_start, response_end) == (3, 5)
 
 
+def test_batched_dataset_teacher_preparation_stays_on_cpu_until_forward():
+    class Tokenizer:
+        def __call__(self, _text, **_kwargs):
+            return SimpleNamespace(input_ids=[4, 5])
+
+    class Processor:
+        tokenizer = Tokenizer()
+
+        def apply_chat_template(self, _messages, *, add_generation_prompt, **_kwargs):
+            return "prompt" if add_generation_prompt else "prompt response"
+
+    adapter = object.__new__(Qwen25VLTargetAdapter)
+    adapter.device = torch.device("meta")
+    adapter.processor = Processor()
+    adapter.prepare_messages = MethodType(
+        lambda self, _messages, *, device=None: (
+            {
+                "input_ids": torch.tensor([[1, 2, 3]], device=device),
+                "attention_mask": torch.ones(1, 3, dtype=torch.long, device=device),
+            },
+            None,
+        ),
+        adapter,
+    )
+    config = DFlashTrainConfig(
+        stage="text",
+        max_seq_length=16,
+        block_size=2,
+        teacher_batch_size=2,
+        teacher_response_mode="dataset",
+        response_max_new_tokens=0,
+    )
+
+    inputs, position_ids, response_start, response_end, _, _ = _fit_clean_sequence(
+        adapter,
+        {
+            "messages": [{"role": "user", "content": "x"}],
+            "target_text": "response",
+        },
+        config,
+    )
+
+    assert inputs["input_ids"].device.type == "cpu"
+    assert inputs["input_ids"].tolist() == [[1, 2, 3, 4, 5]]
+    assert position_ids.device.type == "cpu"
+    assert (response_start, response_end) == (3, 5)
+
+
 def test_multimodal_position_ids_fail_closed_without_qwen_rope_api():
     adapter = object.__new__(Qwen25VLTargetAdapter)
     adapter.model = SimpleNamespace()
@@ -747,6 +804,37 @@ def test_tiny_qwen25vl_decoder_uses_target_cache():
         "attention_mask": torch.ones_like(prompt),
         "position_ids": torch.arange(3).view(1, 1, -1).expand(3, 1, -1),
     }
+    longer_ids = torch.tensor([[6, 7, 8, 9, 10]])
+    longer_inputs = {
+        "input_ids": longer_ids,
+        "attention_mask": torch.ones_like(longer_ids),
+        "position_ids": torch.arange(5).view(1, 1, -1).expand(3, 1, -1),
+    }
+    layer_ids = [1, 4]
+    expected_prompt = adapter.selected_hidden_features(
+        adapter.forward_clean(inputs), layer_ids
+    )
+    expected_longer = adapter.selected_hidden_features(
+        adapter.forward_clean(longer_inputs), layer_ids
+    )
+    teacher_examples = [
+        _PreparedTeacherExample(
+            source_offset=index,
+            record={"id": str(index)},
+            inputs=values,
+            position_ids=values["position_ids"],
+            response_start=1,
+            response_end=int(values["input_ids"].shape[1]),
+            response_truncated=False,
+            dropped_turns=0,
+        )
+        for index, values in enumerate((inputs, longer_inputs))
+    ]
+    batched_inputs = _batch_text_inputs(teacher_examples, pad_token_id=0)
+    selected = adapter.forward_selected_hidden(batched_inputs, layer_ids)
+    torch.testing.assert_close(selected[0, :3], expected_prompt[0])
+    torch.testing.assert_close(selected[1, :5], expected_longer[0])
+
     result = decoder.generate(inputs, max_new_tokens=5)
     assert result.output_ids.shape == (1, 8)
     assert sum(result.acceptance_lengths) >= 3

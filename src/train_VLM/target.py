@@ -360,18 +360,21 @@ class Qwen25VLTargetAdapter:
                 f"refusing an unsafe 1D fallback ({detail})"
             )
         length = inputs["input_ids"].shape[-1]
-        position = torch.arange(length, device=self.device).view(1, 1, -1)
+        position = torch.arange(length, device=inputs["input_ids"].device).view(1, 1, -1)
         return position.expand(3, 1, -1)
 
     def prepare_messages(
-        self, messages: list[dict[str, Any]]
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        device: torch.device | None = None,
     ) -> tuple[dict[str, Any], VideoProcessorMetadata]:
         """Create one batch-size-one processor input on the target device."""
 
         return prepare_qwen_messages(
             self.processor,
             messages,
-            device=self.device,
+            device=device or self.device,
             processor_kwargs=getattr(self.processor, "dflash_processor_kwargs", {}),
             video_reader=getattr(self, "video_reader", "torchvision"),
             image_min_pixels=getattr(self, "image_min_pixels", None),
@@ -434,6 +437,122 @@ class Qwen25VLTargetAdapter:
             use_cache=False,
             return_dict=True,
         )
+
+    def _decoder_layers(self) -> Any | None:
+        """Resolve the Qwen text decoder without depending on one HF layout."""
+
+        candidates = [
+            getattr(getattr(self.model, "model", None), "language_model", None),
+            getattr(self.model, "language_model", None),
+            getattr(self.model, "model", None),
+            self.model,
+        ]
+        for candidate in candidates:
+            layers = getattr(candidate, "layers", None)
+            if layers is not None:
+                return layers
+        return None
+
+    @torch.inference_mode()
+    def forward_selected_hidden(
+        self,
+        inputs: dict[str, Any],
+        layer_ids: Iterable[int],
+    ) -> torch.Tensor:
+        """Return only requested decoder features without materializing LM logits.
+
+        Teacher caching does not consume target logits. Calling the conditional
+        generation wrapper would nevertheless project every sequence position
+        over the full vocabulary. Forward hooks also retain only the requested
+        decoder layers instead of all target hidden states.
+        """
+
+        requested = [int(layer_id) for layer_id in layer_ids]
+        layers = self._decoder_layers()
+        if layers is None or not requested:
+            outputs = self.forward_clean(inputs)
+            return self.selected_hidden_features(outputs, requested)
+        if min(requested) < 0 or max(requested) >= len(layers):
+            raise ValueError("selected target layer is outside the decoder")
+        if max(requested) == len(layers) - 1:
+            # Transformers applies the final RMSNorm before exposing the last
+            # hidden-state tuple entry, so the raw final-layer hook is not an
+            # exact replacement in this uncommon configuration.
+            backbone = getattr(self.model, "model", None)
+            if backbone is not None:
+                outputs = backbone(
+                    **inputs,
+                    output_hidden_states=True,
+                    output_attentions=False,
+                    use_cache=False,
+                    return_dict=True,
+                )
+            else:
+                outputs = self.forward_clean(inputs)
+            return self.selected_hidden_features(outputs, requested)
+
+        captured: dict[int, torch.Tensor] = {}
+
+        class SelectedLayersComplete(Exception):
+            pass
+
+        def make_hook(layer_id: int):
+            def capture(_module: Any, _arguments: Any, output: Any) -> None:
+                hidden = output[0] if isinstance(output, (tuple, list)) else output
+                if not torch.is_tensor(hidden):
+                    raise RuntimeError(
+                        f"target decoder layer {layer_id} did not return a hidden tensor"
+                    )
+                captured[layer_id] = hidden
+                if layer_id == max(requested):
+                    # No later decoder output contributes to the cache.
+                    raise SelectedLayersComplete
+
+            return capture
+
+        handles = [
+            layers[layer_id].register_forward_hook(make_hook(layer_id))
+            for layer_id in sorted(set(requested))
+        ]
+        self.model.eval()
+        try:
+            backbone = getattr(self.model, "model", None)
+            try:
+                if backbone is not None:
+                    backbone(
+                        **inputs,
+                        output_hidden_states=False,
+                        output_attentions=False,
+                        use_cache=False,
+                        return_dict=True,
+                    )
+                else:  # Compatibility fallback for wrappers without an exposed backbone.
+                    try:
+                        self.model(
+                            **inputs,
+                            output_hidden_states=False,
+                            output_attentions=False,
+                            use_cache=False,
+                            return_dict=True,
+                            logits_to_keep=1,
+                        )
+                    except TypeError:
+                        self.model(
+                            **inputs,
+                            output_hidden_states=False,
+                            output_attentions=False,
+                            use_cache=False,
+                            return_dict=True,
+                        )
+            except SelectedLayersComplete:
+                pass
+        finally:
+            for handle in handles:
+                handle.remove()
+        missing = sorted(set(requested).difference(captured))
+        if missing:
+            raise RuntimeError(f"target forward did not visit selected layers: {missing}")
+        return torch.cat([captured[layer_id] for layer_id in requested], dim=-1)
 
     def selected_hidden_features(self, outputs: Any, layer_ids: Iterable[int]) -> torch.Tensor:
         hidden_states = outputs.hidden_states

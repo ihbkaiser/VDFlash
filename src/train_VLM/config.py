@@ -28,6 +28,10 @@ class DFlashTrainConfig:
     prepared_manifest: str = "data/video_dflash/manifest.jsonl"
     teacher_cache_dir: str = "data/video_dflash/teacher_cache"
     cache_shard_size: int = 8
+    teacher_batch_size: int = 1
+    teacher_length_bucket_size: int = 0
+    teacher_preprocess_workers: int = 1
+    teacher_write_queue_depth: int = 0
     selective_image_download: bool = True
     overwrite: bool = False
     context_mode: Literal["full", "text_only"] = "full"
@@ -128,6 +132,20 @@ class DFlashTrainConfig:
             raise ValueError("max_samples must be non-negative (zero means all records)")
         if self.cache_shard_size < 1:
             raise ValueError("cache_shard_size must be positive")
+        if self.teacher_batch_size < 1:
+            raise ValueError("teacher_batch_size must be positive")
+        if self.teacher_length_bucket_size == 0:
+            self.teacher_length_bucket_size = (
+                16 * self.teacher_batch_size if self.teacher_batch_size > 1 else 1
+            )
+        elif self.teacher_length_bucket_size < self.teacher_batch_size:
+            raise ValueError(
+                "teacher_length_bucket_size must be >= teacher_batch_size"
+            )
+        if self.teacher_preprocess_workers < 1:
+            raise ValueError("teacher_preprocess_workers must be positive")
+        if self.teacher_write_queue_depth < 0:
+            raise ValueError("teacher_write_queue_depth must be non-negative")
         if self.micro_batch_size < 1 or self.gradient_accumulation_steps < 1:
             raise ValueError("micro_batch_size and gradient_accumulation_steps must be positive")
         if self.max_train_steps < 0 or self.eval_cache_samples < 1:

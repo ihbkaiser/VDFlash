@@ -156,6 +156,13 @@ python -m src.train_VLM.smoke_video \
 Mỗi rank load một frozen target trên GPU riêng, xử lý một phần không trùng nhau
 của manifest, ghi shard riêng rồi rank 0 merge index theo thứ tự source.
 
+Preset 3B/4×B200 tối ưu riêng bước này bằng batch 64 trên mỗi GPU, bucket 1.024
+sequence theo độ dài, 8 CPU preprocessing workers/rank, shard 32 records và
+hàng đợi ghi đĩa nền sâu 2. Target forward gọi thẳng backbone, dừng ngay sau
+selected layer cuối và chỉ giữ 5 hidden layers cần cache; LM-head cùng các
+decoder layer phía sau không được tính. Nếu batch 64 không vừa VRAM, cache tự
+chia đôi batch bị OOM mà không thay đổi dữ liệu đầu ra.
+
 ```bash
 torchrun --standalone --nproc_per_node=8 \
   -m src.train_VLM.cache_teacher_features \
@@ -164,6 +171,15 @@ torchrun --standalone --nproc_per_node=8 \
 torchrun --standalone --nproc_per_node=8 \
   -m src.train_VLM.cache_teacher_features \
   --config src/train_VLM/config_b200_8gpu_stage2_llava.json
+```
+
+Chạy riêng 3B trên GPU 0–3:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+torchrun --standalone --nproc_per_node=4 \
+  -m src.train_VLM.cache_teacher_features \
+  --config src/train_VLM/config_b200_4gpu_3b_stage1_sharegpt.json
 ```
 
 Cache lưu BF16 losslessly. Với hidden size 2048, 5 features và mọi sequence đều

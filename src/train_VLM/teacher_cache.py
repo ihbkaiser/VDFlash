@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 import copy
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import shutil
+import time
 from typing import Any
 
 import torch
@@ -65,11 +69,19 @@ def _fit_prompt(
     adapter: Qwen25VLTargetAdapter,
     record: dict[str, Any],
     config: DFlashTrainConfig,
+    *,
+    preparation_device: torch.device | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], int, int]:
     messages = copy.deepcopy(record["messages"])
     dropped_turns = 0
     while True:
-        prompt_inputs, _ = adapter.prepare_messages(messages)
+        if preparation_device is None:
+            prompt_inputs, _ = adapter.prepare_messages(messages)
+        else:
+            prompt_inputs, _ = adapter.prepare_messages(
+                messages,
+                device=preparation_device,
+            )
         prompt_length = int(prompt_inputs["input_ids"].shape[1])
         if prompt_length <= config.max_seq_length - config.block_size:
             break
@@ -123,8 +135,18 @@ def _fit_clean_sequence(
     record: dict[str, Any],
     config: DFlashTrainConfig,
 ) -> tuple[dict[str, Any], torch.Tensor, int, int, bool, int]:
+    preparation_device = (
+        torch.device("cpu")
+        if config.stage == "text"
+        and config.teacher_response_mode == "dataset"
+        and config.teacher_batch_size > 1
+        else None
+    )
     messages, prompt_inputs, prompt_length, dropped_turns = _fit_prompt(
-        adapter, record, config
+        adapter,
+        record,
+        config,
+        preparation_device=preparation_device,
     )
 
     if config.teacher_response_mode == "target_generate":
@@ -155,20 +177,190 @@ def _fit_clean_sequence(
     response_tensor = torch.tensor(
         response_ids,
         dtype=prompt_inputs["input_ids"].dtype,
-        device=adapter.device,
+        device=prompt_inputs["input_ids"].device,
     ).view(1, -1)
     full_ids = torch.cat([prompt_inputs["input_ids"], response_tensor], dim=1)
     inputs = dict(prompt_inputs)
     adapter._set_input_sequence(inputs, full_ids)
     inputs.pop("position_ids", None)
     inputs.pop("cache_position", None)
-    position_ids = adapter._compute_position_ids(inputs)
+    if preparation_device is not None:
+        # Pure text uses identical temporal/height/width positions. Avoid a
+        # model API call so CPU preprocessing remains cheap and thread-safe.
+        position_ids = torch.arange(
+            full_ids.shape[1],
+            device=full_ids.device,
+        ).view(1, 1, -1).expand(3, 1, -1)
+    else:
+        position_ids = adapter._compute_position_ids(inputs)
     inputs["position_ids"] = position_ids
     return inputs, position_ids, prompt_length, int(full_ids.shape[1]), response_truncated, dropped_turns
 
 
+@dataclass
+class _PreparedTeacherExample:
+    source_offset: int
+    record: dict[str, Any]
+    inputs: dict[str, Any]
+    position_ids: torch.Tensor
+    response_start: int
+    response_end: int
+    response_truncated: bool
+    dropped_turns: int
+
+
+def _pad_last_dimension(
+    value: torch.Tensor,
+    length: int,
+    *,
+    pad_value: int | float,
+) -> torch.Tensor:
+    missing = length - int(value.shape[-1])
+    if missing < 0:
+        raise ValueError("cannot pad a tensor to a shorter sequence length")
+    if missing == 0:
+        return value
+    padding = value.new_full((*value.shape[:-1], missing), pad_value)
+    return torch.cat([value, padding], dim=-1)
+
+
+def _batch_text_inputs(
+    examples: list[_PreparedTeacherExample],
+    *,
+    pad_token_id: int,
+) -> dict[str, Any]:
+    """Right-pad pure-text Qwen inputs without changing valid-token outputs."""
+
+    if not examples:
+        raise ValueError("cannot batch an empty teacher example list")
+    if len(examples) == 1:
+        return examples[0].inputs
+    visual_keys = {
+        "pixel_values",
+        "pixel_values_videos",
+        "image_grid_thw",
+        "video_grid_thw",
+        "second_per_grid_ts",
+    }
+    if any(key in example.inputs for example in examples for key in visual_keys):
+        raise ValueError("batched teacher caching currently supports pure-text records only")
+
+    lengths = [example.response_end for example in examples]
+    padded_length = max(lengths)
+    keys = set(examples[0].inputs)
+    if any(set(example.inputs) != keys for example in examples[1:]):
+        raise ValueError("teacher examples in one batch must expose identical input keys")
+
+    result: dict[str, Any] = {}
+    for key in sorted(keys):
+        values = [example.inputs[key] for example in examples]
+        first = values[0]
+        if not torch.is_tensor(first):
+            if any(value != first for value in values[1:]):
+                raise ValueError(f"non-tensor teacher input {key!r} differs within a batch")
+            result[key] = first
+            continue
+        if not all(torch.is_tensor(value) for value in values):
+            raise ValueError(f"teacher input {key!r} mixes tensor and non-tensor values")
+
+        if key == "position_ids":
+            if any(
+                value.ndim != 3
+                or value.shape[0] != 3
+                or value.shape[1] != 1
+                or value.shape[-1] != length
+                for value, length in zip(values, lengths)
+            ):
+                raise ValueError("position_ids must have shape [3, 1, sequence_length]")
+            result[key] = torch.cat(
+                [
+                    _pad_last_dimension(value, padded_length, pad_value=0)
+                    for value in values
+                ],
+                dim=1,
+            )
+            continue
+
+        if all(
+            value.ndim >= 2
+            and value.shape[0] == 1
+            and value.shape[-1] == length
+            for value, length in zip(values, lengths)
+        ):
+            pad_value = pad_token_id if key == "input_ids" else 0
+            result[key] = torch.cat(
+                [
+                    _pad_last_dimension(value, padded_length, pad_value=pad_value)
+                    for value in values
+                ],
+                dim=0,
+            )
+            continue
+
+        if all(value.shape[1:] == first.shape[1:] for value in values):
+            result[key] = torch.cat(values, dim=0)
+            continue
+        raise ValueError(f"cannot batch teacher input {key!r} with varying shapes")
+    return result
+
+
+def _iter_teacher_forwards(
+    adapter: Qwen25VLTargetAdapter,
+    examples: list[_PreparedTeacherExample],
+    layer_ids: list[int],
+    *,
+    pad_token_id: int,
+):
+    """Run one batch, recursively backing off only when CUDA reports OOM."""
+
+    host_inputs: dict[str, Any] | None = None
+    batched_inputs: dict[str, Any] | None = None
+    try:
+        host_inputs = _batch_text_inputs(examples, pad_token_id=pad_token_id)
+        batched_inputs = {
+            key: value.to(adapter.device, non_blocking=True)
+            if torch.is_tensor(value)
+            else value
+            for key, value in host_inputs.items()
+        }
+        selected = adapter.forward_selected_hidden(batched_inputs, layer_ids)
+    except torch.OutOfMemoryError:
+        del host_inputs, batched_inputs
+        if adapter.device.type == "cuda":
+            torch.cuda.empty_cache()
+        if len(examples) == 1:
+            raise
+        midpoint = len(examples) // 2
+        print(
+            f"[teacher-oom] reducing batch {len(examples)} -> "
+            f"{midpoint}+{len(examples) - midpoint}"
+        )
+        yield from _iter_teacher_forwards(
+            adapter,
+            examples[:midpoint],
+            layer_ids,
+            pad_token_id=pad_token_id,
+        )
+        yield from _iter_teacher_forwards(
+            adapter,
+            examples[midpoint:],
+            layer_ids,
+            pad_token_id=pad_token_id,
+        )
+        return
+    yield examples, batched_inputs, selected
+
+
 def _tensor_prefix(index: int) -> str:
     return f"sample_{index:06d}"
+
+
+def _shard_filename(shard_index: int, rank: int | None) -> str:
+    return (
+        f"rank-{rank:05d}-shard-{shard_index:05d}.safetensors"
+        if rank is not None
+        else f"shard-{shard_index:05d}.safetensors"
+    )
 
 
 def _write_shard(
@@ -182,11 +374,7 @@ def _write_shard(
         from safetensors.torch import save_file
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("safetensors is required for teacher feature shards") from exc
-    filename = (
-        f"rank-{rank:05d}-shard-{shard_index:05d}.safetensors"
-        if rank is not None
-        else f"shard-{shard_index:05d}.safetensors"
-    )
+    filename = _shard_filename(shard_index, rank)
     tensors: dict[str, torch.Tensor] = {}
     prefixes: dict[int, str] = {}
     for sample_index, values in records:
@@ -196,6 +384,52 @@ def _write_shard(
             tensors[f"{prefix}.{name}"] = value.detach().cpu().contiguous()
     save_file(tensors, str(directory / filename))
     return filename, prefixes
+
+
+class _ShardWriter:
+    """Bounded single-writer queue that overlaps safetensors I/O with inference."""
+
+    def __init__(self, queue_depth: int):
+        self.queue_depth = int(queue_depth)
+        self.executor = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="teacher-cache-writer")
+            if self.queue_depth > 0
+            else None
+        )
+        self.futures: deque[Future[tuple[str, dict[int, str]]]] = deque()
+
+    def submit(
+        self,
+        directory: Path,
+        shard_index: int,
+        records: list[tuple[int, dict[str, torch.Tensor]]],
+        *,
+        rank: int | None,
+    ) -> str:
+        filename = _shard_filename(shard_index, rank)
+        if self.executor is None:
+            _write_shard(directory, shard_index, records, rank=rank)
+            return filename
+        while len(self.futures) >= self.queue_depth:
+            self.futures.popleft().result()
+        self.futures.append(
+            self.executor.submit(
+                _write_shard,
+                directory,
+                shard_index,
+                records,
+                rank=rank,
+            )
+        )
+        return filename
+
+    def close(self) -> None:
+        try:
+            while self.futures:
+                self.futures.popleft().result()
+        finally:
+            if self.executor is not None:
+                self.executor.shutdown(wait=True, cancel_futures=False)
 
 
 def _save_static_target_io(directory: Path, adapter: Qwen25VLTargetAdapter) -> tuple[str, bool]:
@@ -263,7 +497,11 @@ def cache_teacher_features(config: DFlashTrainConfig) -> Path:
         print(
             f"[teacher-setup] model={config.target_model} world_size={distributed.world_size} "
             f"dtype={config.mixed_precision} frozen=True layers={layer_ids} "
-            f"response_mode={config.teacher_response_mode}"
+            f"response_mode={config.teacher_response_mode} batch={config.teacher_batch_size} "
+            f"bucket={config.teacher_length_bucket_size} "
+            f"preprocess_workers={config.teacher_preprocess_workers} "
+            f"shard={config.cache_shard_size} "
+            f"write_queue={config.teacher_write_queue_depth}"
         )
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -272,8 +510,48 @@ def cache_teacher_features(config: DFlashTrainConfig) -> Path:
     index_entries: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     pending: list[tuple[int, dict[str, torch.Tensor]]] = []
+    entry_by_offset: dict[int, dict[str, Any]] = {}
     shard_index = 0
-    for source_offset in range(distributed.rank, len(records), distributed.world_size):
+    writer = _ShardWriter(config.teacher_write_queue_depth)
+    preprocess_executor = (
+        ThreadPoolExecutor(
+            max_workers=config.teacher_preprocess_workers,
+            thread_name_prefix="teacher-preprocess",
+        )
+        if config.teacher_preprocess_workers > 1
+        else None
+    )
+    shard_rank = distributed.rank if distributed.enabled else None
+    tokenizer = adapter.processor.tokenizer
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_token_id is None:
+        pad_token_id = getattr(tokenizer, "eos_token_id", None)
+    if isinstance(pad_token_id, (list, tuple)):
+        pad_token_id = pad_token_id[0] if pad_token_id else 0
+    pad_token_id = int(pad_token_id or 0)
+    started_at = time.perf_counter()
+    processed_tokens = 0
+    last_log_group = -1
+
+    def flush_pending() -> None:
+        nonlocal pending, shard_index
+        if not pending:
+            return
+        records_to_write = pending
+        pending = []
+        filename = writer.submit(
+            temporary,
+            shard_index,
+            records_to_write,
+            rank=shard_rank,
+        )
+        for source_offset, _ in records_to_write:
+            entry_by_offset[source_offset]["shard"] = filename
+        shard_index += 1
+
+    def prepare_offset(
+        source_offset: int,
+    ) -> tuple[_PreparedTeacherExample | None, dict[str, Any] | None]:
         record = records[source_offset]
         try:
             (
@@ -284,79 +562,130 @@ def cache_teacher_features(config: DFlashTrainConfig) -> Path:
                 response_truncated,
                 dropped_turns,
             ) = _fit_clean_sequence(adapter, record, config)
-            with torch.inference_mode():
-                outputs = adapter.forward_clean(inputs)
-                selected = adapter.selected_hidden_features(outputs, layer_ids)[0]
-            context_original = select_context_positions(
-                inputs["input_ids"][0],
-                context_mode=config.context_mode,
-                image_token_ids=image_ids,
-                video_token_ids=video_ids,
-            )
-            cached_tensors = {
-                "input_ids": inputs["input_ids"][0].to(dtype=torch.int32),
-                "position_ids": position_ids[:, 0].to(dtype=torch.int32),
-                "context_hidden": selected[context_original].to(dtype=dtype),
-                "context_original_positions": context_original.to(dtype=torch.int32),
-            }
-            pending.append((source_offset, cached_tensors))
-            index_entries.append(
-                {
-                    "source_offset": source_offset,
-                    "manifest_id": str(record["id"]),
-                    "source": record.get("source", {}),
-                    "response_start": response_start,
-                    "response_end": response_end,
-                    "sequence_length": response_end,
-                    "context_length": int(context_original.numel()),
-                    "response_truncated": response_truncated,
-                    "teacher_response_mode": config.teacher_response_mode,
-                    "dropped_prompt_turns": dropped_turns,
-                    "shard": None,
-                    "tensor_prefix": _tensor_prefix(source_offset),
-                }
-            )
-            if len(pending) >= config.cache_shard_size:
-                filename, _ = _write_shard(
-                    temporary,
-                    shard_index,
-                    pending,
-                    rank=distributed.rank if distributed.enabled else None,
-                )
-                for entry in index_entries[-len(pending) :]:
-                    entry["shard"] = filename
-                pending.clear()
-                shard_index += 1
-            local_done = len(index_entries) + len(skipped)
-            if local_done == 1 or local_done % config.cache_log_every == 0:
-                print(
-                    f"[teacher rank={distributed.rank} source={source_offset + 1}/{len(records)}] "
-                    f"id={record['id']} seq={response_end} "
-                    f"context={int(context_original.numel())} truncated={response_truncated} "
-                    f"dropped_turns={dropped_turns}"
-                )
-            del outputs, selected, inputs, cached_tensors
         except ValueError as exc:
-            skipped.append(
-                {
-                    "source_offset": source_offset,
-                    "manifest_id": str(record.get("id", source_offset)),
-                    "reason": str(exc),
-                }
-            )
-            print(
-                f"[teacher-skip rank={distributed.rank}] "
-                f"id={record.get('id', source_offset)} reason={exc}"
-            )
-    if pending:
-        filename, _ = _write_shard(
-            temporary,
-            shard_index,
-            pending,
-            rank=distributed.rank if distributed.enabled else None,
+            return None, {
+                "source_offset": source_offset,
+                "manifest_id": str(record.get("id", source_offset)),
+                "reason": str(exc),
+            }
+        return (
+            _PreparedTeacherExample(
+                source_offset=source_offset,
+                record=record,
+                inputs=inputs,
+                position_ids=position_ids,
+                response_start=response_start,
+                response_end=response_end,
+                response_truncated=response_truncated,
+                dropped_turns=dropped_turns,
+            ),
+            None,
         )
-        for entry in index_entries[-len(pending) :]:
-            entry["shard"] = filename
+
+    local_offsets = list(range(distributed.rank, len(records), distributed.world_size))
+    try:
+        for bucket_start in range(0, len(local_offsets), config.teacher_length_bucket_size):
+            bucket_offsets = local_offsets[
+                bucket_start : bucket_start + config.teacher_length_bucket_size
+            ]
+            prepared: list[_PreparedTeacherExample] = []
+            outcomes = (
+                preprocess_executor.map(prepare_offset, bucket_offsets)
+                if preprocess_executor is not None
+                else map(prepare_offset, bucket_offsets)
+            )
+            for example, skipped_entry in outcomes:
+                if skipped_entry is not None:
+                    skipped.append(skipped_entry)
+                    print(
+                        f"[teacher-skip rank={distributed.rank}] "
+                        f"id={skipped_entry['manifest_id']} "
+                        f"reason={skipped_entry['reason']}"
+                    )
+                elif example is not None:
+                    prepared.append(example)
+
+            prepared.sort(key=lambda example: (example.response_end, example.source_offset))
+            for batch_start in range(0, len(prepared), config.teacher_batch_size):
+                requested_batch = prepared[
+                    batch_start : batch_start + config.teacher_batch_size
+                ]
+                for actual_batch, batched_inputs, selected in _iter_teacher_forwards(
+                    adapter,
+                    requested_batch,
+                    layer_ids,
+                    pad_token_id=pad_token_id,
+                ):
+                    for batch_index, example in enumerate(actual_batch):
+                        context_original = select_context_positions(
+                            example.inputs["input_ids"][0],
+                            context_mode=config.context_mode,
+                            image_token_ids=image_ids,
+                            video_token_ids=video_ids,
+                        )
+                        sample_hidden = selected[batch_index, : example.response_end]
+                        if context_original.numel() != example.response_end:
+                            sample_hidden = sample_hidden[
+                                context_original.to(sample_hidden.device)
+                            ]
+                        cached_tensors = {
+                            "input_ids": example.inputs["input_ids"][0]
+                            .detach()
+                            .to(device="cpu", dtype=torch.int32)
+                            .contiguous(),
+                            "position_ids": example.position_ids[:, 0]
+                            .detach()
+                            .to(device="cpu", dtype=torch.int32)
+                            .contiguous(),
+                            "context_hidden": sample_hidden
+                            .detach()
+                            .to(device="cpu", dtype=dtype)
+                            .contiguous(),
+                            "context_original_positions": context_original
+                            .detach()
+                            .to(device="cpu", dtype=torch.int32)
+                            .contiguous(),
+                        }
+                        pending.append((example.source_offset, cached_tensors))
+                        entry = {
+                            "source_offset": example.source_offset,
+                            "manifest_id": str(example.record["id"]),
+                            "source": example.record.get("source", {}),
+                            "response_start": example.response_start,
+                            "response_end": example.response_end,
+                            "sequence_length": example.response_end,
+                            "context_length": int(context_original.numel()),
+                            "response_truncated": example.response_truncated,
+                            "teacher_response_mode": config.teacher_response_mode,
+                            "dropped_prompt_turns": example.dropped_turns,
+                            "shard": None,
+                            "tensor_prefix": _tensor_prefix(example.source_offset),
+                        }
+                        index_entries.append(entry)
+                        entry_by_offset[example.source_offset] = entry
+                        processed_tokens += example.response_end
+                        if len(pending) >= config.cache_shard_size:
+                            flush_pending()
+
+                    local_done = len(index_entries) + len(skipped)
+                    log_group = local_done // config.cache_log_every
+                    if local_done == len(actual_batch) or log_group > last_log_group:
+                        elapsed = max(time.perf_counter() - started_at, 1e-6)
+                        print(
+                            f"[teacher rank={distributed.rank} "
+                            f"done={local_done}/{len(local_offsets)} "
+                            f"batch={len(actual_batch)} padded={selected.shape[1]}] "
+                            f"samples_per_s={len(index_entries) / elapsed:.2f} "
+                            f"tokens_per_s={processed_tokens / elapsed:.0f}"
+                        )
+                        last_log_group = log_group
+                    del selected, batched_inputs
+            del prepared
+        flush_pending()
+    finally:
+        if preprocess_executor is not None:
+            preprocess_executor.shutdown(wait=True, cancel_futures=False)
+        writer.close()
 
     local_index_path = temporary / f"index.rank-{distributed.rank:05d}.json"
     local_skipped_path = temporary / f"skipped.rank-{distributed.rank:05d}.json"
@@ -423,6 +752,16 @@ def cache_teacher_features(config: DFlashTrainConfig) -> Path:
             "source_manifest_sha256": manifest_sha,
             "source_manifest_metadata": manifest_metadata,
             "cache_world_size": distributed.world_size,
+            "cache_execution": {
+                "teacher_batch_size": config.teacher_batch_size,
+                "teacher_length_bucket_size": config.teacher_length_bucket_size,
+                "teacher_preprocess_workers": config.teacher_preprocess_workers,
+                "cache_shard_size": config.cache_shard_size,
+                "teacher_write_queue_depth": config.teacher_write_queue_depth,
+                "selected_layer_hooks": True,
+                "lm_head_skipped": True,
+                "decoder_early_stop_layer": max(layer_ids),
+            },
             "cached_count": len(merged_entries),
             "cached_sample_ids": [entry["manifest_id"] for entry in merged_entries],
             "skipped": merged_skipped,

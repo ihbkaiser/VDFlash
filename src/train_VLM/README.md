@@ -67,6 +67,14 @@ vision encoder are absent from GPU memory. Checkpoints contain only draft and
 projection weights plus optimizer/scheduler, per-rank RNG, exact sampler
 permutation and in-epoch progress for resume.
 
+Text-only teacher caching can batch and length-bucket variable sequences. The
+3B/4×B200 Stage 1 preset uses `teacher_batch_size=64`,
+`teacher_length_bucket_size=1024`, `teacher_preprocess_workers=8`,
+`cache_shard_size=32`, and `teacher_write_queue_depth=2`. Selected decoder
+features are captured with forward hooks, execution stops after the highest
+selected layer, and the vocabulary LM projection is skipped. CUDA OOM causes
+only the affected batch to split recursively.
+
 Run the complete real-data smoke path, including both stages and final decode
 on a real TorchVision MP4, with:
 
