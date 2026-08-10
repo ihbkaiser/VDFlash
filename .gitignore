@@ -37,3 +37,5 @@ env/
 *.pt
 *.pth
 *.onnx
+
+dataset/VideoDetailCaption

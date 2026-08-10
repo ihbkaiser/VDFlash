@@ -1,0 +1,24 @@
+# Environment for the Qwen3.5-4B + DFlash acceptance-length experiment.
+# The plan requires an isolated environment (do NOT reuse the Qwen2.5-VL env).
+# Tested with Python 3.13, Transformers 5.3.0, Torch 2.6.0+cu124.
+torch>=2.6,<2.7
+transformers==5.3.0
+accelerate>=1.0
+safetensors>=0.4
+av>=15
+numpy>=1.26
+scipy>=1.12
+pandas>=2.2
+pyarrow>=15
+matplotlib>=3.8
+huggingface_hub>=0.30
+datasets>=2.19
+requests>=2.31
+pillow>=10.0
+pytest>=8.0
+
+# Optional GPU kernels for the fast Qwen3.5 linear-attention path (fla/causal-conv1d).
+# The decoder itself is exact with the pure-torch fallback; kernels only speed
+# up the greedy reference and the draft/target forwards.
+# fla @ git+https://github.com/fla-org/flash-linear-attention
+# causal-conv1d @ git+https://github.com/Dao-AILab/causal-conv1d

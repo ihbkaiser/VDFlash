@@ -1,0 +1,18 @@
+repo_root: "."
+dataset_manifest: "dataset/VideoDetailCaption/subset_manifest.jsonl"
+dataset_root: "dataset/VideoDetailCaption"
+msd_target_model: "Qwen/Qwen2-VL-7B-Instruct"
+msd_weights: "lucylyn/MSD-Qwen2VL-7B-Instruct"
+layer_target_model: "Qwen/Qwen2.5-VL-7B-Instruct"
+quantization: "nf4"
+compute_dtype: "float16"
+device: "cuda:0"
+tree:
+  total_tokens: 30
+  depth: 4
+  top_k: 8
+generation:
+  temperature: 0.0
+  max_new_tokens: 512
+visual_token_milestones: [400, 3000, 13000, 25000]
+retention_percentages: [100.0, 25.0, 10.0, 5.0, 1.0, 0.0]
