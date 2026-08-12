@@ -28,6 +28,7 @@ from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
 
 from specforge.distributed import get_tp_group
 
+from .capture_hooks import configure_capture_layers
 from .model_runner import SGLangRunner
 from .utils import wrap_offline_eagle3_logits_processors
 
@@ -94,23 +95,11 @@ class OfflineSGLangCaptureBackend:
     ) -> None:
         """Set auxiliary layers through the strategy's SGLang capture API."""
 
-        setter_name = {
-            "eagle3": "set_eagle3_layers_to_capture",
-            "dflash": "set_dflash_layers_to_capture",
-            "dspark": "set_dspark_layers_to_capture",
-        }.get(capture_method)
-        if setter_name is None:
-            raise ValueError(
-                "offline SGLang capture method must be 'eagle3', 'dflash', or "
-                "'dspark', "
-                f"got {capture_method!r}"
-            )
-        setter = getattr(self.model_runner.model, setter_name, None)
-        if not callable(setter):
-            raise RuntimeError(
-                f"target model does not expose SGLang capture hook {setter_name!r}"
-            )
-        setter(layer_ids)
+        configure_capture_layers(
+            self.model_runner.model,
+            layer_ids,
+            capture_method=capture_method,
+        )
 
     def _maybe_prepare_mlp_sync_batch(self, batch: ScheduleBatch) -> None:
         if require_mlp_sync(self.model_runner.server_args):

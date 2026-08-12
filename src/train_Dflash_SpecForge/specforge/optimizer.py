@@ -39,9 +39,13 @@ class BF16Optimizer:
         ]
         for mp in self.fp32_params:
             mp.requires_grad = True
-        self.optimizer = torch.optim.AdamW(
-            self.fp32_params, lr=lr, weight_decay=weight_decay
-        )
+        optimizer_kwargs = {"lr": lr, "weight_decay": weight_decay}
+        # CUDA FP32 masters can use the fused multi-tensor implementation.  It
+        # materially reduces optimizer launch overhead on B200 while preserving
+        # the CPU-offload and non-CUDA paths.
+        if self.fp32_params and self.fp32_params[0].device.type == "cuda":
+            optimizer_kwargs["fused"] = True
+        self.optimizer = torch.optim.AdamW(self.fp32_params, **optimizer_kwargs)
         self.last_grad_norm = None
         self._grad_norm_process_group = None
         self._reduce_grad_norm_across_ranks = True
