@@ -3,7 +3,7 @@ model:
   draft_model_config: configs/qwen2.5-vl-7b-dflash.json
   target_backend: sglang
   input_modality: text
-  embedding_key: model.language_model.embed_tokens.weight
+  embedding_key: model.embed_tokens.weight
   lm_head_key: lm_head.weight
   mask_token_id: 151669
   torch_dtype: bfloat16
