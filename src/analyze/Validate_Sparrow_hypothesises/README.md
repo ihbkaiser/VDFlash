@@ -72,11 +72,11 @@ The suite treats these as gates, not optional diagnostics:
 | S5 | Figure 3 records the layer where visual KV is masked and Figure 6 records visual/text cosine curves | Layer-wise claim is not reproducible |
 | S6 | Report contains only measured rows and passes the audit before plotting | A planned or invalid run cannot become evidence |
 
-These scenarios are covered by the 12 CPU tests in `tests/`; S2 and S3 are
+These scenarios are covered by the CPU tests in `tests/`; S2 and S3 are
 also executed as GPU smoke gates by `run_msd.py` before a result row is
 written.
 
-## Full-input MSD smoke/run
+## Figure 1: MSD visual-length and retention runs
 
 After the T4 environment and checkpoints are available, first run one sample:
 
@@ -86,11 +86,36 @@ python -m src.analyze.Validate_Sparrow_hypothesises.run_msd \
   --output results/sparrow_validation/msd_full_smoke.jsonl
 ```
 
-This command currently enables only the full-input condition. It checks native
-prefill parity and exact greedy losslessness before writing a row. The
-retention condition is rejected explicitly until the compacted draft context
-passes the isolation audit; an image-only approximation must not be used as a
-substitute.
+The complete MSD runner uses the measured calibration rows and supports both
+the full-input visual-length sweep and the draft-only visual-retention sweep:
+
+```bash
+python -m src.analyze.Validate_Sparrow_hypothesises msd \
+  --calibration results/sparrow_validation/calibration.jsonl \
+  --condition both \
+  --output results/sparrow_validation/msd.jsonl
+```
+
+For Figure 1(b), the target always keeps the full calibrated video. Only the
+draft-side embedding sequence is compacted at 100/25/10/5/1/0 percent, and
+the row records separate target/draft fingerprints. The default selector is
+deterministic uniform retention. To reproduce attention-guided retention after
+the Figure 2 run, pass `--selection top_attention --selection-scores ...`.
+
+The runner records separate MSD prefill/decode/end-to-end timings, AR timing,
+acceptance traces, output token IDs and the native-prefill parity gate.
+
+The report renderer produces paper-shaped outputs from measured rows:
+
+- `figure1_insight_summary.png`: two-panel Figure 1 analogue with accepted-length/error bars plus latency bars, and retention curves for `Last Instr.`, `All Text`, or the configured selector.
+- `figure2_insight_attention.png`: short/long visual-context panels with Instruction/Visual/Text regions and attention curves.
+- `figure3_insight_layer_analysis.png`: layer-cut output agreement beside the head-by-layer visual-attention heatmap.
+- `figure6_insight_retention.png`: visual/text hidden-state retention curves with the middle-layer marker.
+- `paper_statistics.json` and `figure*_statistics.csv`: per-condition N, mean, spread, and deterministic bootstrap 95% intervals.
+
+These figures mirror the paper's visual grammar and grouping, but all plotted
+values come from completed local runs. Missing experiments are not filled with
+paper numbers; the corresponding panel/file appears only when its rows exist.
 
 ## Runtime invariant
 
@@ -98,3 +123,56 @@ substitute.
 image-only `get_input_embeds_qwen2vl` helper from the original MSD repository
 is not used for video. Before speculative decoding, the runtime compares the
 standard multimodal target logits with the manually fused prefill logits.
+
+## Figure 2: attention dilution
+
+This runner captures one attention row per decoder layer and never materializes
+the full `L x L` matrix. The query is the final user-instruction token, and
+the JSONL contains disjoint instruction/visual/text positions plus per-visual
+token weights:
+
+```bash
+python -m src.analyze.Validate_Sparrow_hypothesises attention \
+  --calibration results/sparrow_validation/calibration.jsonl \
+  --visual-targets 400 3000 \
+  --quantized \
+  --output results/sparrow_validation/figure2_attention.jsonl
+```
+
+## Figure 3 and Figure 6: layer analyses
+
+`layers` runs Figure 3(a) visual-KV truncation, Figure 3(b) final-instruction
+visual attention by layer, and Figure 6/Appendix D cosine retention. It uses
+Qwen2.5-VL-7B, eager attention and bounded hooks for hidden states:
+
+```bash
+python -m src.analyze.Validate_Sparrow_hypothesises layers \
+  --calibration results/sparrow_validation/calibration.jsonl \
+  --visual-targets 3000 \
+  --experiments both \
+  --quantized \
+  --output results/sparrow_validation/layer_analysis.jsonl
+```
+
+Figure 3(a) masks visual KV columns from each requested layer onward and
+compares greedy output IDs, prefix agreement and ROUGE-L with the native
+target. Figure 6 computes cosine similarity to the fused input embedding per
+layer without retaining all hidden-state tensors in memory.
+
+## Complete orchestration
+
+The process-isolated orchestrator runs calibration, all selected GPU stages,
+merges their JSONL rows, audits them and writes the report:
+
+```bash
+python -m src.analyze.Validate_Sparrow_hypothesises all \
+  --output-dir results/sparrow_validation \
+  --quantized
+```
+
+Use `--limit 1` for a smoke run, or `--skip-msd`, `--skip-attention` and
+`--skip-layers` when validating one stage. The final evidence file is
+`results/sparrow_validation/results.jsonl`; the report is valid only when the
+audit exit code is zero. Composite figures and statistics are written under
+`results/sparrow_validation/report/` (or the directory passed to
+`report --output-dir`).

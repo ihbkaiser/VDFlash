@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import torch
+
 from src.analyze.Validate_Sparrow_hypothesises.audit import audit_losslessness, audit_rows
 from src.analyze.Validate_Sparrow_hypothesises.dataset import (
     choose_nearest_calibration,
@@ -10,8 +12,14 @@ from src.analyze.Validate_Sparrow_hypothesises.metrics import (
     normalized_entropy,
     rouge_l,
 )
+from src.analyze.Validate_Sparrow_hypothesises.model_analysis import find_instruction_masks
+from src.analyze.Validate_Sparrow_hypothesises.paper_statistics import build_paper_statistics, summarize
 from src.analyze.Validate_Sparrow_hypothesises.paper_contract import DEFAULT_CONTRACT, validate_contract
-from src.analyze.Validate_Sparrow_hypothesises.runtime import select_visual_positions
+from src.analyze.Validate_Sparrow_hypothesises.runtime import (
+    PreparedPrefill,
+    compact_qwen2vl_prefill,
+    select_visual_positions,
+)
 
 
 def test_default_contract_matches_paper_milestones():
@@ -39,6 +47,48 @@ def test_metrics_are_deterministic_and_bounded():
     assert 0.0 <= normalized_entropy([0.5, 0.5]) <= 1.0
 
 
+def test_paper_statistics_report_n_mean_and_bootstrap_interval():
+    summary = summarize([1, 2, 3], replicates=200, seed=7)
+    assert summary["n"] == 3
+    assert summary["mean"] == 2.0
+    assert summary["ci95_low"] <= summary["mean"] <= summary["ci95_high"]
+
+    rows = [
+        {
+            "paper_figure": "Figure 1(a)",
+            "sample_id": "a",
+            "calibration_target_visual_tokens": 400,
+            "actual_visual_tokens": 392,
+            "accepted_prefix_tokens": 4,
+            "prefill_seconds": 1.0,
+        },
+        {
+            "paper_figure": "Figure 1(a)",
+            "sample_id": "b",
+            "calibration_target_visual_tokens": 400,
+            "actual_visual_tokens": 408,
+            "accepted_prefix_tokens": 6,
+            "prefill_seconds": 1.2,
+        },
+        {
+            "paper_figure": "Figure 2",
+            "modality": "summary",
+            "sample_id": "a",
+            "target_visual_tokens": 400,
+            "attention_policy": "last_instruction",
+            "visual_mass": 0.4,
+            "text_mass": 0.5,
+            "instruction_mass": 0.1,
+            "visual_entropy": 0.8,
+        },
+    ]
+    statistics = build_paper_statistics(rows, replicates=200, seed=7)
+    assert statistics["figure1a"][0]["visual_tokens"] == 400
+    assert statistics["figure1a"][0]["accepted_prefix_tokens"]["n"] == 2
+    assert statistics["figure2"][0]["visual_tokens"] == 400
+    assert statistics["figure2"][0]["visual_mass"]["mean"] == 0.4
+
+
 def _valid_row(**overrides):
     row = {
         "row_id": "sample:400",
@@ -60,6 +110,65 @@ def test_paper_audit_rejects_target_draft_leak():
     report = audit_rows([_valid_row(paper_figure="Figure 1(b)", full_target_visual_tokens=399)], DEFAULT_CONTRACT)
     assert not report.valid
     assert any(issue.code == "target_draft_leak" for issue in report.issues)
+
+
+def test_retention_audit_allows_zero_visual_draft_tokens():
+    row = _valid_row(
+        paper_figure="Figure 1(b)",
+        actual_visual_tokens=0,
+        full_target_visual_tokens=400,
+        retention_percentage=0.0,
+    )
+    assert audit_rows([row], DEFAULT_CONTRACT).valid
+
+
+def test_attention_probe_selects_final_user_instruction_token():
+    class Tokenizer:
+        all_special_ids = [0, 100, 101, 102]
+
+        def encode(self, text, add_special_tokens=False):
+            return [100, 101]
+
+    class Processor:
+        tokenizer = Tokenizer()
+
+    ids = torch.tensor([[0, 10, 151656, 151656, 20, 21, 100, 101, 102]])
+    masks = find_instruction_masks(ids, Processor(), [2, 3])
+    assert masks["attention_query"] == "last_instruction"
+    assert masks["instruction_positions"] == [4, 5]
+    assert masks["query_index"] == 5
+    assert not (set(masks["instruction_positions"]) & set(masks["visual_positions"]))
+
+
+def test_analysis_rows_require_their_provenance_and_use_contract_models():
+    attention = _valid_row(
+        row_id="sample:attention",
+        paper_figure="Figure 2",
+        target_visual_tokens=400,
+        actual_visual_tokens=400,
+        attention_query="last_instruction",
+        query_position=2,
+        instruction_positions=[2],
+        visual_positions=[1],
+        text_positions=[0, 3],
+    )
+    layer = _valid_row(
+        row_id="sample:layer",
+        paper_figure="Figure 3",
+        target_model=DEFAULT_CONTRACT.layer_target_model,
+        visual_kv_masked_from=20,
+        layer_cut=20,
+    )
+    retention = _valid_row(
+        row_id="sample:cosine",
+        paper_figure="Figure 6 / Appendix D",
+        target_model=DEFAULT_CONTRACT.layer_target_model,
+        layer=20,
+        visual_cosine=0.2,
+        text_cosine=0.8,
+    )
+    report = audit_rows([attention, layer, retention], DEFAULT_CONTRACT)
+    assert report.valid
 
 
 def test_paper_audit_rejects_wrong_attention_query_and_missing_layer_mask():
@@ -88,3 +197,25 @@ def test_visual_selector_is_deterministic_and_tie_stable():
     assert select_visual_positions(8, 100).tolist() == list(range(8))
     assert select_visual_positions(8, 25, [1.0] * 8).tolist() == [0, 1]
     assert select_visual_positions(8, 25, [0.1, 0.9, 0.9, 0.2, 0.3, 0.4, 0.5, 0.6]).tolist() == [1, 2]
+
+
+def test_retention_compacts_only_the_draft_and_removes_markers_at_zero():
+    prepared = PreparedPrefill(
+        input_ids=torch.tensor([[10, 151652, 151656, 151656, 151653, 20]]),
+        attention_mask=torch.ones(1, 6, dtype=torch.long),
+        inputs_embeds=torch.randn(1, 6, 4),
+        position_ids=torch.arange(6).view(1, 1, 6).expand(3, 1, 6),
+        rope_deltas=torch.tensor([0]),
+        video_grid_thw=None,
+        video_positions=torch.tensor([2, 3]),
+        input_fingerprint="full",
+        video_token_id=151656,
+        vision_start_token_id=151652,
+        vision_end_token_id=151653,
+    )
+    half = compact_qwen2vl_prefill(prepared, 50)
+    empty = compact_qwen2vl_prefill(prepared, 0)
+    assert half.input_ids.shape[1] == 5
+    assert half.video_positions.tolist() == [2]
+    assert empty.input_ids.tolist() == [[10, 20]]
+    assert empty.video_positions.tolist() == []

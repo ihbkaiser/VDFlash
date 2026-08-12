@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import asdict
 from pathlib import Path
 
@@ -88,7 +89,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
     contract = _contract(args)
     rows = read_jsonl(args.input)
     report = audit_rows(rows, contract)
-    if rows and "target_output_ids" in rows[0]:
+    if any("target_output_ids" in row or "speculative_output_ids" in row for row in rows):
         lossless = audit_losslessness(rows)
         report.issues.extend(lossless.issues)
         report.valid = report.valid and lossless.valid
@@ -107,7 +108,14 @@ def _cmd_report(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog=(
+            "GPU runners are delegated as: `msd`, `attention`, `layers`, `all`. "
+            "For example: python -m src.analyze.Validate_Sparrow_hypothesises "
+            "attention --help"
+        ),
+    )
     parser.add_argument("--contract", default="src/analyze/Validate_Sparrow_hypothesises/configs/paper_contract.yaml")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -148,7 +156,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    values = list(sys.argv[1:] if argv is None else argv)
+    if values and values[0] in {"msd", "attention", "layers", "all"}:
+        command = values.pop(0)
+        if command == "msd":
+            from .run_msd import build_parser as delegated_parser, run as delegated_run
+        elif command == "attention":
+            from .run_attention import build_parser as delegated_parser, run as delegated_run
+        elif command == "layers":
+            from .run_layer_analysis import build_parser as delegated_parser, run as delegated_run
+        else:
+            from .run_paper_experiments import build_parser as delegated_parser, run as delegated_run
+        return delegated_run(delegated_parser().parse_args(values))
+    args = build_parser().parse_args(values)
     return args.function(args)
 
 

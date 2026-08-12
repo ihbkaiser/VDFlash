@@ -10,7 +10,8 @@ from typing import Any, Iterable
 from .audit import AuditReport, audit_losslessness, audit_rows
 from .metrics import acceptance_summary
 from .paper_contract import PaperContract, paper_contract_rows
-from .plots import write_plots
+from .paper_statistics import build_paper_statistics, write_statistics
+from .plots import write_paper_style_plots, write_plots
 
 
 def read_jsonl(path: str | Path) -> list[dict[str, Any]]:
@@ -25,9 +26,15 @@ def read_jsonl(path: str | Path) -> list[dict[str, Any]]:
 def build_report(rows: Iterable[dict[str, Any]], contract: PaperContract) -> dict[str, Any]:
     rows = list(rows)
     conformance = audit_rows(rows, contract)
-    lossless = audit_losslessness(rows) if rows and "target_output_ids" in rows[0] else None
+    lossless = audit_losslessness(rows) if any(
+        "target_output_ids" in row or "speculative_output_ids" in row for row in rows
+    ) else None
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for row in rows:
+    summary_rows = [
+        row for row in rows
+        if row.get("accepted_prefix_tokens") is not None or row.get("rouge_l") is not None
+    ]
+    for row in summary_rows:
         key = " | ".join(
             str(row.get(field, "unknown"))
             for field in ("paper_figure", "actual_visual_tokens", "retention_percentage", "layer_cut")
@@ -41,6 +48,10 @@ def build_report(rows: Iterable[dict[str, Any]], contract: PaperContract) -> dic
         "conformance": conformance.to_dict(),
         "losslessness": lossless.to_dict() if lossless else None,
         "summaries": summaries,
+        "diagnostic_counts": {
+            figure: sum(1 for row in rows if row.get("paper_figure") == figure)
+            for figure in sorted({str(row.get("paper_figure")) for row in rows})
+        },
         "_rows": rows,
     }
 
@@ -48,8 +59,14 @@ def build_report(rows: Iterable[dict[str, Any]], contract: PaperContract) -> dic
 def write_report(output_dir: str | Path, report: dict[str, Any]) -> None:
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    plot_files = write_plots(report.pop("_rows", []), output)
-    report["plots"] = plot_files
+    rows = report.pop("_rows", [])
+    plot_files = write_plots(rows, output)
+    paper_plot_files = write_paper_style_plots(rows, output)
+    statistics = build_paper_statistics(rows)
+    statistics_files = write_statistics(statistics, output)
+    report["plots"] = plot_files + paper_plot_files
+    report["paper_statistics_files"] = statistics_files
+    report["paper_statistics"] = statistics
     (output / "summary.json").write_text(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     lines = [
         "# Sparrow insight validation report",
@@ -72,7 +89,21 @@ def write_report(output_dir: str | Path, report: dict[str, Any]) -> None:
         lossless = summary["lossless_rate"]
         accepted_text = "n/a" if accepted != accepted else f"{accepted:.3f}"
         lossless_text = "n/a" if lossless is None else f"{lossless:.1%}"
-        lines.append(f"| {key} | {summary['n']} | {accepted_text} | {lossless_text} |")
+        display_key = key.replace(" | ", " / ")
+        lines.append(f"| {display_key} | {summary['n']} | {accepted_text} | {lossless_text} |")
+    lines.extend(["", "## Diagnostic row counts", "", "| Figure | Rows |", "|---|---:|"])
+    for figure, count in report.get("diagnostic_counts", {}).items():
+        lines.append(f"| {figure} | {count} |")
+    lines.extend(["", "## Paper-shaped statistics", "", "The following aggregates are computed only from measured rows. Each metric includes N, mean, spread, and a deterministic bootstrap 95% interval.", ""])
+    lines.append("[paper_statistics.json](paper_statistics.json) · " + " · ".join(
+        f"[{name}]({name})" for name in report.get("paper_statistics_files", []) if name != "paper_statistics.json"
+    ))
+    lines.extend(["", "## Paper-style figures", ""])
+    if report.get("plots"):
+        for name in report["plots"]:
+            lines.append(f"- [{name}]({name})")
+    else:
+        lines.append("No plot was generated because no completed metric rows were available.")
     lines.extend(["", "## Audit issues", ""])
     issues = report["conformance"]["issues"]
     if not issues:

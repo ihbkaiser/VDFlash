@@ -39,3 +39,4 @@ env/
 *.onnx
 
 dataset/VideoDetailCaption
+results/

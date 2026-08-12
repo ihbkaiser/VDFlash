@@ -58,6 +58,21 @@ else:
 
 logger = logging.get_logger(__name__)
 
+
+def _past_seq_length(past_key_values):
+    """Return the number of cached tokens for either a transformers ``Cache``
+    (``get_seq_length``) or the EAGLE custom ``KVCache`` list
+    (``[0][0].current_length``)."""
+    if past_key_values is None:
+        return 0
+    if hasattr(past_key_values, "get_seq_length"):
+        return past_key_values.get_seq_length()
+    try:
+        return past_key_values[0][0].current_length.item()
+    except Exception:
+        return 0
+
+
 _CONFIG_FOR_DOC = "Qwen2VLConfig"
 
 
@@ -577,11 +592,13 @@ class Qwen2VLAttention(nn.Module):
         )
         # modified
         if past_key_value is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
-            # key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-            past_key, past_value = past_key_value[self.layer_idx]
-            key_states = past_key.cat(key_states)
-            value_states = past_value.cat(value_states)
+            if hasattr(past_key_value, "update"):  # transformers Cache (e.g. DynamicCache)
+                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
+                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            else:  # EAGLE custom KVCache list
+                past_key, past_value = past_key_value[self.layer_idx]
+                key_states = past_key.cat(key_states)
+                value_states = past_value.cat(value_states)
         past_key_value = None
 
         # repeat k/v heads if n_kv_heads < n_heads
@@ -784,11 +801,13 @@ class Qwen2VLSdpaAttention(Qwen2VLAttention):
         )
         # modified
         if past_key_value is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
-            # key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-            past_key, past_value = past_key_value[self.layer_idx]
-            key_states = past_key.cat(key_states)
-            value_states = past_value.cat(value_states)
+            if hasattr(past_key_value, "update"):  # transformers Cache (e.g. DynamicCache)
+                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
+                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            else:  # EAGLE custom KVCache list
+                past_key, past_value = past_key_value[self.layer_idx]
+                key_states = past_key.cat(key_states)
+                value_states = past_value.cat(value_states)
         past_key_value = None
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -1119,7 +1138,7 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
 
         if cache_position is None:
             # past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            past_seen_tokens = past_key_values[0][0].current_length.item() if past_key_values is not None else 0
+            past_seen_tokens = _past_seq_length(past_key_values)
             cache_position = torch.arange(
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
@@ -1227,7 +1246,7 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
         # to infer the attention mask.
         # modified
         # past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-        past_seen_tokens = past_key_values[0][0].current_length.item() if past_key_values is not None else 0
+        past_seen_tokens = _past_seq_length(past_key_values)
         using_static_cache = isinstance(past_key_values, StaticCache)
         using_sliding_window_cache = isinstance(past_key_values, SlidingWindowCache)
 
@@ -1236,6 +1255,7 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
             self.config._attn_implementation == "sdpa"
             and not (using_static_cache or using_sliding_window_cache)
             and not output_attentions
+            and not (hasattr(self, "tree_mask") and self.tree_mask is not None)
         ):
             if AttentionMaskConverter._ignore_causal_mask_sdpa(
                 attention_mask,
@@ -1735,7 +1755,7 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
                 attention_mask = attention_mask.to(inputs_embeds.device)
 
         if cache_position is None:
-            past_seen_tokens = past_key_values[0][0].current_length.item() if past_key_values is not None else 0
+            past_seen_tokens = _past_seq_length(past_key_values)
             cache_position = torch.arange(
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
@@ -1747,7 +1767,7 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
                 or self.rope_deltas is None
                 # modified
                 # or (past_key_values is None or past_key_values.get_seq_length() == 0)
-                or (past_key_values is None or past_key_values[0][0].current_length.item() == 0)
+                or (past_key_values is None or _past_seq_length(past_key_values) == 0)
             ):
                 position_ids, rope_deltas = self.get_rope_index(
                     input_ids, image_grid_thw, video_grid_thw, attention_mask

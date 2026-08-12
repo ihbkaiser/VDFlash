@@ -36,6 +36,9 @@ class PreparedPrefill:
     video_grid_thw: torch.Tensor | None
     video_positions: torch.Tensor
     input_fingerprint: str
+    video_token_id: int | None = None
+    vision_start_token_id: int | None = None
+    vision_end_token_id: int | None = None
 
 
 def _tensor(batch: Any, key: str) -> torch.Tensor | None:
@@ -56,6 +59,66 @@ def require_cuda() -> torch.device:
     if not torch.cuda.is_available():
         raise RuntimeUnavailableError("CUDA is required for MSD inference; no CUDA device is available")
     return torch.device("cuda")
+
+
+def model_device(model: Any) -> torch.device:
+    """Return the device hosting the first model parameter.
+
+    ``device_map=auto`` can shard a checkpoint, but every runner still needs a
+    deterministic device for processor tensors and the first embedding call.
+    The first parameter is the same convention used by Transformers' generate
+    helpers and is sufficient for the single-GPU experiments in the paper.
+    """
+
+    try:
+        return next(model.parameters()).device
+    except StopIteration as exc:  # pragma: no cover - malformed external model
+        raise RuntimeUnavailableError("model has no parameters") from exc
+
+
+def move_batch_to_device(batch: Any, device: torch.device | str) -> Any:
+    """Move a processor batch without assuming it is a plain dictionary."""
+
+    if hasattr(batch, "to"):
+        return batch.to(device)
+    if isinstance(batch, dict):
+        return {
+            key: value.to(device) if hasattr(value, "to") else value
+            for key, value in batch.items()
+        }
+    raise TypeError(f"unsupported processor batch type: {type(batch)!r}")
+
+
+def _apply_transformers_compat() -> None:
+    """Compatibility shims so the vendored EAGLE (transformers 4.48-era) code
+    runs on the installed transformers version without modifying externals/.
+
+    - transformers >= 5 removed ``SlidingWindowCache`` from ``cache_utils``;
+      EAGLE only uses it in ``isinstance`` checks that never match Qwen2-VL, so
+      a ``DynamicCache`` subclass stub is sufficient.
+    - If the installed ``flash_attn`` wheel cannot be imported on this machine
+      (e.g. broken binary), force ``is_flash_attn_2_available`` to return
+      ``False`` so the vendored Qwen2-VL copy falls back to eager attention.
+    """
+
+    import transformers.cache_utils as cache_utils
+
+    if not hasattr(cache_utils, "SlidingWindowCache"):
+
+        class SlidingWindowCache(cache_utils.DynamicCache):
+            pass
+
+        cache_utils.SlidingWindowCache = SlidingWindowCache
+
+    try:
+        import flash_attn  # noqa: F401
+    except Exception:
+        import transformers.utils as hf_utils
+
+        hf_utils.is_flash_attn_2_available = lambda: False
+
+
+_apply_transformers_compat()
 
 
 def select_visual_positions(
@@ -89,8 +152,9 @@ def select_visual_positions(
 
 def make_visual_mask(total_tokens: int, visual_positions: Sequence[int]) -> torch.Tensor:
     mask = torch.zeros(total_tokens, dtype=torch.bool)
-    if visual_positions:
-        mask[torch.as_tensor(list(visual_positions), dtype=torch.long)] = True
+    positions = [int(value) for value in visual_positions]
+    if positions:
+        mask[torch.as_tensor(positions, dtype=torch.long)] = True
     return mask
 
 
@@ -150,6 +214,77 @@ def prepare_qwen2vl_prefill(model: Any, batch: Any, device: torch.device | str |
         video_grid_thw=video_grid_thw,
         video_positions=video_positions,
         input_fingerprint=_hash_tensor(input_ids),
+        video_token_id=video_token_id,
+        vision_start_token_id=getattr(model.config, "vision_start_token_id", None),
+        vision_end_token_id=getattr(model.config, "vision_end_token_id", None),
+    )
+
+
+def compact_qwen2vl_prefill(
+    prepared: PreparedPrefill,
+    percentage: float,
+    scores: Sequence[float] | None = None,
+) -> PreparedPrefill:
+    """Build the draft-side context for the Figure 1(b) retention sweep.
+
+    The target context is never modified.  Only the draft-side embedding
+    sequence is compacted, while the original M-RoPE positions are retained
+    for the tokens that survive.  At 0% the vision delimiters are removed as
+    well, yielding a genuine text-only draft context rather than an
+    image/video placeholder shortcut.
+    """
+
+    if not 0 <= percentage <= 100:
+        raise ValueError("percentage must be in [0, 100]")
+    visual = prepared.video_positions.detach().to("cpu")
+    selected_local = select_visual_positions(int(visual.numel()), percentage, scores)
+    selected_global = visual[selected_local] if selected_local.numel() else visual[:0]
+    keep = torch.ones(prepared.input_ids.shape[1], dtype=torch.bool, device=prepared.input_ids.device)
+    visual_mask = torch.zeros_like(keep)
+    if visual.numel():
+        visual_mask[visual.to(prepared.input_ids.device)] = True
+    if visual.numel() and selected_global.numel() < visual.numel():
+        selected_mask = torch.zeros_like(keep)
+        selected_mask[selected_global.to(prepared.input_ids.device)] = True
+        keep &= ~visual_mask | selected_mask
+    if percentage == 0:
+        marker_ids = {
+            value
+            for value in (
+                prepared.vision_start_token_id,
+                prepared.vision_end_token_id,
+                prepared.video_token_id,
+            )
+            if value is not None
+        }
+        if marker_ids:
+            marker_mask = torch.zeros_like(keep)
+            for marker_id in marker_ids:
+                marker_mask |= prepared.input_ids[0] == int(marker_id)
+            keep &= ~marker_mask
+
+    input_ids = prepared.input_ids[:, keep]
+    inputs_embeds = prepared.inputs_embeds[:, keep, :]
+    position_ids = prepared.position_ids[..., keep]
+    attention_mask = prepared.attention_mask
+    if attention_mask is not None and attention_mask.ndim == 2:
+        attention_mask = attention_mask[:, keep]
+    compact_visual_positions = torch.nonzero(visual_mask & keep, as_tuple=False).flatten()
+    compact_visual_positions = torch.searchsorted(
+        torch.nonzero(keep, as_tuple=False).flatten(), compact_visual_positions
+    )
+    return PreparedPrefill(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        inputs_embeds=inputs_embeds,
+        position_ids=position_ids,
+        rope_deltas=prepared.rope_deltas,
+        video_grid_thw=prepared.video_grid_thw,
+        video_positions=compact_visual_positions.to(input_ids.device),
+        input_fingerprint=_hash_tensor(input_ids),
+        video_token_id=prepared.video_token_id,
+        vision_start_token_id=prepared.vision_start_token_id,
+        vision_end_token_id=prepared.vision_end_token_id,
     )
 
 
@@ -264,7 +399,7 @@ def load_msd_qwen2vl(base_model_path: str, msd_model_path: str, device_map: str 
         bnb_4bit_compute_dtype=torch.float16,
         bnb_4bit_use_double_quant=True,
     )
-    return EaModel.from_pretrained(
+    result = EaModel.from_pretrained(
         base_model_path=base_model_path,
         ea_model_path=msd_model_path,
         total_token=30,
@@ -274,6 +409,16 @@ def load_msd_qwen2vl(base_model_path: str, msd_model_path: str, device_map: str 
         device_map=device_map,
         quantization_config=quantization_config,
     )
+    # EAGLE's EaModel.from_pretrained returns (model, None) for the Qwen2-VL
+    # path; unwrap it so the caller receives the EaModel itself.
+    if isinstance(result, tuple):
+        result = result[0]
+    # The draft cnets.Model enables gradient checkpointing and nn.Module starts
+    # in training mode; leaving it trainable routes inference through the
+    # torch.utils.checkpoint branch whose custom_forward drops use_cache and
+    # returns a single-element tuple. eval() disables that branch.
+    result.eval()
+    return result
 
 
 def _video_forward(
@@ -288,7 +433,17 @@ def _video_forward(
     """EaModel.forward with explicit Qwen2-VL positions for prefill/tree."""
 
     if position_ids is None and inputs_embeds is not None:
-        cache_empty = past_key_values is None or past_key_values[0][0].current_length.item() == 0
+        # Works for both the transformers Cache (get_seq_length) and the EAGLE
+        # custom KVCache list (past_key_values[0][0].current_length).
+        if past_key_values is None:
+            cache_empty = True
+        elif hasattr(past_key_values, "get_seq_length"):
+            cache_empty = past_key_values.get_seq_length() == 0
+        else:
+            try:
+                cache_empty = past_key_values[0][0].current_length.item() == 0
+            except Exception:
+                cache_empty = True
         if cache_empty and getattr(self, "_video_prefill_position_ids", None) is not None:
             position_ids = self._video_prefill_position_ids
     with torch.inference_mode():
@@ -362,21 +517,31 @@ def patched_msd_video_path(model: Any, prepared: PreparedPrefill):
     old_tree = ea_module.tree_decoding
     old_evaluate = ea_module.evaluate_posterior
     old_forward = model.forward
-    trace: list[int] = []
+    capture: dict[str, Any] = {"trace": [], "prefill_seconds": None}
 
     def evaluate_with_trace(*args, **kwargs):
         result = old_evaluate(*args, **kwargs)
-        trace.append(int(result[1]))
+        capture["trace"].append(int(result[1]))
+        return result
+
+    def initialize_with_timing(*args, **kwargs):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        start = time.perf_counter()
+        result = _video_initialize_tree(*args, **kwargs)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        capture["prefill_seconds"] = time.perf_counter() - start
         return result
 
     model._video_prefill_position_ids = prepared.position_ids
     model._video_rope_delta = prepared.rope_deltas
     model.forward = types.MethodType(_video_forward, model)
-    ea_module.initialize_tree = _video_initialize_tree
+    ea_module.initialize_tree = initialize_with_timing
     ea_module.tree_decoding = _video_tree_decoding
     ea_module.evaluate_posterior = evaluate_with_trace
     try:
-        yield trace
+        yield capture
     finally:
         model.forward = old_forward
         model._video_prefill_position_ids = None
@@ -384,6 +549,20 @@ def patched_msd_video_path(model: Any, prepared: PreparedPrefill):
         ea_module.initialize_tree = old_initialize
         ea_module.tree_decoding = old_tree
         ea_module.evaluate_posterior = old_evaluate
+        # msdgenerate leaves tree_mask/tree_mode set on the base model after the
+        # loop (reset_tree_mode only runs at the start). A following sample in
+        # the same process would otherwise reuse the stale tree mask and corrupt
+        # its causal mask (e.g. emitting <|im_end|> immediately). Clear them and
+        # the cached rope deltas so the next sample starts from a clean state.
+        qwen = model.base_model.model
+        if hasattr(qwen, "tree_mask"):
+            qwen.tree_mask = None
+        if hasattr(qwen, "tree_mode"):
+            qwen.tree_mode = None
+        try:
+            model.base_model.rope_deltas = None
+        except Exception:
+            pass
 
 
 def generate_msd_full_video(
@@ -393,9 +572,9 @@ def generate_msd_full_video(
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Run the original MSD algorithm with the local native-video patch.
 
-    This first runtime path intentionally covers the full-input condition.
-    Draft-retention ablations are enabled only after the runner supplies a
-    compacted draft context and passes the isolation audit.
+    ``prepared`` may be the full target context or a compacted draft context
+    produced by :func:`compact_qwen2vl_prefill`; the caller owns the target
+    versus draft isolation check recorded in the result row.
     """
 
     if prepared.input_ids.shape[0] != 1:
@@ -403,7 +582,7 @@ def generate_msd_full_video(
     start = time.perf_counter()
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-    with patched_msd_video_path(model, prepared) as acceptance_trace:
+    with patched_msd_video_path(model, prepared) as capture:
         output = model.msdgenerate(
             prepared.input_ids,
             inputs_embeds=prepared.inputs_embeds,
@@ -415,8 +594,15 @@ def generate_msd_full_video(
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
+    prefill_seconds = capture["prefill_seconds"]
+    decode_seconds = elapsed - prefill_seconds if prefill_seconds is not None else elapsed
+    decode_seconds = max(0.0, decode_seconds)
+    acceptance_trace = capture["trace"]
     return output, {
-        "decode_seconds": elapsed,
+        "prefill_seconds": prefill_seconds,
+        "decode_seconds": decode_seconds,
+        "speculative_seconds": elapsed,
+        "end_to_end_seconds": elapsed,
         "acceptance_trace": acceptance_trace,
         "accepted_prefix_tokens": (sum(acceptance_trace) / len(acceptance_trace)) if acceptance_trace else None,
         "verification_steps": len(acceptance_trace),
