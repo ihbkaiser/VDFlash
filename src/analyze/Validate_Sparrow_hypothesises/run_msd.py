@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -124,6 +125,20 @@ def _load_existing_rows(path: str | Path) -> dict[str, dict[str, Any]]:
     return existing
 
 
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _job_target(point: dict[str, Any] | None) -> str:
+    return str(point["target_visual_tokens"]) if point else "native"
+
+
 def run(args: argparse.Namespace) -> int:
     try:
         require_cuda()
@@ -158,14 +173,20 @@ def run(args: argparse.Namespace) -> int:
         else:
             jobs.append((sample, None))
     # Resume: skip jobs whose complete row set is already in the output file.
+    # Row ids carry the calibration milestone so the 400 and 3000 jobs of one
+    # sample never collide (the earlier scheme silently dropped one milestone).
     def _job_row_ids(sample: Any, point: dict[str, Any] | None) -> set[str]:
-        row_ids = {f"{sample.sample_id}:error"}
+        # Only the measured rows gate resume; the ":error" marker row is
+        # informational and must not force a completed job to re-run.
+        target = _job_target(point)
+        row_ids: set[str] = set()
         conditions = ["full"] if args.condition == "full" else ["retention"] if args.condition == "retention" else ["full", "retention"]
         for condition in conditions:
             percentages = [100.0] if condition == "full" else list(args.retention_percentages)
             for percentage in percentages:
                 row_ids.add(
-                    f"{sample.sample_id}:{'full' if condition == 'full' else f'retention-{percentage:g}'}"
+                    f"{sample.sample_id}:{target}:"
+                    f"{'full' if condition == 'full' else f'retention-{percentage:g}'}"
                 )
         return row_ids
 
@@ -177,6 +198,28 @@ def run(args: argparse.Namespace) -> int:
     skipped = len(jobs) - len(pending)
     if skipped:
         print(f"Resume: {skipped}/{len(jobs)} jobs already complete, {len(pending)} pending")
+    # Lock the output file so a second concurrent runner (or a duplicate
+    # launch) cannot interleave writes into the same JSONL.  A stale lock
+    # whose owner process is dead is reclaimed.
+    lock_path = Path(args.output).with_suffix(".jsonl.lock")
+    for _attempt in range(2):
+        try:
+            lock_handle = lock_path.open("x")
+            break
+        except FileExistsError:
+            try:
+                owner = int(lock_path.read_text().strip().split("=")[1])
+            except (OSError, ValueError, IndexError):
+                owner = -1
+            if owner > 0 and _pid_alive(owner):
+                raise SystemExit(
+                    f"another msd run (pid {owner}) holds {lock_path}; refusing to run concurrently"
+                )
+            lock_path.unlink(missing_ok=True)
+    else:  # pragma: no cover - both attempts raced
+        raise SystemExit(f"could not acquire lock {lock_path}")
+    lock_handle.write(f"pid={os.getpid()}\n")
+    lock_handle.flush()
     total_jobs = len(pending)
     for index, (sample, point) in enumerate(pending, start=1):
         target_text = point.get("target_visual_tokens") if point else "native"
@@ -199,7 +242,7 @@ def run(args: argparse.Namespace) -> int:
             # Record an explicit error row (audit-compatible) and continue with
             # the next sample instead of aborting the whole multi-hour stage.
             rows.append({
-                "row_id": f"{sample.sample_id}:error",
+                "row_id": f"{sample.sample_id}:{_job_target(point)}:error",
                 "paper_figure": "Figure 1(a)",
                 "sample_id": sample.sample_id,
                 "target_model": args.base_model,
@@ -222,6 +265,11 @@ def run(args: argparse.Namespace) -> int:
         # Incremental write: a killed stage can resume without losing work.
         write_jsonl(args.output, rows)
     print(f"Wrote {len(rows)} MSD rows to {args.output}")
+    try:
+        lock_handle.close()
+        lock_path.unlink()
+    except OSError:  # pragma: no cover - best-effort lock release
+        pass
     return 0
 
 
@@ -297,7 +345,10 @@ def _run_job(
                     break
                 common += 1
             lossless = common == len(target_tokens)
-            row_id = f"{sample.sample_id}:{'full' if condition == 'full' else f'retention-{percentage:g}'}"
+            row_id = (
+                f"{sample.sample_id}:{_job_target(point)}:"
+                f"{'full' if condition == 'full' else f'retention-{percentage:g}'}"
+            )
             row = {
                 "row_id": row_id,
                 "paper_figure": "Figure 1(a)" if condition == "full" else "Figure 1(b)",
