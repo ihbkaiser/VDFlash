@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.distributed as dist
 from datasets import Dataset
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler, Sampler
 
 from specforge.distributed import get_draft_sp_group, get_sp_ulysses_group
 
@@ -196,6 +196,32 @@ class DataCollatorWithPadding:
         return batch
 
 
+class ExactShardSampler(Sampler[int]):
+    """Partition preprocessing rows across ranks exactly once.
+
+    Unlike ``DistributedSampler``, this sampler neither pads the tail with
+    duplicate rows nor drops it.  It is intended for offline feature capture;
+    synchronized training still uses ``DistributedSampler``.
+    """
+
+    def __init__(self, dataset_size: int, *, num_replicas: int, rank: int):
+        if dataset_size < 0:
+            raise ValueError("dataset_size must be non-negative")
+        if num_replicas < 1:
+            raise ValueError("num_replicas must be positive")
+        if rank < 0 or rank >= num_replicas:
+            raise ValueError(f"rank must be in [0, {num_replicas}), got {rank}")
+        base, remainder = divmod(dataset_size, num_replicas)
+        self.start = rank * base + min(rank, remainder)
+        self.length = base + int(rank < remainder)
+
+    def __iter__(self):
+        return iter(range(self.start, self.start + self.length))
+
+    def __len__(self) -> int:
+        return self.length
+
+
 def prepare_dp_dataloaders(
     dataset: Dataset,
     batch_size: int,
@@ -204,6 +230,8 @@ def prepare_dp_dataloaders(
     pin_memory: Optional[bool] = False,
     shuffle: Optional[bool] = False,
     prefetch_factor: Optional[int] = 2,
+    exact_shard: bool = False,
+    drop_last: bool = True,
     **dataloader_kwargs,
 ) -> DataLoader:
     """
@@ -223,9 +251,16 @@ def prepare_dp_dataloaders(
     """
     world_size = dist.get_world_size(process_group)
     rank = dist.get_rank(process_group)
-    sampler = DistributedSampler(
-        dataset, num_replicas=world_size, rank=rank, shuffle=shuffle
-    )
+    if exact_shard:
+        if shuffle:
+            raise ValueError("exact_shard does not support shuffle")
+        sampler = ExactShardSampler(
+            len(dataset), num_replicas=world_size, rank=rank
+        )
+    else:
+        sampler = DistributedSampler(
+            dataset, num_replicas=world_size, rank=rank, shuffle=shuffle
+        )
     if num_workers == 0:
         prefetch_factor = None
 
@@ -237,7 +272,7 @@ def prepare_dp_dataloaders(
         pin_memory=pin_memory,
         prefetch_factor=prefetch_factor,
         collate_fn=DataCollatorWithPadding(),
-        drop_last=True,
+        drop_last=drop_last,
         **dataloader_kwargs,
     )
     return dataloader

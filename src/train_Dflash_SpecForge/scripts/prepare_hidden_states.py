@@ -130,6 +130,14 @@ def parse_args():
         action="store_true",
         help="Whether the input data is preformatted text with the chat template already applied to the conversation messages.",
     )
+    data_group.add_argument(
+        "--train-only-last-turn",
+        action="store_true",
+        help=(
+            "Supervise only the final assistant turn. Use this when earlier "
+            "assistant messages are prompt history rather than training targets."
+        ),
+    )
     data_group.add_argument("--num-samples", type=int, default=None)
     data_group.add_argument("--build-dataset-num-proc", type=int, default=8)
 
@@ -482,13 +490,21 @@ class HiddenStatesGenerator:
                 )
                 return
 
-        if self.compress:
-            with gzip.open(
-                output_file, "wb", compresslevel=self.compression_level
-            ) as f:
-                torch.save(persisted, f)
-        else:
-            torch.save(persisted, output_file)
+        temporary_file = f"{output_file}.tmp.{uuid.uuid4().hex}"
+        try:
+            if self.compress:
+                with gzip.open(
+                    temporary_file, "wb", compresslevel=self.compression_level
+                ) as f:
+                    torch.save(persisted, f)
+            else:
+                torch.save(persisted, temporary_file)
+            os.replace(temporary_file, output_file)
+        finally:
+            try:
+                os.unlink(temporary_file)
+            except FileNotFoundError:
+                pass
 
     def _save_tensor_async(
         self,
@@ -845,7 +861,11 @@ def main():
     tokenizer = load_tokenizer(
         args.target_model_path, trust_remote_code=args.trust_remote_code
     )
-    cache_params_string = f"{args.data_path}-{args.max_length}-{args.chat_template}-{args.target_model_path}-{args.num_samples}-{args.is_preformatted}"
+    cache_params_string = (
+        f"{args.data_path}-{args.max_length}-{args.chat_template}-"
+        f"{args.target_model_path}-{args.num_samples}-{args.is_preformatted}-"
+        f"last-turn={args.train_only_last_turn}"
+    )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
 
     # Preprocess on complete, un-sharded dataset
@@ -859,6 +879,7 @@ def main():
             cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
             cache_key=cache_key,
             is_preformatted=args.is_preformatted,
+            train_only_last_turn=args.train_only_last_turn,
             num_proc=args.build_dataset_num_proc,
             loss_mask_filter=capture_plan.loss_mask_filter,
         )
@@ -886,8 +907,13 @@ def main():
         dataset=eagle3_dataset,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        pin_memory=True,
         shuffle=False,
+        prefetch_factor=4,
         process_group=get_dp_group(),
+        exact_shard=True,
+        drop_last=False,
+        persistent_workers=args.num_workers > 0,
     )
 
     print_with_rank(

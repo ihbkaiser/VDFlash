@@ -54,6 +54,20 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
 
         self.assertTrue(args.sglang_disable_radix_cache)
 
+    def test_cli_can_supervise_only_the_last_assistant_turn(self):
+        argv = [
+            "prepare_hidden_states.py",
+            "--target-model-path",
+            "target",
+            "--data-path",
+            "data.jsonl",
+            "--train-only-last-turn",
+        ]
+        with mock.patch("sys.argv", argv):
+            args = parse_args()
+
+        self.assertTrue(args.train_only_last_turn)
+
     def test_cli_accepts_dflash_family_config(self):
         argv = [
             "prepare_hidden_states.py",
@@ -291,6 +305,26 @@ class PrepareHiddenStatesSerializationTest(unittest.TestCase):
             warning = str(print_warning.call_args.args[0])
             self.assertIn("hidden_states", warning)
             self.assertIn(str(output_file), warning)
+
+    def test_failed_save_does_not_publish_a_partial_record(self):
+        provider = self.registry.resolve("dflash").providers.offline_for("text")
+        record = provider.capture_layout.materialize(self._sources())
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            output_file = output_dir / "interrupted.ckpt"
+            generator = self._generator(compress=False)
+
+            def fail_after_partial_write(_record, path):
+                Path(path).write_bytes(b"partial")
+                raise OSError("simulated interruption")
+
+            with mock.patch("torch.save", side_effect=fail_after_partial_write):
+                with self.assertRaisesRegex(OSError, "simulated interruption"):
+                    generator._save_tensor_sync(record, str(output_file))
+
+            self.assertFalse(output_file.exists())
+            self.assertEqual(list(output_dir.iterdir()), [])
 
 
 class PrepareHiddenStatesVocabMappingTest(unittest.TestCase):

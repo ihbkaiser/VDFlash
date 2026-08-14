@@ -1,0 +1,48 @@
+model:
+  target_model_path: /workspace/storage-shared/nlp/tungdd11/tungdecoder/models/qwen25-vl-3b
+  draft_model_config: configs/qwen2.5-vl-3b-dflash.json
+  target_backend: sglang
+  input_modality: text
+  embedding_key: model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+  mask_token_id: 151669
+  torch_dtype: bfloat16
+
+data:
+  hidden_states_path: cache/qwen25vl_3b/hidden_states
+  max_length: 2048
+  chat_template: qwen
+  train_only_last_turn: true
+  dataloader_num_workers: 12
+  cache_dir: cache
+
+training:
+  strategy: dflash
+  num_epochs: 6
+  batch_size: 16
+  accumulation_steps: 1
+  fsdp_sharding: NO_SHARD
+  learning_rate: 6.0e-4
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  attention_backend: flex_attention
+  num_anchors: 512
+  objective_chunk_blocks: 256
+  loss_decay_gamma: 7.0
+  save_interval: 1000
+  max_checkpoints: 3
+  log_interval: 100
+  dist_timeout: 30
+  seed: 42
+
+tracking:
+  report_to: none
+
+run_id: qwen25vl-3b-dflash-sharegpt68k
+output_dir: outputs/qwen25vl-3b-dflash-sharegpt68k
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 4
