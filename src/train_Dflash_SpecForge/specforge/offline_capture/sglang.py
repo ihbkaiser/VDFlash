@@ -17,6 +17,7 @@ class OfflineCaptureBatch:
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
     loss_mask: torch.Tensor
+    position_ids: Optional[torch.Tensor] = None
 
 
 class OfflineSGLangCapture:
@@ -65,12 +66,24 @@ class OfflineSGLangCapture:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        multimodal_inputs: Optional[list[dict]] = None,
     ) -> OfflineCaptureBatch:
-        data, aux_states, last_states = self._backend.capture(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            loss_mask=loss_mask,
-        )
+        capture_kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "loss_mask": loss_mask,
+        }
+        # Preserve compatibility with small test/custom backends that still
+        # implement the original text-only capture signature.
+        if position_ids is not None:
+            capture_kwargs["position_ids"] = position_ids
+        if multimodal_inputs is not None:
+            capture_kwargs["multimodal_inputs"] = multimodal_inputs
+        data, aux_states, last_states = self._backend.capture(**capture_kwargs)
+        position_batch = None
+        if position_ids is not None:
+            position_batch = position_ids
         return OfflineCaptureBatch(
             hidden_states=torch.cat(
                 [hidden.unsqueeze(0) for hidden in aux_states], dim=0
@@ -81,6 +94,7 @@ class OfflineSGLangCapture:
             input_ids=torch.cat([row[0] for row in data], dim=0),
             attention_mask=torch.cat([row[1] for row in data], dim=0),
             loss_mask=torch.cat([row[2] for row in data], dim=0),
+            position_ids=position_batch,
         )
 
 

@@ -46,4 +46,6 @@ dataset/VideoDetailCaption/
 
 dataset/VideoDetailCaption
 results/
+llava_dflash_68k_clean_3b.jsonl
+sample.json
 .venv-msd

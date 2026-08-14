@@ -106,3 +106,28 @@ SpecForge upstream currently requires its own environment (`torch==2.11.0`,
 `transformers==5.8.1`, `sglang==0.5.14`). Do not install those pins into the
 root VLM environment, which has separate versions in the repository-level
 `requirements.txt`.
+
+## Qwen2.5-VL LLaVA caption Phase 2
+
+The LLaVA caption workflow uses the offline SpecForge DFlash trainer with a
+Qwen2.5-VL multimodal capture path and 3-axis M-RoPE feature tensors. Run it
+on the server that owns the complete JSONL and image archive/root:
+
+```bash
+SOURCE_JSONL=/data/llava_dflash_68k_clean_3b.jsonl \
+TARGET_MODEL_PATH=/models/qwen25-vl-3b \
+PHASE1_CHECKPOINT=/runs/qwen25vl-phase1/dflash-step10000 \
+IMAGE_ARCHIVE=/data/images.zip \
+bash train_qwen25vl_dflash_llava_68k.sh --phase all
+```
+
+The launcher requires exactly 68,000 valid JSONL records. The normalized
+manifest preserves the source `response` as supervision and rejects malformed
+tail lines, duplicate IDs, unsafe paths, and missing images. An archive is
+materialized safely under the artifact root, using only referenced images.
+
+The capture command requires the pinned SpecForge SGLang environment. Each
+feature record contains `input_ids`, `loss_mask`, `hidden_states`, and Qwen
+2.5-VL `position_ids`. The final `infer` phase is an HF smoke test that checks
+image prefill plus DFlash greedy decoding against target-only greedy decoding;
+it is not a production SGLang DFlash serving recipe.

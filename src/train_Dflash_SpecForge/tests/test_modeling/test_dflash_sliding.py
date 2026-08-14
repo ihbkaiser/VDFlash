@@ -9,6 +9,7 @@ from transformers import Qwen3Config
 from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
 from specforge.modeling.draft.dflash import (
     DFlashDraftModel,
+    Qwen25VLMultiModalRotaryEmbedding,
     resolve_dflash_attention_layout,
 )
 
@@ -186,6 +187,33 @@ class TestDFlashSlidingConfig(unittest.TestCase):
                 config.sliding_window = sliding_window
                 with self.assertRaises(ValueError):
                     resolve_dflash_attention_layout(config)
+
+
+class TestQwen25VLMRoPE(unittest.TestCase):
+    def test_three_axis_positions_produce_dflash_attention_embeddings(self):
+        config = Qwen3Config(
+            hidden_size=12,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=6,
+        )
+        rotary = Qwen25VLMultiModalRotaryEmbedding(
+            config,
+            {"mrope_section": [1, 1, 1], "rope_theta": 1_000_000},
+        )
+        positions = torch.tensor(
+            [
+                [[0, 1, 2, 3]],
+                [[0, 1, 5, 3]],
+                [[0, 4, 2, 3]],
+            ],
+            dtype=torch.long,
+        )
+        cos, sin = rotary(torch.zeros(1, 4, 12), positions)
+
+        self.assertEqual(tuple(cos.shape), (1, 4, 6))
+        self.assertEqual(tuple(sin.shape), (1, 4, 6))
+        self.assertFalse(torch.equal(cos[:, 1], cos[:, 2]))
 
 
 if __name__ == "__main__":

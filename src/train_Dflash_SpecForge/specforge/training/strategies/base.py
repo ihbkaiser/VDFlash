@@ -443,6 +443,11 @@ class DFlashTrainStrategy(DraftTrainStrategy):
             input_ids=t["input_ids"].to(device),
             hidden_states=t["hidden_states"].to(device),
             loss_mask=t["loss_mask"].to(device),
+            position_ids=(
+                t["position_ids"].to(device)
+                if "position_ids" in t
+                else None
+            ),
         )
         metrics = {"accuracy": accuracy.detach()}
         if "accuracy_denom" in model_metrics:

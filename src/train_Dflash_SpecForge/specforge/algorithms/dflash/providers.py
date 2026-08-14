@@ -10,9 +10,12 @@ from specforge.algorithms.common.defaults import (
 )
 from specforge.algorithms.common.dflash_family_data import (
     NORMALIZER_ID,
+    QWEN25VL_NORMALIZER_ID,
     build_collator,
     build_offline_normalizer,
     build_offline_reader,
+    build_qwen25vl_collator,
+    normalize_qwen25vl_offline_sample,
 )
 from specforge.algorithms.common.providers import (
     AlgorithmProviders,
@@ -133,6 +136,7 @@ def needs_input_tools(config, draft_model):
 
 def algorithm_spec() -> AlgorithmSpec:
     ready = {"input_ids", "loss_mask", "hidden_states"}
+    qwen25vl_ready = ready | {"position_ids"}
     return AlgorithmSpec(
         name=ALGORITHM_NAME,
         draft=DraftRequirement(
@@ -152,6 +156,16 @@ def algorithm_spec() -> AlgorithmSpec:
                 ),
             ),
             FeatureContract(
+                mode=FeatureMode.OFFLINE,
+                modality="qwen2_5_vl",
+                required_tensors=qwen25vl_ready,
+                storage=OfflineStorageContract(
+                    format="specforge_hidden_states_qwen25vl_v1",
+                    required_tensors=qwen25vl_ready,
+                    normalizer=QWEN25VL_NORMALIZER_ID,
+                ),
+            ),
+            FeatureContract(
                 mode=FeatureMode.STREAMING,
                 modality="text",
                 required_tensors=ready,
@@ -165,6 +179,7 @@ def algorithm_spec() -> AlgorithmSpec:
 
 def algorithm_providers() -> AlgorithmProviders:
     collator = build_collator
+    qwen25vl_collator = build_qwen25vl_collator
     return AlgorithmProviders(
         algorithm_name=ALGORITHM_NAME,
         step=StepProvider(
@@ -209,6 +224,34 @@ def algorithm_providers() -> AlgorithmProviders:
                 build_reader=partial(build_offline_reader, ALGORITHM_NAME),
                 build_normalizer=build_offline_normalizer,
                 build_collator=collator,
+            ),
+            OfflineDataProvider(
+                modality="qwen2_5_vl",
+                normalizer_id=QWEN25VL_NORMALIZER_ID,
+                capture_layout=OfflineCaptureLayout(
+                    capture_method="dflash",
+                    aux_feature="hidden_states",
+                    last_hidden_feature=None,
+                    passthrough=(
+                        ("input_ids", "input_ids"),
+                        ("loss_mask", "loss_mask"),
+                        ("position_ids", "position_ids"),
+                    ),
+                ),
+                build_reader=partial(
+                    build_offline_reader,
+                    ALGORITHM_NAME,
+                    feature_keys=(
+                        "input_ids",
+                        "loss_mask",
+                        "hidden_states",
+                        "position_ids",
+                    ),
+                ),
+                build_normalizer=partial(
+                    normalize_qwen25vl_offline_sample,
+                ),
+                build_collator=qwen25vl_collator,
             ),
         ),
         server_streaming=(

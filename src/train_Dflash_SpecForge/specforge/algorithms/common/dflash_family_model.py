@@ -226,13 +226,37 @@ class OnlineDFlashModel(nn.Module):
         keep_mask = anchors < sentinel
         return torch.where(keep_mask, anchors, 0), keep_mask
 
-    def _create_position_ids(self, anchor_positions: torch.Tensor) -> torch.Tensor:
-        """Create absolute position IDs for parallel draft blocks."""
+    def _create_position_ids(
+        self,
+        anchor_positions: torch.Tensor,
+        context_position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Gather absolute positions for parallel draft blocks.
+
+        Qwen2.5-VL positions are three-axis tensors.  Gathering positions
+        from the already-tokenized target sequence preserves the visual
+        M-RoPE layout and also keeps the text-only 1-D path unchanged.
+        """
+
         bsz, n_blocks = anchor_positions.shape
         device = anchor_positions.device
         offsets = torch.arange(self.block_size, device=device).view(1, 1, -1)
-        pos_ids = anchor_positions.unsqueeze(-1) + offsets
-        return pos_ids.view(bsz, -1)
+        safe_positions = anchor_positions.clamp(0, context_position_ids.shape[-1] - 1)
+        if context_position_ids.ndim == 2:
+            base = torch.gather(context_position_ids, 1, safe_positions)
+            return (base.unsqueeze(-1) + offsets).view(bsz, -1)
+        if context_position_ids.ndim != 3 or context_position_ids.shape[0] != 3:
+            raise ValueError(
+                "position_ids must have shape [batch, seq] or [3, batch, seq], "
+                f"got {tuple(context_position_ids.shape)}"
+            )
+        axis_index = torch.arange(3, device=device).view(3, 1, 1)
+        axis_index = axis_index.expand(3, bsz, n_blocks)
+        batch_index = torch.arange(bsz, device=device).view(1, bsz, 1)
+        batch_index = batch_index.expand(3, -1, n_blocks)
+        axis_positions = safe_positions.unsqueeze(0).expand(3, -1, -1)
+        base = context_position_ids[axis_index, batch_index, axis_positions]
+        return (base.unsqueeze(-1) + offsets.unsqueeze(0)).view(3, bsz, -1)
 
     def _create_noise_embed(self, input_ids, anchor_positions, block_keep_mask):
         bsz, seq_len = input_ids.shape
@@ -296,6 +320,7 @@ class OnlineDFlashModel(nn.Module):
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -308,11 +333,33 @@ class OnlineDFlashModel(nn.Module):
             input_ids, anchor_positions, block_keep_mask
         )
 
-        context_position_ids = (
-            torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
+        if position_ids is None:
+            context_position_ids = (
+                torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
+            )
+        elif position_ids.ndim == 2:
+            context_position_ids = position_ids.to(device=device, dtype=torch.long)
+        elif position_ids.ndim == 3 and position_ids.shape[0] == 3:
+            context_position_ids = position_ids.to(device=device, dtype=torch.long)
+        elif position_ids.ndim == 3 and position_ids.shape[1] == 3:
+            context_position_ids = position_ids.transpose(0, 1).to(
+                device=device, dtype=torch.long
+            )
+        else:
+            raise ValueError(
+                "position_ids must have shape [batch, seq], [3, batch, seq], "
+                f"or [batch, 3, seq], got {tuple(position_ids.shape)}"
+            )
+        if context_position_ids.shape[-1] != seq_len:
+            raise ValueError(
+                "position_ids sequence length must match input_ids: "
+                f"{context_position_ids.shape[-1]} != {seq_len}"
+            )
+        draft_position_ids = self._create_position_ids(
+            anchor_positions,
+            context_position_ids,
         )
-        draft_position_ids = self._create_position_ids(anchor_positions)
-        full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
+        full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=-1)
 
         mask_builder = (
             create_dflash_block_mask
@@ -410,6 +457,7 @@ class OnlineDFlashModel(nn.Module):
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
         """Parallel block-wise training forward pass; returns
         (loss, accuracy, metrics) — same shape as Domino's forward."""
@@ -424,6 +472,7 @@ class OnlineDFlashModel(nn.Module):
             input_ids=input_ids,
             hidden_states=hidden_states,
             loss_mask=loss_mask,
+            position_ids=position_ids,
         )
 
         # --- Labels: same-position prediction (position k predicts token anchor+k) ---
@@ -1090,6 +1139,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
         target_last_hidden_states: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
         """Parallel DSpark training forward pass."""
@@ -1101,6 +1151,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             input_ids=input_ids,
             hidden_states=hidden_states,
             loss_mask=loss_mask,
+            position_ids=position_ids,
         )
 
         (

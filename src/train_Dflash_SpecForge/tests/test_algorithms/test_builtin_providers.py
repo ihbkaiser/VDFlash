@@ -155,12 +155,15 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 self.assertIsNone(policy.target_defaults)
                 self.assertIsNone(policy.apply_overrides)
 
-    def test_vlm_is_not_registered_as_a_builtin(self):
+    def test_qwen25vl_is_registered_only_for_offline_dflash(self):
         for registration in self.registry:
             modalities = {
                 contract.modality for contract in registration.spec.feature_contracts
             }
-            self.assertEqual({"text"}, modalities, registration.name)
+            if registration.name == "dflash":
+                self.assertEqual({"text", "qwen2_5_vl"}, modalities)
+            else:
+                self.assertEqual({"text"}, modalities, registration.name)
 
     def test_builtin_resume_contracts_cover_resolved_objective_semantics(self):
         training = SimpleNamespace(

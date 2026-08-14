@@ -79,6 +79,80 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
+class Qwen25VLMultiModalRotaryEmbedding(nn.Module):
+    """Qwen2.5-VL three-axis rotary embedding for the DFlash backbone.
+
+    The DFlash parameter layout remains Qwen3-compatible.  Only the position
+    encoding is selected by ``dflash_config.position_encoding`` so Phase 1
+    checkpoints can be warm-started without adding or reshaping parameters.
+    """
+
+    def __init__(self, config: Qwen3Config, dflash_config: dict):
+        super().__init__()
+        self.head_dim = int(
+            getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        )
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if rope_parameters is None:
+            rope_parameters = getattr(config, "rope_scaling", None) or {}
+        if isinstance(rope_parameters, dict) and "default" in rope_parameters:
+            rope_parameters = rope_parameters["default"]
+        if not isinstance(rope_parameters, dict):
+            rope_parameters = {}
+        theta = float(
+            dflash_config.get(
+                "rope_theta",
+                rope_parameters.get("rope_theta", getattr(config, "rope_theta", 1_000_000.0)),
+            )
+        )
+        sections = dflash_config.get(
+            "mrope_section",
+            rope_parameters.get("mrope_section", getattr(config, "mrope_section", None)),
+        )
+        if sections is None:
+            sections = [
+                self.head_dim // 2,
+                self.head_dim // 4,
+                self.head_dim - (self.head_dim // 2 + self.head_dim // 4),
+            ]
+        sections = [int(value) for value in sections]
+        if len(sections) != 3 or sum(sections) * 2 != self.head_dim:
+            raise ValueError(
+                "Qwen2.5-VL mrope_section must contain three sections whose "
+                f"doubled sum equals head_dim={self.head_dim}, got {sections}"
+            )
+        self.mrope_section = tuple(sections)
+        inv_freq = 1.0 / (
+            theta
+            ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim)
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor):
+        del hidden_states
+        if position_ids.ndim == 2:
+            position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+        if position_ids.ndim != 3 or position_ids.shape[0] != 3:
+            raise ValueError(
+                "Qwen2.5-VL position_ids must have shape [3, batch, length], "
+                f"got {tuple(position_ids.shape)}"
+            )
+        positions = position_ids.to(device=self.inv_freq.device, dtype=torch.float32)
+        freqs = torch.einsum("d,abl->abdl", self.inv_freq, positions).transpose(-1, -2)
+        embeddings = torch.cat((freqs, freqs), dim=-1)
+        cos, sin = embeddings.cos(), embeddings.sin()
+        sections = list(self.mrope_section) * 2
+        chunks_cos = cos.split(sections, dim=-1)
+        chunks_sin = sin.split(sections, dim=-1)
+        mixed_cos = torch.cat(
+            [chunk[index % 3] for index, chunk in enumerate(chunks_cos)], dim=-1
+        )
+        mixed_sin = torch.cat(
+            [chunk[index % 3] for index, chunk in enumerate(chunks_sin)], dim=-1
+        )
+        return mixed_cos, mixed_sin
+
+
 def _prepare_dflash_eager_mask(
     attention_mask: Optional[torch.Tensor],
     dtype: torch.dtype,
@@ -381,7 +455,10 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             build_target_layer_ids(config.num_target_layers, config.num_hidden_layers),
         )
         self.norm = kernels.make_rms_norm(config.hidden_size, config.rms_norm_eps)
-        self.rotary_emb = Qwen3RotaryEmbedding(config)
+        if dflash_config.get("position_encoding") == "qwen2_5_vl_mrope":
+            self.rotary_emb = Qwen25VLMultiModalRotaryEmbedding(config, dflash_config)
+        else:
+            self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.fc = nn.Linear(
             len(self.target_layer_ids) * config.hidden_size,
             config.hidden_size,
@@ -448,7 +525,10 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         duplicating the target-cache and acceptance logic in ``spec_generate``.
         """
         del block_output_ids
-        draft_logits = target.lm_head(draft_hidden[:, -self.block_size + 1 :, :])
+        lm_head = getattr(target, "lm_head", None)
+        if lm_head is None:
+            lm_head = target.get_output_embeddings()
+        draft_logits = lm_head(draft_hidden[:, -self.block_size + 1 :, :])
         return sample(draft_logits)
 
     def forward(
@@ -490,38 +570,92 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         max_new_tokens: int,
         stop_token_ids: list[int],
         temperature: float,
+        *,
+        position_ids: Optional[torch.LongTensor] = None,
+        target_kwargs: Optional[dict] = None,
     ):
         self.eval()
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
+        target_device = next(target.parameters()).device
 
         block_size = self.block_size
+        if input_ids.shape[0] != 1:
+            raise ValueError("DFlash HF inference currently supports batch size one")
         output_ids = torch.full(
             (1, max_length + block_size),
             self.mask_token_id,
             dtype=torch.long,
-            device=target.device,
+            device=target_device,
         )
-        position_ids = torch.arange(
-            output_ids.shape[1], device=target.device
-        ).unsqueeze(0)
+        if position_ids is None:
+            position_ids = torch.arange(
+                output_ids.shape[1], device=target_device
+            ).unsqueeze(0)
+        else:
+            position_ids = position_ids.to(device=target_device, dtype=torch.long)
+            if position_ids.ndim == 2:
+                if position_ids.shape != input_ids.shape:
+                    raise ValueError("2-D position_ids must match input_ids")
+                continuation = torch.arange(
+                    position_ids[:, -1].item() + 1,
+                    position_ids[:, -1].item() + 1 + output_ids.shape[1] - num_input_tokens,
+                    device=target_device,
+                ).view(1, -1)
+                position_ids = torch.cat([position_ids, continuation], dim=1)
+            elif position_ids.ndim == 3 and position_ids.shape[0] == 3:
+                if position_ids.shape[1:] != input_ids.shape:
+                    raise ValueError(
+                        "3-D position_ids must have shape [3, 1, input_length]"
+                    )
+                starts = position_ids[:, :, -1:] + 1
+                offsets = torch.arange(
+                    output_ids.shape[1] - num_input_tokens,
+                    device=target_device,
+                ).view(1, 1, -1)
+                continuation = starts + offsets
+                position_ids = torch.cat([position_ids, continuation], dim=-1)
+            else:
+                raise ValueError(
+                    "position_ids must have shape [1, input_length] or "
+                    f"[3, 1, input_length], got {tuple(position_ids.shape)}"
+                )
 
         past_key_values_target = DynamicCache()
         past_key_values_draft = DynamicCache()
 
+        target_input_embeddings = getattr(target, "get_input_embeddings", None)
+        if callable(target_input_embeddings):
+            target_embed_tokens = target_input_embeddings()
+        else:
+            target_embed_tokens = target.model.embed_tokens
+
+        def forward_target(**kwargs):
+            try:
+                return target(**kwargs)
+            except TypeError as exc:
+                if "logits_to_keep" not in str(exc):
+                    raise
+                kwargs.pop("logits_to_keep", None)
+                return target(**kwargs)
+
         # Prefill stage
-        output = target(
-            input_ids,
-            position_ids=position_ids[:, :num_input_tokens],
-            past_key_values=past_key_values_target,
-            use_cache=True,
-            logits_to_keep=1,
-            output_hidden_states=True,
+        prefill_kwargs = dict(target_kwargs or {})
+        prefill_kwargs.update(
+            {
+                "input_ids": input_ids,
+                "position_ids": position_ids[..., :num_input_tokens],
+                "past_key_values": past_key_values_target,
+                "use_cache": True,
+                "logits_to_keep": 1,
+                "output_hidden_states": True,
+            }
         )
+        output = forward_target(**prefill_kwargs)
 
         output_ids[:, :num_input_tokens] = input_ids
         output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
-            output.logits, temperature
+            output.logits[:, -1:, :], temperature
         )
         target_hidden = extract_context_feature(
             output.hidden_states, self.target_layer_ids
@@ -532,13 +666,14 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         start = input_ids.shape[1]
         while start < max_length:
             block_output_ids = output_ids[:, start : start + block_size].clone()
-            block_position_ids = position_ids[:, start : start + block_size]
-            noise_embedding = target.model.embed_tokens(block_output_ids)
+            block_position_ids = position_ids[..., start : start + block_size]
+            noise_embedding = target_embed_tokens(block_output_ids)
             draft_hidden = self(
                 target_hidden=target_hidden,
                 noise_embedding=noise_embedding,
                 position_ids=position_ids[
-                    :, past_key_values_draft.get_seq_length() : start + block_size
+                    ...,
+                    past_key_values_draft.get_seq_length() : start + block_size,
                 ],
                 past_key_values=past_key_values_draft,
                 use_cache=True,
@@ -551,8 +686,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 block_output_ids,
             )
 
-            output = target(
-                block_output_ids,
+            output = forward_target(
+                input_ids=block_output_ids,
                 position_ids=block_position_ids,
                 past_key_values=past_key_values_target,
                 use_cache=True,
