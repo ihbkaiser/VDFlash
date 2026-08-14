@@ -27,8 +27,14 @@ artifacts/
 
 # Environment / venv
 .venv/
+.venv-msd/
 venv/
 env/
+.hf_cache/
+.matplotlib/
+
+# Downloaded evaluation data (large, reproducible from the Hugging Face source)
+dataset/VideoDetailCaption/
 
 # Model weights (large binaries, keep out of git)
 *.safetensors
@@ -40,3 +46,4 @@ env/
 
 dataset/VideoDetailCaption
 results/
+.venv-msd

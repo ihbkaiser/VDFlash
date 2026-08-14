@@ -18,10 +18,13 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO_ROOT"
+source "$REPO_ROOT/src/analyze/Validate_Sparrow_hypothesises/activate_msd_env.sh"
 
 OUTPUT_DIR="${OUTPUT_DIR:-results/sparrow_validation}"
 LOG_PATH="${LOG_PATH:-$OUTPUT_DIR/gpu_run.log}"
-ALLOW_OUT_OF_TOLERANCE="${ALLOW_OUT_OF_TOLERANCE:-1}"
+# Strict local evidence defaults to calibrated points only.  Set
+# ALLOW_OUT_OF_TOLERANCE=1 explicitly for a separately-labelled diagnostic.
+ALLOW_OUT_OF_TOLERANCE="${ALLOW_OUT_OF_TOLERANCE:-0}"
 EXTRA_ARGS=("$@")
 
 mkdir -p "$OUTPUT_DIR"
@@ -45,9 +48,9 @@ if [[ ! -s "$OUTPUT_DIR/calibration.jsonl" || "${RECALIBRATE:-0}" == "1" ]]; the
         --output "$OUTPUT_DIR/calibration.jsonl"
 fi
 
-# 2. GPU stages + audit + report.  --allow-out-of-tolerance is expected here:
-#    several short VDC videos cannot reach the 25k visual-token milestone, so
-#    the closest measured point is used and recorded per row.
+# 2. GPU stages + audit + report.  Out-of-tolerance points are excluded from
+#    the strict paper-shaped cohort by default.  Opt in explicitly when a
+#    separately-labelled diagnostic is desired.
 ALLOW_FLAG=()
 if [[ "$ALLOW_OUT_OF_TOLERANCE" == "1" ]]; then
     ALLOW_FLAG+=(--allow-out-of-tolerance)

@@ -15,7 +15,7 @@ from .model_analysis import (
     find_instruction_masks,
     load_qwen_model,
 )
-from .paper_contract import DEFAULT_CONTRACT
+from .paper_contract import load_contract
 from .runtime import (
     RuntimeUnavailableError,
     build_qwen2vl_video_processor,
@@ -57,10 +57,15 @@ def _calibration_jobs(
             continue
         for point in sorted(points, key=lambda row: int(row["target_visual_tokens"])):
             if point.get("status") != "ok" and not allow_out_of_tolerance:
-                raise SystemExit(
-                    f"Calibration point {sample.sample_id}:{point['target_visual_tokens']} is "
-                    f"{point.get('status')}; pass --allow-out-of-tolerance to use it"
+                # Strict evidence uses only calibrated points.  Leave the
+                # sample out of this cohort instead of aborting every other
+                # milestone; coverage will report the missing paired count.
+                print(
+                    f"WARNING: skipping non-calibrated point {sample.sample_id}:"
+                    f"{point['target_visual_tokens']} ({point.get('status')})",
+                    flush=True,
                 )
+                continue
             jobs.append((sample, point))
     if not jobs:
         raise SystemExit(f"No usable calibration jobs for targets {targets} in {calibration_path}")
@@ -77,12 +82,13 @@ def run(args: argparse.Namespace) -> int:
         require_cuda()
     except RuntimeUnavailableError as exc:
         raise SystemExit(str(exc)) from exc
+    contract = load_contract(args.contract)
     samples = load_vdc_manifest(args.manifest, args.dataset_root)
     if args.limit is not None:
         samples = samples[: args.limit]
     targets = list(args.visual_targets or (
-        DEFAULT_CONTRACT.attention_short_tokens,
-        DEFAULT_CONTRACT.attention_long_tokens,
+        contract.attention_short_tokens,
+        contract.attention_long_tokens,
     ))
     jobs = _calibration_jobs(samples, args.calibration, targets, args.allow_out_of_tolerance)
     processor = build_qwen2vl_video_processor(args.model, args.min_pixels, args.max_pixels)
@@ -207,6 +213,13 @@ def run(args: argparse.Namespace) -> int:
                     "modality": "summary",
                     "token_position": int(masks["query_index"]),
                     "attention_weight": None,
+                    # Compact trace used by retention selectors/renderers;
+                    # per-token rows remain for backwards compatibility.
+                    "record_type": "attention_trace",
+                    "attention_weights": [float(value) for value in attention.tolist()],
+                    "visual_attention_weights": [float(value) for value in attention[visual].tolist()],
+                    "instruction_attention_weights": [float(value) for value in attention[instruction].tolist()],
+                    "text_attention_weights": [float(value) for value in attention[text].tolist()],
                 })
                 rows.append(summary)
 
@@ -240,6 +253,10 @@ def _fingerprint(input_ids: torch.Tensor) -> str:
     return __import__("hashlib").sha256(values.numpy().tobytes() + str(values.shape).encode()).hexdigest()[:16]
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--contract",
+        default="src/analyze/Validate_Sparrow_hypothesises/configs/local_insight_vdc50.yaml",
+    )
     parser.add_argument("--manifest", default="dataset/VideoDetailCaption/subset_manifest.jsonl")
     parser.add_argument("--dataset-root", default="dataset/VideoDetailCaption")
     parser.add_argument("--model", default="Qwen/Qwen2-VL-7B-Instruct")

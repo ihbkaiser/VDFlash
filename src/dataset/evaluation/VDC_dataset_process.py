@@ -16,7 +16,7 @@ quantiles, and extracts only those selected videos into::
 The selected directory layout is compatible with the existing benchmark runner
 which looks for ``<video-root>/Test_Videos/<video_name>.mp4``.
 
-python src/analyze/VDC_dataset_process.py \
+python src/dataset/evaluation/VDC_dataset_process.py \
   --subset-size 50 \
   --seed 42
 """

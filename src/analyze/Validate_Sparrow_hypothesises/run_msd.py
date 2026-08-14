@@ -13,7 +13,7 @@ from typing import Any
 import torch
 
 from .dataset import load_vdc_manifest, write_jsonl
-from .paper_contract import DEFAULT_CONTRACT
+from .paper_contract import load_contract
 from .runtime import (
     RuntimeUnavailableError,
     build_qwen2vl_video_processor,
@@ -39,24 +39,43 @@ def _hash_tokens(tokens: list[int]) -> str:
 
 
 def _target_reference(base_model: Any, batch: Any, input_length: int, max_new_tokens: int) -> tuple[list[int], float, float]:
+    # A full-vocabulary logit tensor for every position costs roughly
+    # ``sequence_length * vocab_size * 2`` bytes.  At 25K Qwen2-VL tokens
+    # that is more than 15 GiB and is unnecessary: prefill parity and greedy
+    # generation only consume the final position.  Keep the long-context
+    # path compatible with model-parallel inference by returning last-position
+    # logits from the language-model head.
+    lm_head_original = None
+    input_ids = batch.get("input_ids") if isinstance(batch, dict) else getattr(batch, "input_ids", None)
+    if input_ids is not None and input_ids.shape[1] > 4096:
+        lm_head_original = base_model.lm_head.forward
+
+        def _last_position_only(hidden_states: torch.Tensor) -> torch.Tensor:
+            return lm_head_original(hidden_states[:, -1:])
+
+        base_model.lm_head.forward = _last_position_only
     start = time.perf_counter()
-    with torch.inference_mode():
-        base_model(**batch, use_cache=True, return_dict=True)
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    prefill_seconds = time.perf_counter() - start
-    start = time.perf_counter()
-    with torch.inference_mode():
-        output = base_model.generate(
-            **batch,
-            do_sample=False,
-            temperature=0.0,
-            max_new_tokens=max_new_tokens,
-            use_cache=True,
-        )
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    end_to_end_seconds = time.perf_counter() - start
+    try:
+        with torch.inference_mode():
+            base_model(**batch, use_cache=True, return_dict=True)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        prefill_seconds = time.perf_counter() - start
+        start = time.perf_counter()
+        with torch.inference_mode():
+            output = base_model.generate(
+                **batch,
+                do_sample=False,
+                temperature=0.0,
+                max_new_tokens=max_new_tokens,
+                use_cache=True,
+            )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        end_to_end_seconds = time.perf_counter() - start
+    finally:
+        if lm_head_original is not None:
+            base_model.lm_head.forward = lm_head_original
     return _new_tokens(output, input_length), prefill_seconds, end_to_end_seconds
 
 
@@ -87,16 +106,44 @@ def _load_visual_scores(path: str | None) -> dict[tuple[str, int, str], list[flo
     if path is None:
         return {}
     grouped: dict[tuple[str, int, str], list[tuple[int, float]]] = {}
+    compact: dict[tuple[str, int, str], list[float]] = {}
     for row in _read_jsonl(path):
-        if row.get("paper_figure") != "Figure 2" or row.get("modality") != "visual":
+        if row.get("paper_figure") != "Figure 2":
+            continue
+        if row.get("attention_source") not in {None, "msd_draft"}:
             continue
         policy = str(row.get("attention_policy") or "last_instruction")
         key = (str(row["sample_id"]), int(row.get("visual_token_count", -1)), policy)
-        grouped.setdefault(key, []).append((int(row["visual_index"]), float(row["attention_weight"])))
-    return {
+        if row.get("modality") == "visual":
+            grouped.setdefault(key, []).append((int(row["visual_index"]), float(row["attention_weight"])))
+        elif row.get("modality") == "summary" and row.get("visual_attention_weights") is not None:
+            compact[key] = [float(value) for value in row["visual_attention_weights"]]
+    scores = {
         key: [value for _index, value in sorted(values)]
         for key, values in grouped.items()
     }
+    scores.update({key: values for key, values in compact.items() if key not in scores})
+    return scores
+
+
+def _load_worklist(path: str | None) -> set[tuple[str, str]]:
+    """Load scheduler-selected ``(sample_id, target)`` jobs.
+
+    The regular manifest remains the source of video/question metadata.  A
+    worklist only controls which calibrated milestones this process owns,
+    allowing heterogeneous GPUs to share one model run without duplicating
+    high-visual-token jobs on a smaller GPU.
+    """
+
+    if path is None:
+        return set()
+    selected: set[tuple[str, str]] = set()
+    for row in _read_jsonl(path):
+        if "sample_id" not in row:
+            raise ValueError(f"worklist row is missing sample_id: {path}")
+        target = row.get("target_visual_tokens", "native")
+        selected.add((str(row["sample_id"]), str(target)))
+    return selected
 
 
 def _load_existing_rows(path: str | Path) -> dict[str, dict[str, Any]]:
@@ -145,17 +192,26 @@ def run(args: argparse.Namespace) -> int:
     except RuntimeUnavailableError as exc:
         raise SystemExit(str(exc)) from exc
     manifest_path = Path(args.manifest)
+    contract = load_contract(args.contract)
     samples = load_vdc_manifest(manifest_path, args.dataset_root)
     if args.limit is not None:
         samples = samples[: args.limit]
-    targets = list(args.visual_targets or DEFAULT_CONTRACT.visual_token_milestones)
+    targets = list(args.visual_targets or contract.visual_token_milestones)
+    if args.retention_percentages is None:
+        args.retention_percentages = list(contract.retention_percentages)
     calibration = _load_calibration(args.calibration, targets)
     visual_scores = _load_visual_scores(args.selection_scores)
+    worklist = _load_worklist(args.worklist)
     if args.calibration and not calibration:
         raise SystemExit("Calibration file contains no requested visual-token targets")
     existing = _load_existing_rows(args.output)
     processor = build_qwen2vl_video_processor(args.base_model, args.min_pixels, args.max_pixels)
-    model = load_msd_qwen2vl(args.base_model, args.msd_model)
+    model = load_msd_qwen2vl(
+        args.base_model,
+        args.msd_model,
+        device_map=args.device_map,
+        max_memory=args.max_memory,
+    )
     base_model = model.base_model
     device = model_device(base_model)
     rows: list[dict[str, Any]] = list(existing.values())
@@ -165,13 +221,21 @@ def run(args: argparse.Namespace) -> int:
         if points:
             for point in sorted(points, key=lambda row: int(row["target_visual_tokens"])):
                 if point.get("status") != "ok" and not args.allow_out_of_tolerance:
-                    raise SystemExit(
-                        f"Calibration point {sample.sample_id}:{point['target_visual_tokens']} is "
-                        f"{point.get('status')}; pass --allow-out-of-tolerance to run it"
+                    print(
+                        f"WARNING: skipping non-calibrated point {sample.sample_id}:"
+                        f"{point['target_visual_tokens']} ({point.get('status')})",
+                        flush=True,
                     )
+                    continue
                 jobs.append((sample, point))
         else:
             jobs.append((sample, None))
+    if args.worklist:
+        jobs = [
+            (sample, point)
+            for sample, point in jobs
+            if (sample.sample_id, _job_target(point)) in worklist
+        ]
     # Resume: skip jobs whose complete row set is already in the output file.
     # Row ids carry the calibration milestone so the 400 and 3000 jobs of one
     # sample never collide (the earlier scheme silently dropped one milestone).
@@ -285,6 +349,8 @@ def _run_job(
 ) -> list[dict[str, Any]]:
     """Run every Figure 1(a)/1(b) condition for one (sample, milestone) job."""
 
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(device)
     if point and point.get("candidate_settings"):
         settings = point["candidate_settings"]
         fps = float(settings["frames"]) / max(float(sample.duration_sec or 1.0), 1e-3)
@@ -349,9 +415,17 @@ def _run_job(
                 f"{sample.sample_id}:{_job_target(point)}:"
                 f"{'full' if condition == 'full' else f'retention-{percentage:g}'}"
             )
+            length_series = "msd_keep_visual"
+            paper_figure = "Figure 1(a)"
+            if condition == "retention" and args.length_series == "remove_all" and percentage == 0.0:
+                length_series = "msd_remove_all"
+                paper_figure = "Figure 1(a)"
+            elif condition == "retention":
+                paper_figure = "Figure 1(b)"
             row = {
                 "row_id": row_id,
-                "paper_figure": "Figure 1(a)" if condition == "full" else "Figure 1(b)",
+                "paper_figure": paper_figure,
+                "series_id": length_series if paper_figure == "Figure 1(a)" else f"vdc_{args.selection}",
                 "sample_id": sample.sample_id,
                 "target_model": args.base_model,
                 "temperature": 0.0,
@@ -372,6 +446,8 @@ def _run_job(
                 "verification_steps": trace["verification_steps"],
                 "prefill_seconds": trace["prefill_seconds"],
                 "decode_seconds": trace["decode_seconds"],
+                "draft_tree_prefill_seconds": trace.get("draft_tree_prefill_seconds", trace["prefill_seconds"]),
+                "verification_seconds": trace.get("verification_seconds", trace["decode_seconds"]),
                 "end_to_end_seconds": trace["end_to_end_seconds"],
                 "ar_prefill_seconds": ar_prefill,
                 "ar_decode_seconds": max(0.0, ar_e2e - ar_prefill),
@@ -405,17 +481,48 @@ def _run_job(
                 print(f"  {condition} {percentage:g}% lossless: NO (prefix {common}/{len(target_tokens)})", flush=True)
                 if args.strict_losslessness:
                     raise RuntimeError(f"losslessness failed for {row_id}")
+    if torch.cuda.is_available():
+        peak_memory = int(torch.cuda.max_memory_allocated(device))
+        peak_gib = peak_memory / (1024 ** 3)
+        print(f"  peak allocated memory: {peak_gib:.2f} GiB", flush=True)
+        for row in rows:
+            row["peak_memory_allocated_bytes"] = peak_memory
     return rows
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--contract",
+        default="src/analyze/Validate_Sparrow_hypothesises/configs/local_insight_vdc50.yaml",
+    )
     parser.add_argument("--manifest", default="dataset/VideoDetailCaption/subset_manifest.jsonl")
     parser.add_argument("--dataset-root", default="dataset/VideoDetailCaption")
     parser.add_argument("--base-model", default="Qwen/Qwen2-VL-7B-Instruct")
     parser.add_argument("--msd-model", default="lucylyn/MSD-Qwen2VL-7B-Instruct")
+    parser.add_argument(
+        "--device-map",
+        choices=("cuda", "auto", "model_parallel"),
+        default="cuda",
+        help="cuda keeps one model on one GPU; auto lets Accelerate shard; model_parallel uses the MSD-safe explicit 3090/A4000 map.",
+    )
+    parser.add_argument(
+        "--max-memory",
+        help="device budgets for --device-map auto, e.g. 0:22GiB,1:14GiB",
+    )
     parser.add_argument("--output", default="results/sparrow_validation/msd_full.jsonl")
+    parser.add_argument(
+        "--worklist",
+        help="JSONL of scheduler-selected sample_id/target_visual_tokens jobs; "
+        "the manifest still supplies the video metadata.",
+    )
     parser.add_argument("--condition", choices=("full", "retention", "both"), default="full")
+    parser.add_argument(
+        "--length-series",
+        choices=("keep_visual", "remove_all"),
+        default="keep_visual",
+        help="Label a zero-retention run as Figure 1(a) Remove All instead of Figure 1(b).",
+    )
     parser.add_argument("--fps", type=float, default=8.0)
     parser.add_argument("--min-pixels", type=int, default=256 * 28 * 28)
     parser.add_argument("--max-pixels", type=int, default=1024 * 28 * 28)
@@ -432,12 +539,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Milestones to select from --calibration (default: 400 3000 13000 25000).",
     )
     parser.add_argument("--allow-out-of-tolerance", action="store_true")
-    parser.add_argument(
-        "--retention-percentages",
-        type=float,
-        nargs="+",
-        default=list(DEFAULT_CONTRACT.retention_percentages),
-    )
+    parser.add_argument("--retention-percentages", type=float, nargs="+", default=None)
     parser.add_argument(
         "--selection",
         choices=("uniform", "top_attention", "last_instruction", "all_text"),

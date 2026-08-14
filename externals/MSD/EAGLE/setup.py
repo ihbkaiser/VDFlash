@@ -10,7 +10,7 @@ setup(
     packages=find_packages(),
     install_requires=[
         "torch == 2.1.2",
-        "transformers==4.48.3",
+        "transformers==4.49.0",
         "accelerate == 1.3.0",
         "fschat == 0.2.31",
         "gradio == 3.50.2",

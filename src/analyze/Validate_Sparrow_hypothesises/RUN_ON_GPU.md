@@ -27,10 +27,21 @@ nguồn được phân biệt bằng field `attention_source` (`target` / `msd_d
 ## 2. Môi trường GPU host (T4 16GB trở lên)
 
 ```bash
-# Python 3.10, CUDA 12.1 (xem requirements.txt của harness)
+# Python 3.10, PyTorch CUDA 12.1 và Transformers 4.49.0 (xem requirements.txt của harness)
 python3.10 -m venv .venv-msd && source .venv-msd/bin/activate
 pip install -r src/analyze/Validate_Sparrow_hypothesises/requirements.txt
 pip install torch==2.1.2 --index-url https://download.pytorch.org/whl/cu121
+
+# Kích hoạt venv và CUDA runtime wheels cho bitsandbytes
+source src/analyze/Validate_Sparrow_hypothesises/activate_msd_env.sh
+python -m bitsandbytes
+```
+
+Nếu `bitsandbytes` báo thiếu `libcusparse.so.12`, cài bổ sung:
+
+```bash
+python -m pip install nvidia-cusparse-cu12==12.1.0.106
+source src/analyze/Validate_Sparrow_hypothesises/activate_msd_env.sh
 ```
 
 Model cần có trong HF cache (hoặc `hf auth login` để tải khi chạy):
@@ -56,16 +67,19 @@ phải nằm cạnh repo (đã có sẵn trong repo này).
 src/analyze/Validate_Sparrow_hypothesises/run_sparrow_validation_gpu.sh
 ```
 
-Script tự chạy: calibration (nếu chưa có) → `all` (preflight → msd full +
-retention → attention → draft_attention → layers → audit → report), với
-`--quantized` (4-bit cho T4) và `--allow-out-of-tolerance` (nhiều video VDC
-ngắn không đạt nổi milestone 25k — điểm đo gần nhất được dùng và ghi rõ trong
-row). Kết quả nằm ở `results/sparrow_validation/`:
+Script tự chạy: calibration (nếu chưa có) → `all` (preflight → target/draft
+attention → MSD full + remove-all + attention-guided retention → layers →
+audit → report), với `--quantized` (4-bit cho T4). Chỉ điểm calibration
+`ok` được đưa vào cohort paper-shaped; đặt `ALLOW_OUT_OF_TOLERANCE=1` nếu cần
+diagnostic riêng. Kết quả nằm ở `results/sparrow_validation/`:
 
-- `msd.jsonl`, `figure2_attention.jsonl`, `figure2_draft_attention.jsonl`,
+- `msd_full.jsonl`, `msd_remove_all.jsonl`,
+  `msd_retention_last_instruction.jsonl`,
+  `msd_retention_all_text.jsonl`, `figure2_attention.jsonl`, `figure2_draft_attention.jsonl`,
   `layer_analysis.jsonl` → merge thành `results.jsonl`
 - `audit.json` (fail-closed: leak target/draft, masks chồng nhau, model sai contract…)
-- `report/REPORT.md`, `report/figure*_insight_*.png`,
+- `report/REPORT.md`, `report/figure*_insight_*.{png,pdf,svg}` (only when
+  coverage passes; otherwise `report/diagnostic/` is watermarked),
   `report/paper_statistics.json`
 
 Tham số hữu ích:

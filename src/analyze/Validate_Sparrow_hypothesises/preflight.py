@@ -56,18 +56,69 @@ def run_preflight(
             import torch
 
             cuda = bool(torch.cuda.is_available())
-            detail = f"torch={torch_version}, cuda={cuda}"
-            add("torch_cuda", "ok" if cuda or not require_gpu else "error", detail, cuda_available=cuda)
+            device_count = int(torch.cuda.device_count()) if cuda else 0
+            detail = f"torch={torch_version}, cuda={cuda}, devices={device_count}"
+            add(
+                "torch_cuda",
+                "ok" if cuda or not require_gpu else "error",
+                detail,
+                cuda_available=cuda,
+                device_count=device_count,
+            )
             if cuda:
-                add("gpu", "ok", torch.cuda.get_device_name(0), device_count=torch.cuda.device_count())
+                names = [torch.cuda.get_device_name(index) for index in range(device_count)]
+                add("gpu", "ok", "; ".join(names), device_count=device_count, devices=names)
         except Exception as exc:  # pragma: no cover
             add("torch_cuda", "error", str(exc))
 
     for module_name in ("transformers", "accelerate", "av", "matplotlib", "qwen_vl_utils"):
         version = _module_version(module_name)
         add(module_name, "ok" if version else "error", version or "not installed", version=version)
+
+    try:
+        import transformers
+
+        qwen25_available = hasattr(transformers, "Qwen2_5_VLForConditionalGeneration")
+        add(
+            "qwen25_vl",
+            "ok" if qwen25_available else "error",
+            "Qwen2.5-VL Transformers integration available"
+            if qwen25_available
+            else "Qwen2.5-VL is unavailable; install Transformers 4.49.0 or newer",
+        )
+    except Exception as exc:  # pragma: no cover
+        add("qwen25_vl", "error", str(exc))
+
+    eagle_root = root / "externals" / "MSD" / "EAGLE"
+    if eagle_root.exists():
+        try:
+            import sys as _sys
+
+            if str(eagle_root) not in _sys.path:
+                _sys.path.insert(0, str(eagle_root))
+            import eagle.model.ea_model  # noqa: F401
+
+            add("msd_eagle", "ok", "vendored MSD/EAGLE imports successfully")
+        except Exception as exc:  # pragma: no cover
+            add("msd_eagle", "error", str(exc))
+    else:
+        add("msd_eagle", "error", f"missing: {eagle_root}")
+
     bitsandbytes = _module_version("bitsandbytes")
     add("bitsandbytes", "ok" if bitsandbytes else ("error" if require_gpu else "warning"), bitsandbytes or "not installed")
+    if bitsandbytes:
+        try:
+            from bitsandbytes.cextension import CudaBNBNativeLibrary, lib
+
+            bnb_cuda = isinstance(lib, CudaBNBNativeLibrary)
+            add(
+                "bitsandbytes_cuda",
+                "ok" if bnb_cuda or not require_gpu else "error",
+                "CUDA backend loaded" if bnb_cuda else "CUDA backend unavailable",
+                cuda_available=bnb_cuda,
+            )
+        except Exception as exc:  # pragma: no cover
+            add("bitsandbytes_cuda", "error" if require_gpu else "warning", str(exc))
 
     if require_models:
         add(

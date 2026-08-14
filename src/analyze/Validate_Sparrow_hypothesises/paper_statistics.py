@@ -120,7 +120,10 @@ def _metric_row(
 def _attention_summary_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         row for row in rows
-        if row.get("paper_figure") == "Figure 2" and row.get("modality") == "summary"
+        if row.get("paper_figure") == "Figure 2"
+        and row.get("modality") == "summary"
+        and row.get("attention_source", "msd_draft") == "msd_draft"
+        and row.get("attention_policy", "last_instruction") == "last_instruction"
     ]
 
 
@@ -143,16 +146,16 @@ def build_paper_statistics(
     f1a_groups: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
     for row in f1a:
         target = _group_value(row, "calibration_target_visual_tokens", "actual_visual_tokens")
-        f1a_groups[(target,)].append(row)
+        f1a_groups[(target, row.get("series_id") or "msd_keep_visual")].append(row)
     f1a_stats = [
         _metric_row(
-            (target,),
-            ["visual_tokens"],
+            (target, series),
+            ["visual_tokens", "series_id"],
             group,
             [
                 "accepted_prefix_tokens",
-                "prefill_seconds",
-                "decode_seconds",
+                "draft_tree_prefill_seconds",
+                "verification_seconds",
                 "end_to_end_seconds",
                 "end_to_end_speedup",
                 "lossless",
@@ -160,11 +163,11 @@ def build_paper_statistics(
             replicates=replicates,
             seed=seed,
         )
-        for (target,), group in sorted(f1a_groups.items(), key=lambda item: (float(item[0][0]) if item[0][0] is not None else float("inf"),))
+        for (target, series), group in sorted(f1a_groups.items(), key=lambda item: (float(item[0][0]) if item[0][0] is not None else float("inf"), str(item[0][1])))
     ]
     for row in f1a_stats:
         row["actual_visual_tokens"] = summarize(
-            [item.get("actual_visual_tokens") for item in f1a_groups[(row["visual_tokens"],)]],
+            [item.get("actual_visual_tokens") for item in f1a_groups[(row["visual_tokens"], row["series_id"])]],
             replicates=replicates,
             seed=seed + 100,
         )
@@ -198,7 +201,7 @@ def build_paper_statistics(
         )
     ]
     f3a_stats = [
-        _metric_row(key, ["layer_cut"], group, ["rouge_l", "prefix_agreement", "lossless"], replicates=replicates, seed=seed)
+        _metric_row(key, ["layer_cut"], group, ["prefix_agreement", "rouge_l", "lossless"], replicates=replicates, seed=seed)
         for key, group in sorted(_group_rows(f3a, ["layer_cut"]).items(), key=lambda item: float(item[0][0] or 0))
     ]
     f3b_stats = [

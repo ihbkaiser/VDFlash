@@ -92,7 +92,7 @@ def move_batch_to_device(batch: Any, device: torch.device | str) -> Any:
 
 
 def _apply_transformers_compat() -> None:
-    """Compatibility shims so the vendored EAGLE (transformers 4.48-era) code
+    """Compatibility shims so the vendored EAGLE (Transformers 4.49-era) code
     runs on the installed transformers version without modifying externals/.
 
     - transformers >= 5 removed ``SlidingWindowCache`` from ``cache_utils``;
@@ -498,16 +498,18 @@ def apply_msd_memory_patches() -> None:
         ends = cu_seqlens[1:].tolist()
         outputs = []
         for start, end in zip(starts, ends):
+            # SDPA expects [batch, heads, sequence, head_dim].  The vision
+            # projection is initially [sequence, heads, head_dim].
             frame = F.scaled_dot_product_attention(
-                q[start:end].unsqueeze(0),
-                k[start:end].unsqueeze(0),
-                v[start:end].unsqueeze(0),
+                q[start:end].transpose(0, 1).unsqueeze(0),
+                k[start:end].transpose(0, 1).unsqueeze(0),
+                v[start:end].transpose(0, 1).unsqueeze(0),
                 attn_mask=None,
                 dropout_p=0.0,
                 is_causal=False,
-            )
-            outputs.append(frame.squeeze(0))
-        attn_output = torch.cat(outputs, dim=1)  # [heads, S, head_dim]
+            ).squeeze(0).transpose(0, 1)
+            outputs.append(frame)
+        attn_output = torch.cat(outputs, dim=0)  # [S, heads, head_dim]
         attn_output = attn_output.reshape(seq_length, -1)
         return self.proj(attn_output)
 
@@ -515,6 +517,16 @@ def apply_msd_memory_patches() -> None:
 
     # 2. Language-model SDPA attention (modeling_qwen2vl_kv.Qwen2VLSdpaAttention).
     language_original = kv_mod.Qwen2VLSdpaAttention.forward
+
+    def _cache_empty(past_key_value: Any) -> bool:
+        if past_key_value is None:
+            return True
+        if hasattr(past_key_value, "get_seq_length"):
+            return past_key_value.get_seq_length() == 0
+        try:
+            return past_key_value[0][0].current_length.item() == 0
+        except (AttributeError, IndexError, TypeError):
+            return False
 
     def _language_sdpa_forward(
         self: Any,
@@ -533,6 +545,14 @@ def apply_msd_memory_patches() -> None:
                 past_key_value=past_key_value, output_attentions=True, use_cache=use_cache,
                 cache_position=cache_position, position_embeddings=position_embeddings,
             )
+        # During the initial full-context prefill the mask is a plain causal
+        # mask.  Passing that [1, 1, S, S] tensor to torch 2.1 SDPA can select
+        # the math backend and materialize a huge attention matrix.  Let SDPA
+        # use its causal memory-efficient kernel instead.  Non-causal MSD
+        # tree masks and non-empty KV-cache decoding retain their mask.
+        q_len = hidden_states.shape[1]
+        if q_len > 1 and _cache_empty(past_key_value):
+            attention_mask = None
         if attention_mask is not None and attention_mask.ndim == 4:
             attention_mask = _bool_attend(attention_mask)
         return language_original(
@@ -568,6 +588,7 @@ def apply_msd_memory_patches() -> None:
                 cache_position=cache_position, position_embeddings=position_embeddings,
             )
         bsz, q_len, _ = hidden_states.size()
+        cache_empty = _cache_empty(past_key_value)
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
@@ -588,8 +609,15 @@ def apply_msd_memory_patches() -> None:
         if mask is not None:
             mask = mask[:, :, :, : key_states.shape[-2]]
             mask = _bool_attend(mask)
+        if q_len > 1 and cache_empty:
+            mask = None
         attn_weights = F.scaled_dot_product_attention(
-            query_states, key_states, value_states, attn_mask=mask, dropout_p=0.0
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=mask,
+            dropout_p=0.0,
+            is_causal=mask is None and q_len > 1,
         )
         attn_output = attn_weights.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, -1)
@@ -599,7 +627,89 @@ def apply_msd_memory_patches() -> None:
     ea_mod.Qwen2VLAttention.forward = _draft_sdpa_forward
 
 
-def load_msd_qwen2vl(base_model_path: str, msd_model_path: str, device_map: str = "cuda") -> Any:
+def apply_chunked_video_vision(model: Any, chunk_frames: int = 8) -> None:
+    """Run Qwen2-VL vision frames in bounded chunks.
+
+    Vision attention is independent across video frames, but the stock
+    implementation receives all patch tokens in one call.  Chunking keeps
+    the temporary vision activations on the vision device bounded while the
+    decoder still receives the exact concatenated embedding sequence.
+    """
+
+    if chunk_frames <= 0 or not hasattr(model, "visual"):
+        return
+    visual = model.visual
+    if getattr(visual, "_msd_chunked_video", False):
+        return
+    original_forward = visual.forward
+
+    def _chunked_forward(hidden_states: torch.Tensor, grid_thw: torch.Tensor, *args: Any, **kwargs: Any):
+        if grid_thw is None or grid_thw.ndim != 2 or grid_thw.shape[0] != 1:
+            return original_forward(hidden_states, grid_thw=grid_thw, *args, **kwargs)
+        temporal, height, width = (int(value) for value in grid_thw[0].tolist())
+        if temporal <= chunk_frames:
+            return original_forward(hidden_states, grid_thw=grid_thw, *args, **kwargs)
+        patches_per_frame = height * width
+        outputs = []
+        for start_frame in range(0, temporal, chunk_frames):
+            frames = min(chunk_frames, temporal - start_frame)
+            start = start_frame * patches_per_frame
+            end = (start_frame + frames) * patches_per_frame
+            chunk_grid = grid_thw.new_tensor([[frames, height, width]])
+            outputs.append(
+                original_forward(hidden_states[start:end], grid_thw=chunk_grid, *args, **kwargs)
+            )
+        return torch.cat(outputs, dim=0)
+
+    visual.forward = _chunked_forward
+    visual._msd_chunked_video = True
+
+
+def _parse_max_memory(value: str | dict[int, str] | None) -> dict[int, str] | None:
+    if value is None or isinstance(value, dict):
+        return value
+    result: dict[int, str] = {}
+    for item in value.split(","):
+        index, budget = item.split(":", 1)
+        result[int(index)] = budget
+    return result
+
+
+def _model_parallel_device_map(base_model_path: str) -> dict[str, int]:
+    """Place Qwen2-VL's vision/final path and EAGLE draft on GPU 0."""
+
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(base_model_path, trust_remote_code=True)
+    layer_count = int(config.num_hidden_layers)
+    prefix = min(
+        int(os.environ.get("MSD_MODEL_PARALLEL_PREFIX_LAYERS", "3")),
+        max(1, layer_count - 1),
+    )
+    suffix = min(
+        int(os.environ.get("MSD_MODEL_PARALLEL_SUFFIX_LAYERS", "2")),
+        max(1, layer_count - prefix),
+    )
+    mapping: dict[str, int] = {
+        "visual": 0,
+        "model.embed_tokens": 0,
+        "model.norm": 0,
+        "model.rotary_emb": 0,
+        "lm_head": 0,
+    }
+    for index in range(layer_count):
+        mapping[f"model.layers.{index}"] = (
+            0 if index < prefix or index >= layer_count - suffix else 1
+        )
+    return mapping
+
+
+def load_msd_qwen2vl(
+    base_model_path: str,
+    msd_model_path: str,
+    device_map: str = "cuda",
+    max_memory: str | dict[int, str] | None = None,
+) -> Any:
     """Load the official MSD wrapper after an explicit CUDA check."""
 
     require_cuda()
@@ -617,16 +727,23 @@ def load_msd_qwen2vl(base_model_path: str, msd_model_path: str, device_map: str 
         bnb_4bit_compute_dtype=torch.float16,
         bnb_4bit_use_double_quant=True,
     )
-    result = EaModel.from_pretrained(
-        base_model_path=base_model_path,
-        ea_model_path=msd_model_path,
-        total_token=30,
-        depth=4,
-        top_k=8,
-        torch_dtype=torch.float16,
-        device_map=device_map,
-        quantization_config=quantization_config,
-    )
+    resolved_device_map: str | dict[str, int] = device_map
+    if device_map == "model_parallel":
+        resolved_device_map = _model_parallel_device_map(base_model_path)
+    model_kwargs: dict[str, Any] = {
+        "base_model_path": base_model_path,
+        "ea_model_path": msd_model_path,
+        "total_token": 30,
+        "depth": 4,
+        "top_k": 8,
+        "torch_dtype": torch.float16,
+        "device_map": resolved_device_map,
+        "quantization_config": quantization_config,
+    }
+    parsed_max_memory = _parse_max_memory(max_memory)
+    if parsed_max_memory is not None:
+        model_kwargs["max_memory"] = parsed_max_memory
+    result = EaModel.from_pretrained(**model_kwargs)
     # EAGLE's EaModel.from_pretrained returns (model, None) for the Qwen2-VL
     # path; unwrap it so the caller receives the EaModel itself.
     if isinstance(result, tuple):
@@ -637,6 +754,8 @@ def load_msd_qwen2vl(base_model_path: str, msd_model_path: str, device_map: str 
     # returns a single-element tuple. eval() disables that branch.
     result.eval()
     apply_msd_memory_patches()
+    vision_chunk_frames = int(os.environ.get("MSD_VISION_CHUNK_FRAMES", "8"))
+    apply_chunked_video_vision(result.base_model, vision_chunk_frames)
     return result
 
 
@@ -736,7 +855,20 @@ def patched_msd_video_path(model: Any, prepared: PreparedPrefill):
     old_tree = ea_module.tree_decoding
     old_evaluate = ea_module.evaluate_posterior
     old_forward = model.forward
-    capture: dict[str, Any] = {"trace": [], "prefill_seconds": None}
+    old_lm_head = model.base_model.lm_head.forward
+
+    def _last_position_lm_head(hidden_states: torch.Tensor) -> torch.Tensor:
+        if hidden_states.ndim == 3 and hidden_states.shape[1] > 4096:
+            return old_lm_head(hidden_states[:, -1:])
+        return old_lm_head(hidden_states)
+
+    model.base_model.lm_head.forward = _last_position_lm_head
+    capture: dict[str, Any] = {
+        "trace": [],
+        "prefill_seconds": None,
+        "verification_start": None,
+        "verification_end": None,
+    }
 
     def evaluate_with_trace(*args, **kwargs):
         result = old_evaluate(*args, **kwargs)
@@ -756,13 +888,26 @@ def patched_msd_video_path(model: Any, prepared: PreparedPrefill):
     model._video_prefill_position_ids = prepared.position_ids
     model._video_rope_delta = prepared.rope_deltas
     model.forward = types.MethodType(_video_forward, model)
+
+    def tree_decoding_with_timing(*args: Any, **kwargs: Any):
+        if capture["verification_start"] is None:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            capture["verification_start"] = time.perf_counter()
+        result = _video_tree_decoding(*args, **kwargs)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        capture["verification_end"] = time.perf_counter()
+        return result
+
     ea_module.initialize_tree = initialize_with_timing
-    ea_module.tree_decoding = _video_tree_decoding
+    ea_module.tree_decoding = tree_decoding_with_timing
     ea_module.evaluate_posterior = evaluate_with_trace
     try:
         yield capture
     finally:
         model.forward = old_forward
+        model.base_model.lm_head.forward = old_lm_head
         model._video_prefill_position_ids = None
         model._video_rope_delta = None
         ea_module.initialize_tree = old_initialize
@@ -816,10 +961,15 @@ def generate_msd_full_video(
     prefill_seconds = capture["prefill_seconds"]
     decode_seconds = elapsed - prefill_seconds if prefill_seconds is not None else elapsed
     decode_seconds = max(0.0, decode_seconds)
+    verification_seconds = None
+    if capture.get("verification_start") is not None and capture.get("verification_end") is not None:
+        verification_seconds = max(0.0, capture["verification_end"] - capture["verification_start"])
     acceptance_trace = capture["trace"]
     return output, {
         "prefill_seconds": prefill_seconds,
+        "draft_tree_prefill_seconds": prefill_seconds,
         "decode_seconds": decode_seconds,
+        "verification_seconds": verification_seconds if verification_seconds is not None else decode_seconds,
         "speculative_seconds": elapsed,
         "end_to_end_seconds": elapsed,
         "acceptance_trace": acceptance_trace,
@@ -863,7 +1013,8 @@ def generate_msd_retention_video(
     with patched_msd_video_path(model, prepared_full) as capture:
         model.ea_layer.reset_kv()
         past_key_values, past_key_values_data, current_length_data = ea_module.initialize_past_key_values(
-            model.base_model
+            model.base_model,
+            max_position_embeddings=prepared_full.input_ids.shape[1] + max_new_tokens + 64,
         )
         ea_module.reset_tree_mode(model)
         input_ids = prepared_full.input_ids.clone()
@@ -986,10 +1137,15 @@ def generate_msd_retention_video(
     prefill_seconds = capture["prefill_seconds"]
     decode_seconds = elapsed - prefill_seconds if prefill_seconds is not None else elapsed
     decode_seconds = max(0.0, decode_seconds)
+    verification_seconds = None
+    if capture.get("verification_start") is not None and capture.get("verification_end") is not None:
+        verification_seconds = max(0.0, capture["verification_end"] - capture["verification_start"])
     acceptance_trace = capture["trace"]
     return input_ids, {
         "prefill_seconds": prefill_seconds,
+        "draft_tree_prefill_seconds": prefill_seconds,
         "decode_seconds": decode_seconds,
+        "verification_seconds": verification_seconds if verification_seconds is not None else decode_seconds,
         "speculative_seconds": elapsed,
         "end_to_end_seconds": elapsed,
         "acceptance_trace": acceptance_trace,

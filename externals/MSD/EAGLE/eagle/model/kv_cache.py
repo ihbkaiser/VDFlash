@@ -66,7 +66,7 @@ class KVCache:
         return torch.narrow(self.data, 2, 0, self.current_length)
 
 
-def initialize_past_key_values(model):
+def initialize_past_key_values(model, max_position_embeddings=None):
     """
     Initialize past key and value states for a given transformer model.
 
@@ -104,34 +104,35 @@ def initialize_past_key_values(model):
         elif hasattr(model, "h"):
             device = model.h[-1].attn.c_attn.weight.device
         devices.append(device)
-    past_key_values_data_list=[]
-    startnum=0
-    startdevice=devices[0]
-    for id,i in enumerate(devices):
-        if startdevice!=i:
-            past_key_values_data = torch.zeros(
-                startnum * 2,
-                batch_size,
-                config.num_key_value_heads,
-                config.max_position_embeddings,
-                config.hidden_size // config.num_attention_heads,
-                device=startdevice,
-                dtype=model.dtype,
-            )
-            past_key_values_data_list.append(past_key_values_data)
-            startdevice = i
-            startnum=0
-        startnum += 1
-    past_key_values_data = torch.zeros(
-        startnum * 2,
-        batch_size,
-        config.num_key_value_heads,
-        config.max_position_embeddings,
-        config.hidden_size // config.num_attention_heads,
-        device=startdevice,
-        dtype=model.dtype,
-    )
-    past_key_values_data_list.append(past_key_values_data)
+    cache_length = int(max_position_embeddings or config.max_position_embeddings)
+    # A model-parallel map may put the first and last layers on GPU 0 with
+    # middle layers on GPU 1. Aggregate cache slots by device instead of by
+    # contiguous runs, and keep an explicit layer -> (device, offset) map.
+    device_groups = {}
+    for device in devices:
+        key = str(device)
+        if key not in device_groups:
+            device_groups[key] = {"device": device, "count": 0}
+        device_groups[key]["count"] += 1
+    group_order = list(device_groups.values())
+    group_index = {str(group["device"]): index for index, group in enumerate(group_order)}
+    layer_offsets = {}
+    offsets = {str(group["device"]): 0 for group in group_order}
+    for layer_index, device in enumerate(devices):
+        key = str(device)
+        layer_offsets[layer_index] = (group_index[key], offsets[key])
+        offsets[key] += 1
+    past_key_values_data_list = []
+    for group in group_order:
+        past_key_values_data_list.append(torch.zeros(
+            group["count"] * 2,
+            batch_size,
+            config.num_key_value_heads,
+            cache_length,
+            config.hidden_size // config.num_attention_heads,
+            device=group["device"],
+            dtype=model.dtype,
+        ))
     # Initialize tensor to store the current length of the cached data for all layers.
     # [IMPORTANT] It needs to be kept on CPU for quick access and updates.
     current_length_data = torch.zeros(
@@ -140,27 +141,10 @@ def initialize_past_key_values(model):
     # Creating a KVCache for each pair of key and value in all layers
     past_key_values = [] * config.num_hidden_layers
 
-    bias=0
-    start_data_m=devices[0].index
-    for i in range(config.num_hidden_layers):
-        data_m=devices[i].index
-        if data_m!=start_data_m:
-            bias=0
-            start_data_m=data_m
-        try:
-            past_key_values.append(
-                [
-                    KVCache(past_key_values_data_list[data_m-devices[0].index][2*bias + j], current_length_data[i * 2 + j])
-                    for j in range(2)
-                ]
-            )
-        except:
-            past_key_values.append(
-                [
-                    KVCache(past_key_values_data_list[0][2 * bias + j],
-                            current_length_data[i * 2 + j])
-                    for j in range(2)
-                ]
-            )
-        bias+=1
+    for layer_index in range(config.num_hidden_layers):
+        group, offset = layer_offsets[layer_index]
+        past_key_values.append([
+            KVCache(past_key_values_data_list[group][2 * offset + j], current_length_data[layer_index * 2 + j])
+            for j in range(2)
+        ])
     return past_key_values, past_key_values_data_list, current_length_data

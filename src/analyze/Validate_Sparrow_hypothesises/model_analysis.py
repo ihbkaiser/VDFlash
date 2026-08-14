@@ -419,7 +419,9 @@ def layerwise_input_cosine(
     text = torch.as_tensor(sorted(int(value) for value in text_positions), device=input_embeds.device)
     if visual.numel() == 0 or text.numel() == 0:
         raise ValueError("visual and text positions must both be non-empty")
-    result: list[dict[str, float | int]] = [{"layer": 0, "visual_cosine": 1.0, "text_cosine": 1.0}]
+    # Report actual transformer blocks only.  A synthetic layer-0 identity
+    # point would make the plotted curve look better covered than measured.
+    result: list[dict[str, float | int]] = []
     originals: list[tuple[Any, Any]] = []
     layers = _layers(model)
     for layer_index, layer in enumerate(layers, start=1):

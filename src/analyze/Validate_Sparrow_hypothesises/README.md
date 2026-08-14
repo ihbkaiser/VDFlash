@@ -8,6 +8,13 @@ The harness uses the local duration-representative 50-sample
 The official MSD/Qwen2-VL and Qwen2.5-VL checkpoints are selected in the
 contract; actual inference requires a Python 3.10 CUDA environment.
 
+The default `local_insight_vdc50` profile is deliberately strict: only rows
+whose calibration status is `ok` are evidence, every required milestone and
+selector curve must be present, and at least 10 samples must be shared by all
+figures. A smoke run therefore produces a diagnostic report, never a falsely
+complete paper figure. Use `--contract .../paper_contract.yaml` only when you
+explicitly want the legacy non-enforcing schema audit.
+
 ## First checks
 
 From the repository root:
@@ -55,8 +62,10 @@ python -m src.analyze.Validate_Sparrow_hypothesises report \
   --output-dir results/sparrow_validation/report
 ```
 
-`REPORT.md` separates paper-conformance from numerical reproduction. It must
-not be interpreted as evidence when the validity gate is `FALSE`.
+`REPORT.md` separates row conformance, coverage, and losslessness. Paper-
+shaped figures are written as PNG/PDF/SVG only when the strict coverage gate
+passes; otherwise they are placed under `report/diagnostic/` with an
+`INCOMPLETE DIAGNOSTIC` watermark.
 
 ## Paper-conformance scenarios
 
@@ -77,6 +86,75 @@ also executed as GPU smoke gates by `run_msd.py` before a result row is
 written.
 
 ## Figure 1: MSD visual-length and retention runs
+
+### Two-GPU data-parallel runner
+
+`run_msd_2gpu.sh` runs two independent batch-size-one MSD workers concurrently,
+splitting the manifest between the selected GPUs. This is the recommended way
+to use heterogeneous GPUs such as an RTX 3090 and an RTX A4000; `torchrun` is
+not used because the MSD runner has no DDP synchronization.
+
+```bash
+src/analyze/Validate_Sparrow_hypothesises/run_msd_2gpu.sh \
+  --gpus 0,1 \
+  --limit 2 \
+  --visual-targets 400,3000 \
+  --condition full \
+  --output-dir results/sparrow_validation_2gpu
+```
+
+Use `--limit 2` for a smoke test so each GPU receives one video. The launcher
+calibrates once, starts both workers, merges `msd_gpu*.jsonl`, and writes the
+combined audit and report. Use `--dry-run` to inspect the generated commands.
+
+### Memory-aware runner for 3090 + A4000
+
+The simple launcher above splits samples round-robin. For the heterogeneous
+3090 (24 GB) and A4000 (16 GB) pair, use the memory-aware launcher so splitting
+happens per `(video, visual-token milestone)` job. It measures the actual token
+count from calibration, routes jobs above the A4000 budget to the 3090, and
+keeps one model process per GPU:
+
+```bash
+src/analyze/Validate_Sparrow_hypothesises/run_msd_memory_aware_2gpu.sh \
+  --gpus 0,1 \
+  --a4000-max-visual-tokens 5500 \
+  --strong-max-visual-tokens 11000 \
+  --visual-targets 400,3000,13000,25000 \
+  --condition both \
+  --output-dir results/sparrow_validation_memory_aware_2gpu
+```
+
+`5500` is a conservative cap: the A4000 probe reached 5,760 tokens with
+`max_new_tokens=512` but OOMed at the next tested level. The 3090 probe reached
+11,520 tokens and OOMed near 23K, so the launcher uses an 11,000-token strong
+GPU cap by default. Jobs above that cap are written to `unsupported_jobs.jsonl`
+instead of being launched and crashing the run. The first GPU is assumed to
+be the 3090; change `--gpus` if the device order differs. Reaching 25K would
+require model sharding/tensor parallelism or a substantially different memory
+configuration; it is not safe with the current single-GPU MSD runtime.
+
+### 25K model-parallel runner
+
+For the 13K/25K milestones, use the single-process model-parallel launcher,
+not the two-worker data-parallel launchers:
+
+```bash
+src/analyze/Validate_Sparrow_hypothesises/run_msd_model_parallel_2gpu.sh \
+  --gpus 0,1 \
+  --visual-targets 13000,25000 \
+  --condition both \
+  --max-new-tokens 512 \
+  --output results/sparrow_validation_model_parallel_2gpu/msd.jsonl
+```
+
+This path uses explicit layer placement, chunks video vision frames, avoids
+full-sequence vocabulary logits, and allocates MSD KV cache to the actual
+context length. It was validated on `v_SEVVSei-r6w` at 25,168 visual tokens:
+`lossless=true`, prefix `512/512`, MSD decode `51.91s`, peak 3090 allocation
+`15.70 GiB`. The calibration grid includes 176/192-frame candidates so the
+25K target can be represented without using an unnecessarily large per-frame
+resolution.
 
 After the T4 environment and checkpoints are available, first run one sample:
 
@@ -107,15 +185,15 @@ acceptance traces, output token IDs and the native-prefill parity gate.
 
 The report renderer produces paper-shaped outputs from measured rows:
 
-- `figure1_insight_summary.png`: two-panel Figure 1 analogue with accepted-length/error bars plus latency bars, and retention curves for `Last Instr.`, `All Text`, or the configured selector.
-- `figure2_insight_attention.png`: short/long visual-context panels with Instruction/Visual/Text regions and attention curves.
-- `figure3_insight_layer_analysis.png`: layer-cut output agreement beside the head-by-layer visual-attention heatmap.
-- `figure6_insight_retention.png`: visual/text hidden-state retention curves with the middle-layer marker.
+- `figure1_insight_summary.{png,pdf,svg}`: two-panel local Figure 1 analogue with MSD keep/remove-all length series and attention-guided retention curves.
+- `figure2_insight_attention.{png,pdf,svg}`: exactly the short/long MSD-draft panels with disjoint Instruction/Visual/Text regions.
+- `figure3_insight_layer_analysis.{png,pdf,svg}`: local prefix-agreement proxy beside an aggregated, head-sorted layer heatmap.
+- `figure6_insight_retention.{png,pdf,svg}`: visual/text hidden-state retention curves with the middle-layer marker.
 - `paper_statistics.json` and `figure*_statistics.csv`: per-condition N, mean, spread, and deterministic bootstrap 95% intervals.
 
 These figures mirror the paper's visual grammar and grouping, but all plotted
 values come from completed local runs. Missing experiments are not filled with
-paper numbers; the corresponding panel/file appears only when its rows exist.
+paper numbers; incomplete runs are diagnostic-only and watermarked.
 
 ## Runtime invariant
 
@@ -152,10 +230,9 @@ python -m src.analyze.Validate_Sparrow_hypothesises draft_attention \
 ```
 
 Rows share the Figure 2 schema and are distinguished by `attention_source`
-(`target` vs `msd_draft`); the audit accepts both, and the report renders them
-as separate figures (`figure2_insight_attention.png` vs
-`figure2_insight_attention_draft.png`). `--selection top_attention` in the MSD
-runner consumes either file's last-instruction scores.
+(`target` vs `msd_draft`). The strict paper-shaped plot uses the MSD-draft
+`last_instruction` trace; target rows remain a diagnostic proxy. Compact
+summary rows provide selector scores without requiring an O(L²) artifact.
 
 ## Figure 3 and Figure 6: layer analyses
 
@@ -179,8 +256,9 @@ layer without retaining all hidden-state tensors in memory.
 
 ## Complete orchestration
 
-The process-isolated orchestrator runs calibration, all selected GPU stages,
-merges their JSONL rows, audits them and writes the report:
+The process-isolated orchestrator runs calibration, attention first, then MSD
+length/retention series, layer probes, merges their JSONL rows, audits them and
+writes the report:
 
 ```bash
 python -m src.analyze.Validate_Sparrow_hypothesises all \
@@ -189,9 +267,9 @@ python -m src.analyze.Validate_Sparrow_hypothesises all \
 ```
 
 A single-script wrapper for a GPU host (T4-class) is also provided; it runs
-calibration when missing, then `all` with `--quantized` and
-`--allow-out-of-tolerance` (several short VDC videos cannot reach the 25k
-milestone, so the closest measured point is used and recorded):
+calibration when missing, then `all` with `--quantized`. It excludes
+out-of-tolerance points by default. Set `ALLOW_OUT_OF_TOLERANCE=1` only for a
+separately-labelled diagnostic run:
 
 ```bash
 src/analyze/Validate_Sparrow_hypothesises/run_sparrow_validation_gpu.sh
@@ -201,8 +279,8 @@ See `RUN_ON_GPU.md` for the full environment setup and per-insight
 verification criteria.
 
 Use `--limit 1` for a smoke run, or `--skip-msd`, `--skip-attention` and
-`--skip-layers` when validating one stage. The final evidence file is
+`--skip-layers` when validating one stage. The final merged file is
 `results/sparrow_validation/results.jsonl`; the report is valid only when the
-audit exit code is zero. Composite figures and statistics are written under
+row, losslessness, and coverage gates all pass. Composite figures and statistics are written under
 `results/sparrow_validation/report/` (or the directory passed to
 `report --output-dir`).

@@ -26,7 +26,7 @@ import torch
 from .dataset import load_vdc_manifest, write_jsonl
 from .metrics import normalized_entropy
 from .model_analysis import find_instruction_masks
-from .paper_contract import DEFAULT_CONTRACT
+from .paper_contract import load_contract
 from .runtime import (
     RuntimeUnavailableError,
     build_qwen2vl_video_processor,
@@ -213,6 +213,11 @@ def _rows_for_policy(
         "token_position": int(masks["query_index"]),
         "attention_weight": None,
         "per_head_visual_mass": per_head_visual_mass,
+        "record_type": "attention_trace",
+        "attention_weights": [float(value) for value in attention.tolist()],
+        "visual_attention_weights": [float(value) for value in attention[visual].tolist()],
+        "instruction_attention_weights": [float(value) for value in attention[instruction].tolist()],
+        "text_attention_weights": [float(value) for value in attention[text].tolist()],
     })
     rows.append(summary_row)
     return rows
@@ -223,12 +228,13 @@ def run(args: argparse.Namespace) -> int:
         require_cuda()
     except RuntimeUnavailableError as exc:
         raise SystemExit(str(exc)) from exc
+    contract = load_contract(args.contract)
     samples = load_vdc_manifest(args.manifest, args.dataset_root)
     if args.limit is not None:
         samples = samples[: args.limit]
     targets = list(args.visual_targets or (
-        DEFAULT_CONTRACT.attention_short_tokens,
-        DEFAULT_CONTRACT.attention_long_tokens,
+        contract.attention_short_tokens,
+        contract.attention_long_tokens,
     ))
     jobs = _calibration_jobs(samples, args.calibration, targets, args.allow_out_of_tolerance)
     processor = build_qwen2vl_video_processor(args.base_model, args.min_pixels, args.max_pixels)
@@ -304,6 +310,10 @@ def run(args: argparse.Namespace) -> int:
     return 0
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--contract",
+        default="src/analyze/Validate_Sparrow_hypothesises/configs/local_insight_vdc50.yaml",
+    )
     parser.add_argument("--manifest", default="dataset/VideoDetailCaption/subset_manifest.jsonl")
     parser.add_argument("--dataset-root", default="dataset/VideoDetailCaption")
     parser.add_argument("--base-model", default="Qwen/Qwen2-VL-7B-Instruct")

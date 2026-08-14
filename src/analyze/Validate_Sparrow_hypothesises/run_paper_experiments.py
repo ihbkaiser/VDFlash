@@ -14,16 +14,18 @@ import sys
 from pathlib import Path
 
 from .dataset import write_jsonl
+from .paper_contract import load_contract
 
 
 PACKAGE = "src.analyze.Validate_Sparrow_hypothesises"
 
 
-def _run(command: list[str], cwd: Path) -> None:
+def _run(command: list[str], cwd: Path, *, allow_failure: bool = False) -> int:
     print("$", " ".join(command), flush=True)
     result = subprocess.run(command, cwd=str(cwd), check=False)
-    if result.returncode:
+    if result.returncode and not allow_failure:
         raise SystemExit(result.returncode)
+    return result.returncode
 
 
 def _merge(paths: list[Path], output: Path) -> None:
@@ -48,9 +50,14 @@ def run(args: argparse.Namespace) -> int:
     output_dir = root / args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     python = sys.executable
+    contract_path = root / args.contract
+    contract = load_contract(contract_path)
     preflight = output_dir / "preflight.json"
     calibration = output_dir / "calibration.jsonl"
-    msd = output_dir / "msd.jsonl"
+    msd_full = output_dir / "msd_full.jsonl"
+    msd_remove_all = output_dir / "msd_remove_all.jsonl"
+    msd_retention_last = output_dir / "msd_retention_last_instruction.jsonl"
+    msd_retention_all = output_dir / "msd_retention_all_text.jsonl"
     attention = output_dir / "figure2_attention.jsonl"
     draft_attention = output_dir / "figure2_draft_attention.jsonl"
     layers = output_dir / "layer_analysis.jsonl"
@@ -59,10 +66,11 @@ def run(args: argparse.Namespace) -> int:
     report = output_dir / "report"
 
     base = [python, "-m", PACKAGE]
+    global_flags = ["--contract", str(contract_path)]
     if not args.skip_preflight:
-        _run(base + ["preflight", "--require-gpu", "--require-models", "--output", str(preflight)], root)
+        _run(base + global_flags + ["preflight", "--require-gpu", "--require-models", "--output", str(preflight)], root)
     if not args.skip_calibration:
-        _run(base + [
+        _run(base + global_flags + [
             "calibrate",
             "--output", str(calibration),
             "--model", args.calibration_model,
@@ -76,36 +84,57 @@ def run(args: argparse.Namespace) -> int:
     if args.quantized:
         model_flags.append("--quantized")
     produced: list[Path] = []
-    if not args.skip_msd:
-        _run(base + [
-            "msd",
-            "--condition", args.msd_condition,
-            "--output", str(msd),
-            *calibration_arg,
-            *common,
-        ], root)
-        produced.append(msd)
     if not args.skip_attention:
-        _run(base + [
+        _run(base + global_flags + [
             "attention",
             "--output", str(attention),
             *calibration_arg,
-            "--visual-targets", "400", "3000",
+            "--visual-targets", str(contract.attention_short_tokens), str(contract.attention_long_tokens),
             *model_flags,
             *common,
         ], root)
         produced.append(attention)
     if not args.skip_draft_attention:
-        _run(base + [
+        _run(base + global_flags + [
             "draft_attention",
             "--output", str(draft_attention),
             *calibration_arg,
-            "--visual-targets", "400", "3000",
+            "--visual-targets", str(contract.attention_short_tokens), str(contract.attention_long_tokens),
             *common,
         ], root)
         produced.append(draft_attention)
+    if not args.skip_msd:
+        # Run attention first: the retention selectors consume the draft
+        # attention trace.  Keep the full length sweep and remove-all series
+        # separate so Figure 1(a) cannot accidentally mix with Figure 1(b).
+        _run(base + global_flags + [
+            "msd", "--condition", "full", "--output", str(msd_full),
+            "--visual-targets", *[str(value) for value in contract.visual_token_milestones],
+            *calibration_arg, *common,
+        ], root)
+        produced.append(msd_full)
+        _run(base + global_flags + [
+            "msd", "--condition", "retention", "--length-series", "remove_all",
+            "--selection", "uniform", "--retention-percentages", "0",
+            "--output", str(msd_remove_all), "--visual-targets",
+            *[str(value) for value in contract.visual_token_milestones],
+            *calibration_arg, *common,
+        ], root)
+        produced.append(msd_remove_all)
+        if args.skip_draft_attention:
+            print("WARNING: draft attention was skipped; selector retention is omitted and coverage will remain incomplete.", flush=True)
+        else:
+            for selection, destination in (("last_instruction", msd_retention_last), ("all_text", msd_retention_all)):
+                _run(base + global_flags + [
+                    "msd", "--condition", "retention", "--selection", selection,
+                    "--selection-scores", str(draft_attention),
+                    "--retention-percentages", *[str(value) for value in contract.retention_percentages],
+                    "--visual-targets", str(contract.retention_anchor_visual_tokens),
+                    "--output", str(destination), *calibration_arg, *common,
+                ], root)
+                produced.append(destination)
     if not args.skip_layers:
-        _run(base + [
+        _run(base + global_flags + [
             "layers",
             "--output", str(layers),
             "--experiments", args.layer_experiments,
@@ -116,19 +145,20 @@ def run(args: argparse.Namespace) -> int:
         ], root)
         produced.append(layers)
     _merge(produced, combined)
-    _run(base + ["audit", "--input", str(combined), "--output", str(audit)], root)
-    _run(base + ["report", "--input", str(combined), "--output-dir", str(report)], root)
+    audit_rc = _run(base + global_flags + ["audit", "--input", str(combined), "--output", str(audit)], root, allow_failure=True)
+    report_rc = _run(base + global_flags + ["report", "--input", str(combined), "--output-dir", str(report)], root, allow_failure=True)
     print(f"Complete report: {report / 'REPORT.md'}")
-    return 0
+    return report_rc or audit_rc
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--contract", default="src/analyze/Validate_Sparrow_hypothesises/configs/local_insight_vdc50.yaml")
     parser.add_argument("--repo-root", default=".")
     parser.add_argument("--output-dir", default="results/sparrow_validation")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--calibration-model", default="Qwen/Qwen2-VL-7B-Instruct")
-    parser.add_argument("--msd-condition", choices=("full", "retention", "both"), default="both")
+    parser.add_argument("--msd-condition", choices=("full", "retention", "both"), default="both", help="Legacy compatibility; the local profile runs the required series explicitly.")
     parser.add_argument("--layer-experiments", choices=("figure3", "figure6", "both"), default="both")
     parser.add_argument("--layer-visual-targets", type=int, nargs="+", default=[3000])
     parser.add_argument("--device-map", default="auto")
@@ -151,4 +181,3 @@ def build_parser() -> argparse.ArgumentParser:
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(run(build_parser().parse_args()))
-

@@ -25,7 +25,7 @@ class VideoCandidate:
         return f"frames={self.frames}:max_pixels={self.max_pixels}"
 
 
-DEFAULT_FRAME_COUNTS = (4, 8, 16, 32, 64, 96, 128, 160)
+DEFAULT_FRAME_COUNTS = (4, 8, 16, 32, 64, 96, 128, 160, 176, 192)
 DEFAULT_MAX_PIXELS = tuple(int(value * 28 * 28) for value in (256, 384, 512, 768, 1024))
 
 

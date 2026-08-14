@@ -247,7 +247,10 @@ class EaModel(nn.Module):
                 past_key_values,
                 past_key_values_data,
                 current_length_data,
-            ) = initialize_past_key_values(self.base_model)
+            ) = initialize_past_key_values(
+                self.base_model,
+                max_position_embeddings=input_ids.shape[1] + max_new_tokens + 64,
+            )
             self.past_key_values = past_key_values
             self.past_key_values_data = past_key_values_data
             self.current_length_data = current_length_data
@@ -350,7 +353,10 @@ class EaModel(nn.Module):
                 past_key_values,
                 past_key_values_data,
                 current_length_data,
-            ) = initialize_past_key_values(self.base_model)
+            ) = initialize_past_key_values(
+                self.base_model,
+                max_position_embeddings=input_ids.shape[1] + max_new_tokens + 64,
+            )
             self.past_key_values = past_key_values
             self.past_key_values_data = past_key_values_data
             self.current_length_data = current_length_data
@@ -392,4 +398,3 @@ class EaModel(nn.Module):
             return input_ids
         else:
             return input_ids, new_token, idx
-

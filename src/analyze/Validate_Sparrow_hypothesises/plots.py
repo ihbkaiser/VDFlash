@@ -59,10 +59,29 @@ def _empty_panel(axis: Any, message: str) -> None:
     axis.set_axis_off()
 
 
-def _write_paper_figure1(rows: list[dict[str, Any]], output: Path, plt: Any) -> list[str]:
+def _save_paper(fig: Any, output: Path, stem: str, plt: Any, formats: tuple[str, ...], watermark: str | None = None) -> list[str]:
+    """Save a paper-shaped figure in every requested vector/raster format."""
+    if watermark:
+        fig.text(0.5, 0.01, watermark, ha="center", va="bottom", color="#b2182b", fontsize=8)
+    fig.tight_layout(rect=(0, 0.03 if watermark else 0, 1, 1))
+    names: list[str] = []
+    for fmt in formats:
+        path = output / f"{stem}.{fmt}"
+        fig.savefig(path, dpi=600, bbox_inches="tight")
+        names.append(path.name)
+    plt.close(fig)
+    return names
+
+
+def _write_paper_figure1(rows: list[dict[str, Any]], output: Path, plt: Any, formats: tuple[str, ...], watermark: str | None) -> list[str]:
     length_rows = [row for row in rows if row.get("paper_figure") == "Figure 1(a)"]
     retention_rows = [row for row in rows if row.get("paper_figure") == "Figure 1(b)"]
     length_groups = _group_by_value(length_rows, _paper_group)
+    series_groups: dict[str, dict[float, list[dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
+    for row in length_rows:
+        value = _paper_group(row)
+        if value is not None:
+            series_groups[str(row.get("series_id") or "msd_keep_visual")][value].append(row)
     retention_groups = _group_by_value(retention_rows, lambda row: row.get("retention_percentage"))
     if not length_groups and not retention_groups:
         return []
@@ -71,32 +90,38 @@ def _write_paper_figure1(rows: list[dict[str, Any]], output: Path, plt: Any) -> 
     files: list[str] = []
     if length_groups:
         x = list(sorted(length_groups))
-        accepted = [summarize([row.get("accepted_prefix_tokens") for row in length_groups[value]]) for value in x]
+        keep_groups = series_groups.get("msd_keep_visual", {})
+        accepted = [summarize([row.get("accepted_prefix_tokens") for row in keep_groups.get(value, [])]) for value in x]
         latency = [summarize([
-            row.get("decode_seconds") if row.get("decode_seconds") is not None else row.get("end_to_end_seconds")
-            for row in length_groups[value]
+            row.get("draft_tree_prefill_seconds") if row.get("draft_tree_prefill_seconds") is not None else row.get("prefill_seconds")
+            for row in keep_groups.get(value, [])
         ]) for value in x]
         axis = axes[0]
         twin = axis.twinx()
         positions = list(range(len(x)))
         bars = twin.bar(positions, [float(stat["mean"] or 0.0) * 1000 for stat in latency], width=0.58, color="#f4a582", alpha=0.75, label="MSD draft/decode time")
-        line = axis.errorbar(
+        line = axis.plot(
             positions,
-            [float(stat["mean"] or 0.0) for stat in accepted],
-            yerr=[_errorbar(stat) for stat in accepted],
+            [float(stat["mean"]) if stat["mean"] is not None else float("nan") for stat in accepted],
             marker="o",
             linewidth=1.7,
             color="#2166ac",
-            capsize=3,
             label="MSD average accepted length",
+        )
+        remove_groups = series_groups.get("msd_remove_all", {})
+        remove_stats = [summarize([row.get("accepted_prefix_tokens") for row in remove_groups.get(value, [])]) for value in x]
+        remove_line = axis.plot(
+            positions,
+            [float(stat["mean"]) if stat["mean"] is not None else float("nan") for stat in remove_stats],
+            marker="s", linewidth=1.5, color="#b2182b", linestyle="--", label="MSD remove all visual",
         )
         axis.set_xticks(positions, [_token_axis_label(value) for value in x])
         axis.set_xlabel("Visual token length")
         axis.set_ylabel("Average accepted length")
-        twin.set_ylabel("Draft/decode time (ms)", color="#b2182b")
-        axis.set_title("(a) Visual length")
+        twin.set_ylabel("Draft tree prefill (ms)", color="#b2182b")
+        axis.set_title("(a) MSD visual-length sweep (VDC-50 local)")
         axis.grid(axis="y", alpha=0.22)
-        axis.legend([line, bars], ["MSD average accepted length", "MSD draft/decode time"], loc="best", fontsize=8)
+        axis.legend([line[0], remove_line[0], bars], ["MSD keep visual", "MSD remove all visual", "Draft tree prefill"], loc="best", fontsize=8)
     else:
         _empty_panel(axes[0], "No measured Figure 1(a) rows")
     if retention_groups:
@@ -118,32 +143,26 @@ def _write_paper_figure1(rows: list[dict[str, Any]], output: Path, plt: Any) -> 
                 "all_text": "All Text",
                 "uniform": "Uniform",
             }.get(policy, policy)
-            axis.errorbar(
-                positions, means, yerr=errors, marker="o", linewidth=1.7, capsize=3,
+            axis.plot(
+                positions, means, marker="o", linewidth=1.7,
                 color=colors.get(policy, None), label=label,
             )
         axis.set_xlabel("Retained visual input (%)")
         axis.set_ylabel("Average accepted length")
-        axis.set_title("(b) Visual retention")
+        axis.set_title("(b) Draft visual retention (VDC-50 local)")
         axis.invert_xaxis()
         axis.grid(axis="y", alpha=0.22)
         axis.legend(fontsize=8)
     else:
         _empty_panel(axes[1], "No measured Figure 1(b) rows")
     fig.suptitle("Figure 1. Impact of visual token length and retention on MSD", y=1.02, fontsize=12)
-    fig.tight_layout()
-    path = output / "figure1_insight_summary.png"
-    fig.savefig(path, dpi=220, bbox_inches="tight")
-    plt.close(fig)
-    files.append(path.name)
-    return files
+    return _save_paper(fig, output, "figure1_insight_summary", plt, formats, watermark)
 
 
-def _write_paper_figure2(rows: list[dict[str, Any]], output: Path, plt: Any) -> list[str]:
-    files: list[str] = []
-    for source, suffix in (("target", ""), ("msd_draft", "_draft")):
-        files.extend(_figure2_for_source(rows, output, plt, source, suffix))
-    return files
+def _write_paper_figure2(rows: list[dict[str, Any]], output: Path, plt: Any, formats: tuple[str, ...], watermark: str | None) -> list[str]:
+    # The mechanism claim is about the small MSD draft.  Render exactly the
+    # short/long pair instead of mixing target and draft proxy panels.
+    return _figure2_for_source(rows, output, plt, "msd_draft", "", formats, watermark)
 
 
 def _figure2_for_source(
@@ -152,6 +171,8 @@ def _figure2_for_source(
     plt: Any,
     source: str,
     suffix: str,
+    formats: tuple[str, ...] = ("png",),
+    watermark: str | None = None,
 ) -> list[str]:
     attention_rows = [
         row for row in rows
@@ -160,6 +181,24 @@ def _figure2_for_source(
         and row.get("modality") in {"visual", "instruction", "text"}
         and row.get("attention_weight") is not None
     ]
+    if not attention_rows:
+        # Prefer the compact trace when a run intentionally omits the
+        # backwards-compatible per-token expansion.
+        for summary in rows:
+            if (
+                summary.get("paper_figure") == "Figure 2"
+                and summary.get("attention_source", "target") == source
+                and summary.get("modality") == "summary"
+                and summary.get("attention_policy", "last_instruction") == "last_instruction"
+                and summary.get("attention_weights") is not None
+            ):
+                visual = set(int(value) for value in summary.get("visual_positions", []))
+                instruction = set(int(value) for value in summary.get("instruction_positions", []))
+                text = set(int(value) for value in summary.get("text_positions", []))
+                for position, weight in enumerate(summary["attention_weights"]):
+                    modality = "visual" if position in visual else "instruction" if position in instruction else "text" if position in text else None
+                    if modality is not None:
+                        attention_rows.append({**summary, "modality": modality, "token_position": position, "attention_weight": weight})
     groups = _group_by_value(attention_rows, _paper_group)
     if not groups:
         return []
@@ -176,8 +215,7 @@ def _figure2_for_source(
     for axis, target in zip(axes, selected):
         subset = groups[target]
         policies = ["last_instruction"]
-        if any(row.get("attention_policy") == "all_text" for row in subset):
-            policies.append("all_text")
+        # Figure 2 uses the final instruction query only.
         for policy in policies:
             policy_rows = [row for row in subset if str(row.get("attention_policy") or "last_instruction") == policy]
             by_position: dict[int, list[float]] = defaultdict(list)
@@ -189,12 +227,9 @@ def _figure2_for_source(
             points = sorted((position, sum(values) / len(values)) for position, values in by_position.items())
             if not points:
                 continue
-            label = "Last Instr." if policy == "last_instruction" else "All Text"
             axis.plot(
                 [position for position, _ in points], [value for _, value in points],
-                linewidth=0.8 if policy == "last_instruction" else 1.0,
-                color="#2166ac" if policy == "last_instruction" else "#b2182b",
-                alpha=0.85, label=label,
+                linewidth=1.0, color="#2166ac", alpha=0.9, label="Last instruction",
             )
         representative = next((row for row in subset if row.get("modality") == "visual"), None)
         if representative:
@@ -213,17 +248,11 @@ def _figure2_for_source(
         axis.set_title(f"{_token_axis_label(target)} visual tokens")
         axis.grid(alpha=0.2)
         axis.legend(fontsize=8)
-    model_label = "MSD draft" if source == "msd_draft" else "Target"
-    fig.suptitle(f"Figure 2. Final-instruction attention distribution ({model_label})", y=1.02, fontsize=12)
-    fig.tight_layout()
-    path = output / f"figure2_insight_attention{suffix}.png"
-    fig.savefig(path, dpi=220, bbox_inches="tight")
-    plt.close(fig)
-    files.append(path.name)
-    return files
+    fig.suptitle("Figure 2. Draft final-instruction attention distribution (VDC-50 local)", y=1.02, fontsize=12)
+    return _save_paper(fig, output, "figure2_insight_attention", plt, formats, watermark)
 
 
-def _write_paper_figure3(rows: list[dict[str, Any]], output: Path, plt: Any) -> list[str]:
+def _write_paper_figure3(rows: list[dict[str, Any]], output: Path, plt: Any, formats: tuple[str, ...], watermark: str | None) -> list[str]:
     ablation = [row for row in rows if row.get("paper_figure") == "Figure 3"]
     attention = [row for row in rows if row.get("paper_figure") == "Figure 3(b)"]
     if not ablation and not attention:
@@ -233,49 +262,53 @@ def _write_paper_figure3(rows: list[dict[str, Any]], output: Path, plt: Any) -> 
     if ablation:
         grouped = _group_by_value(ablation, lambda row: row.get("layer_cut"))
         cuts = sorted(grouped)
-        stats = [summarize([row.get("rouge_l") for row in grouped[cut]]) for cut in cuts]
-        left.errorbar(cuts, [stat["mean"] for stat in stats], yerr=[_errorbar(stat) for stat in stats], marker="o", color="#1b7837", capsize=3, label="Ablated output")
+        stats = [summarize([row.get("prefix_agreement") for row in grouped[cut]]) for cut in cuts]
+        left.plot(cuts, [stat["mean"] for stat in stats], marker="o", color="#1b7837", label="Local prefix agreement")
         left.axhline(1.0, color="#555", linestyle="--", linewidth=1, label="Native target")
         left.axvline(20, color="#555", linestyle=":", linewidth=1, label="Layer 20")
         left.set_xlabel("Visual KV removal starting layer")
-        left.set_ylabel("ROUGE-L vs native target")
-        left.set_title("(a) Layer-wise visual ablation")
+        left.set_ylabel("Prefix agreement vs native output")
+        left.set_title("(a) Local output-agreement proxy")
         left.set_ylim(0, 1.05)
         left.grid(alpha=0.2)
         left.legend(fontsize=8)
     else:
         _empty_panel(left, "No measured Figure 3(a) rows")
     if attention:
-        layer_rows = sorted(attention, key=lambda row: int(row.get("layer", 0)))
-        max_heads = max((len(row.get("per_head_visual_mass", [])) for row in layer_rows), default=0)
-        matrix = []
-        layer_values = []
-        for row in layer_rows:
+        head_groups: dict[int, dict[int, list[float]]] = defaultdict(lambda: defaultdict(list))
+        for row in attention:
+            layer = int(row.get("layer", 0))
             values = [float(value) for value in row.get("per_head_visual_mass", [])]
-            if not values:
-                values = [float(row.get("visual_mass", 0.0))]
-            max_heads = max(max_heads, len(values))
-            matrix.append(values)
-            layer_values.append(int(row.get("layer", 0)))
-        padded = [values + [float("nan")] * (max_heads - len(values)) for values in matrix]
-        image = right.imshow(list(map(list, zip(*padded))), aspect="auto", origin="lower", interpolation="nearest", cmap="Blues")
-        right.set_xticks(range(len(layer_values)), layer_values)
-        right.set_xlabel("Model layer")
-        right.set_ylabel("Attention head")
-        right.set_title("(b) Visual attention by head/layer")
-        right.axvline(layer_values.index(20) if 20 in layer_values else 0, color="#b2182b", linestyle="--", linewidth=1)
+            for head, value in enumerate(values):
+                head_groups[layer][head].append(value)
+        by_layer = {layer: [sum(values) / len(values) for _head, values in sorted(heads.items())] for layer, heads in head_groups.items()}
+        layer_values = sorted(by_layer)
+        max_heads = max((len(by_layer[layer]) for layer in layer_values), default=0)
+        matrix = [by_layer[layer] + [float("nan")] * (max_heads - len(by_layer[layer])) for layer in layer_values]
+        # Sort heads by aggregate visual mass, matching the paper's heatmap.
+        order = sorted(range(max_heads), key=lambda idx: sum((row[idx] if idx < len(row) and row[idx] == row[idx] else 0.0) for row in matrix), reverse=True)
+        matrix = [[row[idx] if idx < len(row) else float("nan") for idx in order] for row in matrix]
+        image = right.imshow(matrix, aspect="auto", origin="lower", interpolation="nearest", cmap="Blues")
+        right.set_yticks(range(len(layer_values)), layer_values)
+        right.set_ylabel("Model layer")
+        right.set_xlabel("Heads sorted by visual attention")
+        right.set_title("(b) Head/layer visual attention")
+        if 20 in layer_values:
+            right.axhline(layer_values.index(20), color="#b2182b", linestyle="--", linewidth=1)
+        totals = [sum(value for value in by_layer[layer] if value == value) for layer in layer_values]
+        if totals:
+            inset = right.twinx()
+            inset.plot(totals, range(len(layer_values)), color="#b2182b", linestyle="--", linewidth=1.2)
+            inset.set_ylim(right.get_ylim())
+            inset.set_yticks([])
         fig.colorbar(image, ax=right, fraction=0.046, pad=0.04, label="Visual attention mass")
     else:
         _empty_panel(right, "No measured Figure 3(b) rows")
-    fig.suptitle("Figure 3. Layer-wise visual importance analysis", y=1.02, fontsize=12)
-    fig.tight_layout()
-    path = output / "figure3_insight_layer_analysis.png"
-    fig.savefig(path, dpi=220, bbox_inches="tight")
-    plt.close(fig)
-    return [path.name]
+    fig.suptitle("Figure 3. Layer-wise visual importance (VDC-50 local proxy)", y=1.02, fontsize=12)
+    return _save_paper(fig, output, "figure3_insight_layer_analysis", plt, formats, watermark)
 
 
-def _write_paper_figure6(rows: list[dict[str, Any]], output: Path, plt: Any) -> list[str]:
+def _write_paper_figure6(rows: list[dict[str, Any]], output: Path, plt: Any, formats: tuple[str, ...], watermark: str | None) -> list[str]:
     retention = [row for row in rows if row.get("paper_figure") == "Figure 6 / Appendix D"]
     if not retention:
         return []
@@ -284,23 +317,25 @@ def _write_paper_figure6(rows: list[dict[str, Any]], output: Path, plt: Any) -> 
     visual = [summarize([row.get("visual_cosine") for row in grouped[layer]]) for layer in layers]
     text = [summarize([row.get("text_cosine") for row in grouped[layer]]) for layer in layers]
     fig, axis = plt.subplots(figsize=(6.2, 4.2))
-    axis.errorbar(layers, [stat["mean"] for stat in visual], yerr=[_errorbar(stat) for stat in visual], color="#d73027", marker="o", linewidth=1.5, capsize=2, label="Visual information retention")
-    axis.errorbar(layers, [stat["mean"] for stat in text], yerr=[_errorbar(stat) for stat in text], color="#2166ac", marker="o", linewidth=1.5, capsize=2, label="Text information retention")
+    axis.plot(layers, [stat["mean"] for stat in visual], color="#d73027", marker="o", linewidth=1.5, label="Visual information retention")
+    axis.plot(layers, [stat["mean"] for stat in text], color="#2166ac", marker="o", linewidth=1.5, label="Text information retention")
     axis.axvline(20, color="#555", linestyle="--", linewidth=1, label="Layer 20")
     axis.set_xlabel("Layer")
     axis.set_ylabel("Retention rate")
     axis.set_ylim(0, 1.05)
-    axis.set_title("Figure 6. Layer-wise information retention")
+    axis.set_title("Figure 6. Layer-wise information retention (VDC-50 local)")
     axis.grid(alpha=0.2)
     axis.legend(fontsize=8)
-    fig.tight_layout()
-    path = output / "figure6_insight_retention.png"
-    fig.savefig(path, dpi=220, bbox_inches="tight")
-    plt.close(fig)
-    return [path.name]
+    return _save_paper(fig, output, "figure6_insight_retention", plt, formats, watermark)
 
 
-def write_paper_style_plots(rows: Iterable[dict[str, Any]], output_dir: str | Path) -> list[str]:
+def write_paper_style_plots(
+    rows: Iterable[dict[str, Any]],
+    output_dir: str | Path,
+    *,
+    formats: tuple[str, ...] = ("png",),
+    watermark: str | None = None,
+) -> list[str]:
     """Write composite figures whose layouts mirror the paper's insight plots."""
 
     try:
@@ -310,11 +345,21 @@ def write_paper_style_plots(rows: Iterable[dict[str, Any]], output_dir: str | Pa
     rows = list(rows)
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
+    # Match the paper's compact serif typography while keeping all values
+    # measured locally (the style is cosmetic, never a numerical fallback).
+    plt.rcParams.update({
+        "font.family": "serif",
+        "font.size": 9,
+        "axes.titlesize": 10,
+        "axes.labelsize": 9,
+        "legend.fontsize": 8,
+        "figure.dpi": 120,
+    })
     files: list[str] = []
-    files.extend(_write_paper_figure1(rows, output, plt))
-    files.extend(_write_paper_figure2(rows, output, plt))
-    files.extend(_write_paper_figure3(rows, output, plt))
-    files.extend(_write_paper_figure6(rows, output, plt))
+    files.extend(_write_paper_figure1(rows, output, plt, formats, watermark))
+    files.extend(_write_paper_figure2(rows, output, plt, formats, watermark))
+    files.extend(_write_paper_figure3(rows, output, plt, formats, watermark))
+    files.extend(_write_paper_figure6(rows, output, plt, formats, watermark))
     return files
 
 

@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Iterable, Mapping
 
 from .paper_contract import PaperContract, validate_contract
+from .coverage import build_coverage
 
 
 @dataclass(frozen=True)
@@ -92,6 +93,12 @@ def audit_rows(rows: Iterable[Mapping[str, Any]], contract: PaperContract) -> Au
         if len(issues) == before:
             valid_rows += 1
     return AuditReport(not any(issue.severity == "error" for issue in issues) and bool(rows), len(rows), valid_rows, issues)
+
+
+def audit_coverage(rows: Iterable[Mapping[str, Any]], contract: PaperContract):
+    """Audit the experiment matrix, in addition to individual row schema."""
+
+    return build_coverage(rows, contract)
 
 
 def audit_losslessness(rows: Iterable[Mapping[str, Any]]) -> AuditReport:

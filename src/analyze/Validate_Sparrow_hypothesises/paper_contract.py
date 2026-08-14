@@ -31,6 +31,20 @@ class PaperContract:
     attention_short_tokens: int
     attention_long_tokens: int
     layer_cut_points: tuple[int, ...]
+    profile: str = "paper"
+    minimum_paired_samples: int = 1
+    strict_calibration: bool = False
+    retention_anchor_visual_tokens: int = 25000
+    layer_count: int = 28
+    required_figures: tuple[str, ...] = (
+        "Figure 1(a)",
+        "Figure 1(b)",
+        "Figure 2",
+        "Figure 3",
+        "Figure 3(b)",
+        "Figure 6 / Appendix D",
+    )
+    paper_plot_formats: tuple[str, ...] = ("png",)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -76,7 +90,13 @@ def load_contract(path: str | Path | None = None) -> PaperContract:
         return DEFAULT_CONTRACT
     values = DEFAULT_CONTRACT.to_dict()
     values.update(dict(_read_yaml(Path(path))))
-    for field in ("visual_token_milestones", "retention_percentages", "layer_cut_points"):
+    for field in (
+        "visual_token_milestones",
+        "retention_percentages",
+        "layer_cut_points",
+        "required_figures",
+        "paper_plot_formats",
+    ):
         values[field] = tuple(values[field])
     return PaperContract(**values)
 
@@ -105,6 +125,16 @@ def validate_contract(contract: PaperContract) -> list[str]:
         errors.append("MSD target must be the Qwen2-VL family used by Figure 1/2")
     if not contract.layer_target_model.startswith("Qwen/"):
         errors.append("layer analysis target must be the Qwen2.5-VL family")
+    if contract.minimum_paired_samples <= 0:
+        errors.append("minimum_paired_samples must be positive")
+    if contract.retention_anchor_visual_tokens not in contract.visual_token_milestones:
+        errors.append("retention_anchor_visual_tokens must be one of the visual milestones")
+    if contract.layer_count <= 0:
+        errors.append("layer_count must be positive")
+    if not contract.required_figures:
+        errors.append("required_figures must not be empty")
+    if any(fmt not in {"png", "pdf", "svg"} for fmt in contract.paper_plot_formats):
+        errors.append("paper_plot_formats must contain only png, pdf or svg")
     return errors
 
 
@@ -117,7 +147,7 @@ def paper_contract_rows(contract: PaperContract) -> list[dict[str, Any]]:
             "claim": "MSD acceptance and latency degrade as visual length grows",
             "model": contract.msd_target_model,
             "visual_tokens": list(contract.visual_token_milestones),
-            "metric": "accepted_length, prefill/decode/end_to_end_seconds",
+            "metric": "accepted_length, draft_tree_prefill/verification/end_to_end_seconds",
         },
         {
             "figure": "Figure 1(b)",
@@ -138,7 +168,7 @@ def paper_contract_rows(contract: PaperContract) -> list[dict[str, Any]]:
             "claim": "visual flow becomes less important after the middle layers",
             "model": contract.layer_target_model,
             "layer_cut_points": list(contract.layer_cut_points),
-            "metric": "output_agreement, prefix_agreement, rouge_l",
+            "metric": "local_prefix_agreement_proxy",
         },
         {
             "figure": "Figure 6 / Appendix D",

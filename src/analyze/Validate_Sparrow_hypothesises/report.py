@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .audit import AuditReport, audit_losslessness, audit_rows
+from .coverage import build_coverage
 from .metrics import acceptance_summary
 from .paper_contract import PaperContract, paper_contract_rows
 from .paper_statistics import build_paper_statistics, write_statistics
@@ -26,6 +27,7 @@ def read_jsonl(path: str | Path) -> list[dict[str, Any]]:
 def build_report(rows: Iterable[dict[str, Any]], contract: PaperContract) -> dict[str, Any]:
     rows = list(rows)
     conformance = audit_rows(rows, contract)
+    coverage = build_coverage(rows, contract)
     lossless = audit_losslessness(rows) if any(
         "target_output_ids" in row or "speculative_output_ids" in row for row in rows
     ) else None
@@ -42,10 +44,11 @@ def build_report(rows: Iterable[dict[str, Any]], contract: PaperContract) -> dic
         groups[key].append(row)
     summaries = {key: acceptance_summary(group) for key, group in sorted(groups.items())}
     return {
-        "valid": conformance.valid and (lossless is None or lossless.valid),
+        "valid": conformance.valid and coverage.valid and (lossless is None or lossless.valid),
         "contract": contract.to_dict(),
         "traceability": paper_contract_rows(contract),
         "conformance": conformance.to_dict(),
+        "coverage": coverage.to_dict(),
         "losslessness": lossless.to_dict() if lossless else None,
         "summaries": summaries,
         "diagnostic_counts": {
@@ -60,8 +63,20 @@ def write_report(output_dir: str | Path, report: dict[str, Any]) -> None:
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     rows = report.pop("_rows", [])
-    plot_files = write_plots(rows, output)
-    paper_plot_files = write_paper_style_plots(rows, output)
+    # Legacy exploratory plots are always useful for debugging, but the
+    # paper-shaped figures are emitted only for a complete enforced cohort.
+    plot_files = write_plots(rows, output / "diagnostic")
+    paper_root = output if report.get("valid", False) else output / "diagnostic"
+    watermark = None if report.get("valid", False) else "INCOMPLETE DIAGNOSTIC — NOT PAPER EVIDENCE"
+    paper_plot_files = write_paper_style_plots(
+        rows,
+        paper_root,
+        formats=tuple(report.get("contract", {}).get("paper_plot_formats", ["png"])),
+        watermark=watermark,
+    )
+    if paper_root != output:
+        paper_plot_files = [str(Path("diagnostic") / name) for name in paper_plot_files]
+    plot_files = [str(Path("diagnostic") / name) for name in plot_files]
     statistics = build_paper_statistics(rows)
     statistics_files = write_statistics(statistics, output)
     report["plots"] = plot_files + paper_plot_files
@@ -111,6 +126,11 @@ def write_report(output_dir: str | Path, report: dict[str, Any]) -> None:
     else:
         for issue in issues:
             lines.append(f"- `{issue['severity']}` `{issue['code']}`: {issue['message']} ({issue.get('row_id')})")
+    lines.extend(["", "## Coverage gate", ""])
+    coverage = report.get("coverage", {})
+    lines.append(f"Coverage valid: `{str(coverage.get('valid', False)).upper()}`; paired samples: `{coverage.get('paired_samples', 0)}`.")
+    for issue in coverage.get("issues", []):
+        lines.append(f"- `{issue['code']}`: {issue['message']} ({issue.get('figure') or 'run'})")
     if report.get("losslessness"):
         lines.extend(["", "## Losslessness", ""])
         lines.append(json.dumps(report["losslessness"], ensure_ascii=False, indent=2))

@@ -20,7 +20,7 @@ from .model_analysis import (
     prefix_length,
     target_generation,
 )
-from .paper_contract import DEFAULT_CONTRACT
+from .paper_contract import load_contract
 from .run_attention import _calibration_jobs
 from .runtime import (
     RuntimeUnavailableError,
@@ -142,11 +142,14 @@ def _run_figure3_attention(
     rows: list[dict[str, Any]] = []
     visual = torch.as_tensor(masks["visual_positions"], dtype=torch.long)
     for layer, weights in sorted(captured.items()):
+        # Paper figures use one-based layer labels; attention hooks expose
+        # zero-based module indices.
+        paper_layer = int(layer) + 1
         row = _base_row(sample, args, prepared, point, fps, max_pixels)
         row.update({
-            "row_id": f"{sample.sample_id}:{prepared.video_positions.numel()}:attention-layer-{layer}",
+            "row_id": f"{sample.sample_id}:{prepared.video_positions.numel()}:attention-layer-{paper_layer}",
             "paper_figure": "Figure 3(b)",
-            "layer": int(layer),
+            "layer": paper_layer,
             "attention_query": "last_instruction",
             "query_position": int(masks["query_index"]),
             "instruction_positions": masks["instruction_positions"],
@@ -206,10 +209,13 @@ def run(args: argparse.Namespace) -> int:
         require_cuda()
     except RuntimeUnavailableError as exc:
         raise SystemExit(str(exc)) from exc
+    contract = load_contract(args.contract)
     samples = load_vdc_manifest(args.manifest, args.dataset_root)
     if args.limit is not None:
         samples = samples[: args.limit]
-    targets = list(args.visual_targets or DEFAULT_CONTRACT.visual_token_milestones)
+    targets = list(args.visual_targets or (contract.attention_long_tokens,))
+    if args.layer_cut_points is None:
+        args.layer_cut_points = list(contract.layer_cut_points)
     jobs = _calibration_jobs(samples, args.calibration, targets, args.allow_out_of_tolerance)
     processor = build_qwen2vl_video_processor(args.model, args.min_pixels, args.max_pixels)
     model = load_qwen_model(
@@ -281,6 +287,10 @@ def run(args: argparse.Namespace) -> int:
     return 0
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--contract",
+        default="src/analyze/Validate_Sparrow_hypothesises/configs/local_insight_vdc50.yaml",
+    )
     parser.add_argument("--manifest", default="dataset/VideoDetailCaption/subset_manifest.jsonl")
     parser.add_argument("--dataset-root", default="dataset/VideoDetailCaption")
     parser.add_argument("--model", default="Qwen/Qwen2.5-VL-7B-Instruct")
@@ -289,7 +299,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--calibration")
     parser.add_argument("--visual-targets", type=int, nargs="+")
     parser.add_argument("--allow-out-of-tolerance", action="store_true")
-    parser.add_argument("--layer-cut-points", type=int, nargs="+", default=list(DEFAULT_CONTRACT.layer_cut_points))
+    parser.add_argument("--layer-cut-points", type=int, nargs="+", default=None)
     parser.add_argument("--fps", type=float, default=8.0)
     parser.add_argument("--min-pixels", type=int, default=256 * 28 * 28)
     parser.add_argument("--max-pixels", type=int, default=1024 * 28 * 28)

@@ -8,7 +8,7 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from .audit import audit_losslessness, audit_rows
+from .audit import audit_coverage, audit_losslessness, audit_rows
 from .calibrate import calibrate_sample, candidate_grid, write_calibration
 from .dataset import load_vdc_manifest, planned_calibration, write_jsonl
 from .paper_contract import load_contract, validate_contract
@@ -132,13 +132,18 @@ def _cmd_audit(args: argparse.Namespace) -> int:
     contract = _contract(args)
     rows = read_jsonl(args.input)
     report = audit_rows(rows, contract)
+    coverage = audit_coverage(rows, contract)
     if any("target_output_ids" in row or "speculative_output_ids" in row for row in rows):
         lossless = audit_losslessness(rows)
         report.issues.extend(lossless.issues)
         report.valid = report.valid and lossless.valid
+    payload = report.to_dict()
+    payload["coverage"] = coverage.to_dict()
+    report.valid = report.valid and coverage.valid
+    payload["valid"] = report.valid
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.output).write_text(json.dumps(report.to_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+    Path(args.output).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0 if report.valid else 2
 
 
@@ -159,7 +164,7 @@ def build_parser() -> argparse.ArgumentParser:
             "attention --help"
         ),
     )
-    parser.add_argument("--contract", default="src/analyze/Validate_Sparrow_hypothesises/configs/paper_contract.yaml")
+    parser.add_argument("--contract", default="src/analyze/Validate_Sparrow_hypothesises/configs/local_insight_vdc50.yaml")
     sub = parser.add_subparsers(dest="command", required=True)
 
     preflight = sub.add_parser("preflight")
