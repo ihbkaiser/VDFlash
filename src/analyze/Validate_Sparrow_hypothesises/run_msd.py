@@ -215,7 +215,10 @@ def run(args: argparse.Namespace) -> int:
                 "calibration_status": point.get("status") if point else "not_requested",
             })
             continue
-        rows.extend(job_rows)
+        # Drop stale rows for the re-done job (resume may have loaded partial
+        # rows from a killed run) so the file never contains duplicates.
+        job_ids = {row["row_id"] for row in job_rows}
+        rows = [row for row in rows if row["row_id"] not in job_ids] + job_rows
         # Incremental write: a killed stage can resume without losing work.
         write_jsonl(args.output, rows)
     print(f"Wrote {len(rows)} MSD rows to {args.output}")

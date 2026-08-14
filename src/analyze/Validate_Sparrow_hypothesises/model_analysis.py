@@ -61,7 +61,7 @@ def load_qwen_model(
     """Load a Qwen-VL checkpoint with eager attention for inspectable probes."""
 
     try:
-        from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+        from transformers import AutoModelForVision2Seq, BitsAndBytesConfig
     except ImportError as exc:  # pragma: no cover - environment gate
         raise RuntimeUnavailableError("Transformers is required for model analysis") from exc
     if dtype == "bfloat16":
@@ -85,12 +85,14 @@ def load_qwen_model(
             bnb_4bit_use_double_quant=True,
         )
     try:
-        model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+        # Qwen2-VL is a vision-encoder-decoder: AutoModelForCausalLM rejects
+        # Qwen2VLConfig on modern transformers, so use AutoModelForVision2Seq.
+        model = AutoModelForVision2Seq.from_pretrained(model_id, **kwargs)
     except TypeError:
         # Older Transformers releases use the config field instead of the
         # from_pretrained keyword for the attention implementation.
         kwargs.pop("attn_implementation", None)
-        model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+        model = AutoModelForVision2Seq.from_pretrained(model_id, **kwargs)
         if hasattr(model.config, "_attn_implementation"):
             model.config._attn_implementation = "eager"
     model.eval()
