@@ -2,6 +2,39 @@
 set -euo pipefail
 
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
+# Load a trusted shell-style environment file before applying defaults below.
+# Explicit command-line options are parsed afterwards and take precedence.
+ENV_FILE=${SPECFORGE_ENV_FILE:-}
+ARGS=("$@")
+for ((arg_index = 0; arg_index < ${#ARGS[@]}; arg_index++)); do
+  case "${ARGS[arg_index]}" in
+    --env-file)
+      arg_index=$((arg_index + 1))
+      if ((arg_index >= ${#ARGS[@]})); then
+        echo "--env-file requires a path" >&2
+        exit 2
+      fi
+      ENV_FILE=${ARGS[arg_index]}
+      ;;
+    --env-file=*)
+      ENV_FILE=${ARGS[arg_index]#--env-file=}
+      ;;
+  esac
+done
+if [[ -n "$ENV_FILE" ]]; then
+  if [[ ! -f "$ENV_FILE" ]]; then
+    echo "environment file not found: $ENV_FILE" >&2
+    exit 2
+  fi
+  # The env file is intentionally shell syntax so paths may be quoted.
+  # Only source files the user explicitly selected.
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+fi
+
 PYTHON_BIN=${PYTHON_BIN:-python3}
 # Keep the local SpecForge package importable when this launcher is invoked
 # from the repository root or from a scheduler working directory.
@@ -33,6 +66,8 @@ Required environment:
   IMAGE_ROOT         extracted LLaVA image hierarchy, or set IMAGE_ARCHIVE
 
 Options:
+  --env-file FILE
+  --env-file=FILE
   --phase data|capture|train|infer|all
   --gpus N
   --resume
@@ -42,6 +77,8 @@ EOF
 
 while (($#)); do
   case "$1" in
+    --env-file) shift 2 ;;
+    --env-file=*) shift ;;
     --phase) PHASE=${2:?--phase requires a value}; shift 2 ;;
     --gpus) GPU_COUNT=${2:?--gpus requires a value}; shift 2 ;;
     --resume) RESUME=1; shift ;;

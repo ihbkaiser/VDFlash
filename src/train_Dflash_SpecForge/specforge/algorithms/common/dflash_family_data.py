@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from functools import partial
 
+import torch
+
 from specforge.algorithms.common.collation import pad_and_concatenate_features
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
@@ -38,7 +40,9 @@ def _normalize_hidden_states(
 def normalize_offline_sample(raw, max_len: int):
     """Normalize raw DFlash/Domino capture tensors without target projection."""
 
-    input_ids = raw["input_ids"][:max_len].unsqueeze(0)
+    # Token ids are written as int32 by the capture scripts to reduce cache
+    # size, but torch embedding/gather/index assignment paths require int64.
+    input_ids = raw["input_ids"][:max_len].to(dtype=torch.long).unsqueeze(0)
     loss_mask = raw["loss_mask"][:max_len].unsqueeze(0)
     hidden_states = _normalize_hidden_states(
         raw,
@@ -93,7 +97,7 @@ def normalize_dspark_offline_sample(raw, max_len: int):
     }
 
 
-def normalize_qwen25vl_offline_sample(raw, max_len: int):
+def normalize_qwen25vl_offline_sample(raw, max_len: int, **_topology):
     """Normalize DFlash features carrying Qwen2.5-VL 3-axis positions."""
 
     normalized = normalize_offline_sample(raw, max_len)
@@ -187,6 +191,10 @@ def build_dspark_offline_normalizer(max_len, **_topology):
     return partial(normalize_dspark_offline_sample, max_len=max_len)
 
 
+def build_qwen25vl_offline_normalizer(max_len, **_topology):
+    return partial(normalize_qwen25vl_offline_sample, max_len=max_len)
+
+
 def build_collator():
     def collate(features):
         return pad_and_concatenate_features(
@@ -264,6 +272,7 @@ __all__ = [
     "build_qwen25vl_collator",
     "build_dspark_collator",
     "build_dspark_offline_normalizer",
+    "build_qwen25vl_offline_normalizer",
     "build_dspark_offline_reader",
     "build_offline_normalizer",
     "build_offline_reader",

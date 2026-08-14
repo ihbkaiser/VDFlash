@@ -137,8 +137,8 @@ with one parallel target forward, crops rejected cache entries, and continues
 from the target bonus token. No Sparrow attention, glimpsing, tree decoding, or
 video-token selector is used.
 
-After installing the repository-root `requirements.txt` as described in
-`README.md`, run the self-contained 3090 smoke test:
+After installing `src/train_VLM/requirements.txt`, run the self-contained
+3090 smoke test:
 
 ```bash
 python -m src.train_VLM.smoke_video
@@ -254,6 +254,7 @@ python -m src.train_VLM.train --config src/train_VLM/config_qwen25vl_7b.json \
 ```
 
 The final export remains in `output_dir/`, and the highest validation accepted
-prefix checkpoint is at `output_dir/best/`. Use Python 3.11 with the pinned
-Torch 2.7.1 / Transformers 4.57.1 dependencies in the repository-root
-`requirements.txt` for real Qwen2.5-VL runs.
+prefix checkpoint is at `output_dir/best/`. For the currently validated Phase
+1 environment, use Python 3.10 with the pinned dependencies in
+`src/train_VLM/requirements.txt`. The repository-root requirements file keeps
+the separate Python 3.11 / CUDA 12.8 environment for other repo workflows.

@@ -121,6 +121,21 @@ IMAGE_ARCHIVE=/data/images.zip \
 bash train_qwen25vl_dflash_llava_68k.sh --phase all
 ```
 
+To keep the paths and run parameters in one place, copy
+`train_qwen25vl_dflash_llava_68k.env.example` to a private env file, edit it,
+and pass it to the launcher:
+
+```bash
+cp train_qwen25vl_dflash_llava_68k.env.example qwen25vl_llava_phase2.env
+# edit qwen25vl_llava_phase2.env
+bash train_qwen25vl_dflash_llava_68k.sh \
+  --env-file qwen25vl_llava_phase2.env --phase all
+```
+
+The env file is shell-style configuration and is intentionally not committed
+when it contains machine-specific paths. `--phase`, `--gpus`, and `--resume`
+can still be supplied on the command line for a particular run.
+
 The launcher requires exactly 68,000 valid JSONL records. The normalized
 manifest preserves the source `response` as supervision and rejects malformed
 tail lines, duplicate IDs, unsafe paths, and missing images. An archive is

@@ -64,8 +64,8 @@ python -m pip install --upgrade pip setuptools wheel
 python -m pip install -r requirements.txt
 ```
 
-`src/train_VLM/requirements.txt` là compatibility entrypoint trỏ về
-`requirements.txt` ở root, nên lệnh sau tương đương:
+Phase 1 có bộ pin riêng đã được xác nhận trên máy RTX 3090/A4000 tại
+`src/train_VLM/requirements.txt`. Nếu chạy Phase 1 trên driver hiện tại, dùng:
 
 ```bash
 python -m pip install -r src/train_VLM/requirements.txt

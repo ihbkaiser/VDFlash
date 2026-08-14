@@ -1,3 +1,32 @@
-# Compatibility entrypoint. The canonical environment is maintained at the
-# repository root so both the package code and tests use one dependency set.
--r ../../requirements.txt
+# Phase 1 Video-DFlash environment validated by the GPU smoke test on
+# 2026-08-15.
+#
+# Host assumptions:
+#   - Linux x86_64
+#   - NVIDIA driver 535.309.01 (CUDA 12.2 capability)
+#   - Python 3.10.x
+#
+# CUDA 12.1 wheels are intentional: they run with the current driver. Do not
+# replace these pins with the repository-root CUDA 12.8 stack on this host.
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+torch==2.5.1+cu121
+torchvision==0.20.1+cu121
+
+transformers==4.52.4
+accelerate==1.3.0
+qwen-vl-utils==0.0.14
+pydantic==2.13.4
+
+numpy==1.26.4
+safetensors==0.8.0
+huggingface-hub==0.36.2
+fsspec[http]>=2023.1
+ijson==3.5.1
+PyYAML==6.0.3
+av==17.1.0
+Pillow==12.2.0
+setuptools>=70
+
+# Repository tests used by the Phase 1 package.
+pytest>=8,<10

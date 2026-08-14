@@ -13,6 +13,21 @@ from specforge.qwen25vl import compute_qwen25vl_position_ids
 
 
 class Qwen25VLFeatureTest(unittest.TestCase):
+    def test_normalizer_accepts_topology_and_promotes_int32_token_ids(self):
+        raw = {
+            "input_ids": torch.arange(5, dtype=torch.int32),
+            "loss_mask": torch.tensor([0, 0, 1, 1, 1], dtype=torch.float32),
+            "hidden_states": torch.zeros(5, 8),
+            "position_ids": torch.arange(15, dtype=torch.int32).reshape(3, 5),
+        }
+        normalized = normalize_qwen25vl_offline_sample(
+            raw,
+            max_len=5,
+            ttt_length=7,
+            use_usp_preprocess=False,
+        )
+        self.assertEqual(normalized["input_ids"].dtype, torch.long)
+
     def test_normalizer_requires_and_preserves_three_axis_positions(self):
         raw = {
             "input_ids": torch.arange(5),

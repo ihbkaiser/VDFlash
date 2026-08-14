@@ -14,8 +14,8 @@ from specforge.algorithms.common.dflash_family_data import (
     build_collator,
     build_offline_normalizer,
     build_offline_reader,
+    build_qwen25vl_offline_normalizer,
     build_qwen25vl_collator,
-    normalize_qwen25vl_offline_sample,
 )
 from specforge.algorithms.common.providers import (
     AlgorithmProviders,
@@ -248,9 +248,7 @@ def algorithm_providers() -> AlgorithmProviders:
                         "position_ids",
                     ),
                 ),
-                build_normalizer=partial(
-                    normalize_qwen25vl_offline_sample,
-                ),
+                build_normalizer=build_qwen25vl_offline_normalizer,
                 build_collator=qwen25vl_collator,
             ),
         ),
