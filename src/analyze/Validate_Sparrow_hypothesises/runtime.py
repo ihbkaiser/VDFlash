@@ -9,6 +9,7 @@ image-only helper shipped in the original MSD repository.
 from __future__ import annotations
 
 import hashlib
+import os
 import sys
 import time
 import types
@@ -39,6 +40,7 @@ class PreparedPrefill:
     video_token_id: int | None = None
     vision_start_token_id: int | None = None
     vision_end_token_id: int | None = None
+    keep_mask: torch.Tensor | None = None
 
 
 def _tensor(batch: Any, key: str) -> torch.Tensor | None:
@@ -195,6 +197,9 @@ def prepare_qwen2vl_prefill(model: Any, batch: Any, device: torch.device | str |
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds.to(inputs_embeds.dtype))
         if pixel_values_videos is None:
             raise ValueError("video experiment requires processor key pixel_values_videos")
+        if int(os.environ.get("VIDEO_DFLASH_DEBUG", "0")):
+            print(f"[debug] grid={video_grid_thw.tolist() if video_grid_thw is not None else None} "
+                  f"video_ids={(input_ids[0] == int(getattr(model.config, 'video_token_id'))).sum().item()}", flush=True)
         video_values = pixel_values_videos.to(dtype=model.visual.get_dtype())
         video_embeds = model.visual(video_values, grid_thw=video_grid_thw)
         video_token_id = int(getattr(model.config, "video_token_id"))
@@ -285,6 +290,7 @@ def compact_qwen2vl_prefill(
         video_token_id=prepared.video_token_id,
         vision_start_token_id=prepared.vision_start_token_id,
         vision_end_token_id=prepared.vision_end_token_id,
+        keep_mask=keep.detach().to(device=prepared.input_ids.device),
     )
 
 
@@ -301,27 +307,44 @@ def validate_native_prefill_parity(model: Any, batch: Any, device: torch.device 
         pixel_values_videos = pixel_values_videos.to(device)
     if image_grid_thw is not None:
         image_grid_thw = image_grid_thw.to(device)
-    with torch.inference_mode():
-        native = model(
-            input_ids=prepared.input_ids,
-            attention_mask=prepared.attention_mask,
-            pixel_values=pixel_values,
-            pixel_values_videos=pixel_values_videos,
-            image_grid_thw=image_grid_thw,
-            video_grid_thw=prepared.video_grid_thw,
-            use_cache=False,
-            return_dict=True,
-        )
-        native_logits = native.logits
-        inner = model.model(
-            inputs_embeds=prepared.inputs_embeds,
-            attention_mask=prepared.attention_mask,
-            position_ids=prepared.position_ids,
-            use_cache=False,
-            return_dict=True,
-        )
-        hidden = inner.last_hidden_state if hasattr(inner, "last_hidden_state") else inner[0]
-        fused_logits = model.lm_head(hidden)
+    # For long sequences the full vocabulary logits [1, S, 152064] do not fit
+    # the T4; compare only the last position, which sees the entire context and
+    # is the strongest single alignment probe.  Short sequences keep the
+    # full-length comparison.
+    sequence_length = int(prepared.input_ids.shape[1])
+    last_only = sequence_length > 4096
+    if last_only:
+        lm_head_original = model.lm_head.forward
+
+        def _last_position_only(input: torch.Tensor) -> torch.Tensor:
+            return lm_head_original(input[:, -1:])
+
+        model.lm_head.forward = _last_position_only
+    try:
+        with torch.inference_mode():
+            native = model(
+                input_ids=prepared.input_ids,
+                attention_mask=prepared.attention_mask,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=prepared.video_grid_thw,
+                use_cache=False,
+                return_dict=True,
+            )
+            native_logits = native.logits
+            inner = model.model(
+                inputs_embeds=prepared.inputs_embeds,
+                attention_mask=prepared.attention_mask,
+                position_ids=prepared.position_ids,
+                use_cache=False,
+                return_dict=True,
+            )
+            hidden = inner.last_hidden_state if hasattr(inner, "last_hidden_state") else inner[0]
+            fused_logits = model.lm_head(hidden)
+    finally:
+        if last_only:
+            model.lm_head.forward = lm_head_original
     max_error = float((native_logits - fused_logits).abs().max().item())
     return {
         "valid": max_error <= atol,
@@ -329,6 +352,7 @@ def validate_native_prefill_parity(model: Any, batch: Any, device: torch.device 
         "atol": atol,
         "input_fingerprint": prepared.input_fingerprint,
         "video_token_count": int(prepared.video_positions.numel()),
+        "parity_positions": "last_only" if last_only else "full",
     }
 
 
@@ -364,6 +388,33 @@ def process_video(
     question: str,
     fps: float,
     max_pixels: int | None = None,
+    attempts: int = 2,
+) -> Any:
+    """Process a video with a small number of retries.
+
+    The torchvision reader occasionally reports zero total frames on a healthy
+    file under I/O contention (concurrent downloads/calibration); a single
+    retry resolves the transient reads seen on the T4 host.
+    """
+
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return _process_video_once(processor, video_path, question, fps, max_pixels)
+        except Exception as exc:  # noqa: BLE001 - transient video read failures
+            last_exc = exc
+            if attempt < attempts:
+                time.sleep(3)
+    assert last_exc is not None
+    raise last_exc
+
+
+def _process_video_once(
+    processor: Any,
+    video_path: str | Path,
+    question: str,
+    fps: float,
+    max_pixels: int | None = None,
 ) -> Any:
     try:
         from qwen_vl_utils import process_vision_info
@@ -379,6 +430,173 @@ def process_video(
     kwargs = dict(text=[text], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt")
     kwargs.update(video_kwargs)
     return processor(**kwargs)
+
+
+def apply_msd_memory_patches() -> None:
+    """Make the vendored MSD attention memory-efficient on small GPUs (T4).
+
+    The vendored EAGLE code materializes full attention-score matrices:
+
+    - ``VisionSdpaAttention`` passes a 3D query and a ``[1, S, S]`` bool mask,
+      which forces SDPA's math backend and allocates ``heads * S * S`` fp32
+      scores.  Reshaping to 4D ``[1, heads, S, S]`` selects the memory-
+      efficient backend (measured: 684 MB vs 9.3 GB at S=12512).
+    - ``Qwen2VLSdpaAttention`` passes a 4D float32 mask, which also forces the
+      math backend; converting it to bool keeps the memory-efficient backend.
+    - The EAGLE draft ``Qwen2VLAttention`` materializes ``S * S`` fp32 weights
+      with a manual matmul; the SDPA path is used unless ``output_attentions``
+      is requested (the draft-attention probe then falls back to the original
+      implementation, which is small at probe sizes).
+
+    The patches preserve the original masking semantics (masked positions are
+    exactly ``finfo.min`` or ``-inf``, so ``mask > finfo.min / 2`` is a safe
+    "attend" predicate).
+    """
+
+    import torch.nn.functional as F
+
+    def _bool_attend(mask: torch.Tensor) -> torch.Tensor:
+        if mask.dtype == torch.float32:
+            return mask > (torch.finfo(torch.float32).min / 2)
+        return mask
+
+    try:
+        from eagle.model import ea_qwen2vl_model as ea_mod
+        from eagle.model import modeling_qwen2vl_kv as kv_mod
+    except ImportError:  # pragma: no cover - only applied after MSD import
+        return
+
+    # 1. Vision encoder attention (modeling_qwen2vl_kv.VisionSdpaAttention).
+    vision_original = kv_mod.VisionSdpaAttention.forward
+
+    def _vision_sdpa_forward(
+        self: Any,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        rotary_pos_emb: torch.Tensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        seq_length = hidden_states.shape[0]
+        q, k, v = (
+            self.qkv(hidden_states)
+            .reshape(seq_length, 3, self.num_heads, -1)
+            .permute(1, 0, 2, 3)
+            .unbind(0)
+        )
+        if position_embeddings is None:
+            emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+            cos, sin = emb.cos().float(), emb.sin().float()
+        else:
+            cos, sin = position_embeddings
+        q, k = kv_mod.apply_rotary_pos_emb_vision(q, k, cos, sin)
+        # The attention is block-diagonal (each frame attends only within
+        # itself, fully bidirectional).  Process each frame separately so the
+        # flash backend runs without materializing a [1, S, S] mask, which
+        # would OOM on a T4 once the patch grid reaches tens of thousands of
+        # tokens (measured: 474 MB peak vs 4.7 GB at S=50048).
+        starts = cu_seqlens[:-1].tolist()
+        ends = cu_seqlens[1:].tolist()
+        outputs = []
+        for start, end in zip(starts, ends):
+            frame = F.scaled_dot_product_attention(
+                q[start:end].unsqueeze(0),
+                k[start:end].unsqueeze(0),
+                v[start:end].unsqueeze(0),
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=False,
+            )
+            outputs.append(frame.squeeze(0))
+        attn_output = torch.cat(outputs, dim=1)  # [heads, S, head_dim]
+        attn_output = attn_output.reshape(seq_length, -1)
+        return self.proj(attn_output)
+
+    kv_mod.VisionSdpaAttention.forward = _vision_sdpa_forward
+
+    # 2. Language-model SDPA attention (modeling_qwen2vl_kv.Qwen2VLSdpaAttention).
+    language_original = kv_mod.Qwen2VLSdpaAttention.forward
+
+    def _language_sdpa_forward(
+        self: Any,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        past_key_value: Any = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: torch.Tensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, Any]:
+        if output_attentions:
+            return language_original(
+                self, hidden_states, attention_mask=attention_mask, position_ids=position_ids,
+                past_key_value=past_key_value, output_attentions=True, use_cache=use_cache,
+                cache_position=cache_position, position_embeddings=position_embeddings,
+            )
+        if attention_mask is not None and attention_mask.ndim == 4:
+            attention_mask = _bool_attend(attention_mask)
+        return language_original(
+            self, hidden_states, attention_mask=attention_mask, position_ids=position_ids,
+            past_key_value=past_key_value, output_attentions=False, use_cache=use_cache,
+            cache_position=cache_position, position_embeddings=position_embeddings,
+        )
+
+    kv_mod.Qwen2VLSdpaAttention.forward = _language_sdpa_forward
+
+    # 3. EAGLE draft attention (ea_qwen2vl_model.Qwen2VLAttention).
+    draft_original = ea_mod.Qwen2VLAttention.forward
+    draft_apply_rope = ea_mod.apply_multimodal_rotary_pos_emb
+    draft_repeat_kv = ea_mod.repeat_kv
+
+    def _draft_sdpa_forward(
+        self: Any,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        past_key_value: Any = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: torch.Tensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, Any]:
+        if output_attentions:
+            # The draft-attention probe needs the explicit weights; at probe
+            # sizes (<= 3k tokens) the original materialization fits VRAM.
+            return draft_original(
+                self, hidden_states, attention_mask=attention_mask, position_ids=position_ids,
+                past_key_value=past_key_value, output_attentions=True, use_cache=use_cache,
+                cache_position=cache_position, position_embeddings=position_embeddings,
+            )
+        bsz, q_len, _ = hidden_states.size()
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+        query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        cos, sin = position_embeddings
+        query_states, key_states = draft_apply_rope(
+            query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
+        )
+        if past_key_value is not None:
+            key_states = torch.cat([past_key_value[0], key_states], dim=2)
+            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+        past_key_value = (key_states, value_states) if use_cache else None
+        key_states = draft_repeat_kv(key_states, self.num_key_value_groups)
+        value_states = draft_repeat_kv(value_states, self.num_key_value_groups)
+        mask = attention_mask
+        if mask is not None:
+            mask = mask[:, :, :, : key_states.shape[-2]]
+            mask = _bool_attend(mask)
+        attn_weights = F.scaled_dot_product_attention(
+            query_states, key_states, value_states, attn_mask=mask, dropout_p=0.0
+        )
+        attn_output = attn_weights.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, -1)
+        attn_output = self.o_proj(attn_output)
+        return attn_output, None, past_key_value
+
+    ea_mod.Qwen2VLAttention.forward = _draft_sdpa_forward
 
 
 def load_msd_qwen2vl(base_model_path: str, msd_model_path: str, device_map: str = "cuda") -> Any:
@@ -418,6 +636,7 @@ def load_msd_qwen2vl(base_model_path: str, msd_model_path: str, device_map: str 
     # torch.utils.checkpoint branch whose custom_forward drops use_cache and
     # returns a single-element tuple. eval() disables that branch.
     result.eval()
+    apply_msd_memory_patches()
     return result
 
 
@@ -608,4 +827,174 @@ def generate_msd_full_video(
         "verification_steps": len(acceptance_trace),
         "input_fingerprint": prepared.input_fingerprint,
         "video_token_count": int(prepared.video_positions.numel()),
+    }
+
+
+def generate_msd_retention_video(
+    model: Any,
+    prepared_full: PreparedPrefill,
+    prepared_draft: PreparedPrefill,
+    max_new_tokens: int = 512,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """MSD decode for the Figure 1(b) retention sweep.
+
+    The *target* is prefilled and verified on the full video context while the
+    *draft* tree is built on the compacted draft context only (``keep_mask``).
+    This matches the paper's setup ("the target always keeps the full
+    calibrated video; only the draft-side embedding sequence is compacted").
+    The original harness path fed the compacted context to the target as well,
+    which broke losslessness by construction; this function restores the split.
+
+    The first draft tree (inside ``topK_genrate``) is the only place the draft
+    receives real visual features; later tree rebuilds use placeholder visual
+    embeddings exactly like the official ``msdgenerate`` loop.
+    """
+
+    from eagle.model import ea_model as ea_module
+
+    if prepared_full.input_ids.shape[0] != 1 or prepared_draft.input_ids.shape[0] != 1:
+        raise ValueError("MSD runtime currently supports batch size one")
+    keep = prepared_draft.keep_mask
+    if keep is None:
+        raise ValueError("prepared_draft must carry keep_mask (use compact_qwen2vl_prefill)")
+    start = time.perf_counter()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    with patched_msd_video_path(model, prepared_full) as capture:
+        model.ea_layer.reset_kv()
+        past_key_values, past_key_values_data, current_length_data = ea_module.initialize_past_key_values(
+            model.base_model
+        )
+        ea_module.reset_tree_mode(model)
+        input_ids = prepared_full.input_ids.clone()
+        input_len = int(input_ids.shape[1])
+        max_length = input_len + max_new_tokens + 64 - model.ea_layer.total_tokens - 10
+
+        # 1. Target prefill on the FULL context (full video + text).
+        _outputs, orig, hidden_states = model(
+            input_ids,
+            past_key_values=past_key_values,
+            output_orig=True,
+            inputs_embeds=prepared_full.inputs_embeds,
+            position_ids=prepared_full.position_ids,
+        )
+        token = torch.argmax(orig[:, -1], dim=-1, keepdim=True)
+
+        # 2. Draft tree on the COMPACTED context: the kept target hidden states
+        #    and the kept input embeddings.  topK_genrate extends the embedding
+        #    sequence with the first sampled token itself, so the embeddings
+        #    must be aligned with the compacted hidden states (length C).
+        keep_gpu = keep.to(device=hidden_states.device)
+        compact_hidden = hidden_states[:, keep_gpu]
+        draft_input_ids = prepared_draft.input_ids
+        extended_compact_ids = torch.cat((draft_input_ids, token.to(draft_input_ids.device)), dim=1)
+
+        # Rebuild calls from update_inference_inputs pass the *full* growing
+        # input_ids, but the draft's cached KV is the compacted one.  Remap
+        # them to the compacted growing sequence: the initial compacted
+        # context plus the accepted tokens that follow the full context.
+        full_len = int(input_ids.shape[1])
+        original_topk = model.ea_layer.topK_genrate
+
+        def compacted_topk(*args: Any, **kwargs: Any):
+            inputs_embeds = kwargs.get("inputs_embeds", args[4] if len(args) > 4 else None)
+            if inputs_embeds is not None:
+                # First call: the compacted context (with real visual features).
+                return original_topk(*args, **kwargs)
+            ids = kwargs.get("input_ids", args[1] if len(args) > 1 else None)
+            if ids is None:
+                raise ValueError("topK_genrate requires input_ids")
+            compacted_ids = torch.cat((draft_input_ids, ids[:, full_len:]), dim=1)
+            if "input_ids" in kwargs:
+                kwargs["input_ids"] = compacted_ids
+            else:
+                args = list(args)
+                args[1] = compacted_ids
+                args = tuple(args)
+            return original_topk(*args, **kwargs)
+
+        model.ea_layer.topK_genrate = compacted_topk
+        try:
+            draft_tokens, retrieve_indices, tree_mask, tree_position_ids = model.ea_layer.topK_genrate(
+                compact_hidden,
+                extended_compact_ids,
+                model.base_model.lm_head,
+                None,
+                prepared_draft.inputs_embeds,
+            )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            capture["prefill_seconds"] = time.perf_counter() - start
+
+            # 3. Verification loop: identical to msdgenerate, the target KV is
+            #    the full-context cache and grows with the accepted tokens.
+            new_token = 0
+            for _idx in range(max_length):
+                model.base_model.model.tree_mask = tree_mask
+                draft_tokens = draft_tokens.to(input_ids.device)
+                logits, hidden_state_new, _outputs = ea_module.tree_decoding(
+                    model,
+                    draft_tokens,
+                    past_key_values,
+                    tree_position_ids,
+                    input_ids,
+                    retrieve_indices,
+                )
+                draft_tokens = torch.cat(
+                    (draft_tokens, torch.full((1, 1), -1, dtype=torch.long, device=input_ids.device)), dim=1
+                )
+                candidates = draft_tokens[0, retrieve_indices]
+                best_candidate, accept_length, sample_p = ea_module.evaluate_posterior(
+                    logits, candidates, None
+                )
+                (
+                    input_ids,
+                    draft_tokens,
+                    retrieve_indices,
+                    tree_mask,
+                    tree_position_ids,
+                    new_token,
+                    _hidden_state,
+                    _sample_token,
+                ) = ea_module.update_inference_inputs(
+                    input_ids,
+                    candidates,
+                    best_candidate,
+                    accept_length,
+                    retrieve_indices,
+                    None,
+                    new_token,
+                    past_key_values_data,
+                    current_length_data,
+                    model,
+                    hidden_state_new,
+                    sample_p,
+                )
+                if model.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
+                    break
+                if hasattr(model.tokenizer, "eod_id") and model.tokenizer.eod_id in input_ids[0, input_len:].tolist():
+                    break
+                if new_token > max_new_tokens:
+                    break
+                if input_ids.shape[1] > max_length:
+                    break
+        finally:
+            model.ea_layer.topK_genrate = original_topk
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    elapsed = time.perf_counter() - start
+    prefill_seconds = capture["prefill_seconds"]
+    decode_seconds = elapsed - prefill_seconds if prefill_seconds is not None else elapsed
+    decode_seconds = max(0.0, decode_seconds)
+    acceptance_trace = capture["trace"]
+    return input_ids, {
+        "prefill_seconds": prefill_seconds,
+        "decode_seconds": decode_seconds,
+        "speculative_seconds": elapsed,
+        "end_to_end_seconds": elapsed,
+        "acceptance_trace": acceptance_trace,
+        "accepted_prefix_tokens": (sum(acceptance_trace) / len(acceptance_trace)) if acceptance_trace else None,
+        "verification_steps": len(acceptance_trace),
+        "input_fingerprint": prepared_draft.input_fingerprint,
+        "video_token_count": int(prepared_draft.video_positions.numel()),
     }

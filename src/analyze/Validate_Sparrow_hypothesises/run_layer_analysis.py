@@ -221,43 +221,64 @@ def run(args: argparse.Namespace) -> int:
     device = model_device(model)
     rows: list[dict[str, Any]] = []
     for index, (sample, point) in enumerate(jobs, start=1):
-        if point and point.get("candidate_settings"):
-            settings = point["candidate_settings"]
-            fps = float(settings["frames"]) / max(float(sample.duration_sec or 1.0), 1e-3)
-            max_pixels = int(settings["max_pixels"])
-        else:
-            fps = args.fps
-            max_pixels = None
-        print(f"[{index}/{len(jobs)}] {sample.sample_id} target={point.get('target_visual_tokens') if point else 'native'}")
-        batch = process_video(
-            processor,
-            sample.resolved_path(args.dataset_root),
-            sample.question,
-            fps,
-            max_pixels=max_pixels,
-        )
-        batch = move_batch_to_device(batch, device)
-        prepared = prepare_qwen25_prefill(model, batch, device)
-        masks = find_instruction_masks(batch["input_ids"], processor, prepared.video_positions.tolist())
-        target_tokens, timing, _target_output = target_generation(model, batch, args.max_new_tokens)
-        target_text = _decode(processor, target_tokens)
-        if args.experiments in {"figure3", "both"}:
-            rows.extend(_run_figure3(
-                model, processor, batch, sample, args, prepared, point, fps, max_pixels,
-                target_tokens, target_text, masks,
-            ))
-            rows.extend(_run_figure3_attention(
-                model, processor, batch, sample, args, prepared, point, fps, max_pixels, masks,
-            ))
-        if args.experiments in {"figure6", "both"}:
-            rows.extend(_run_figure6(
-                model, processor, batch, sample, args, prepared, point, fps, max_pixels, masks,
-            ))
+        try:
+            if point and point.get("candidate_settings"):
+                settings = point["candidate_settings"]
+                fps = float(settings["frames"]) / max(float(sample.duration_sec or 1.0), 1e-3)
+                max_pixels = int(settings["max_pixels"])
+            else:
+                fps = args.fps
+                # Bound the native path by the explicit pixel budget (see run_msd).
+                max_pixels = args.max_pixels
+            print(f"[{index}/{len(jobs)}] {sample.sample_id} target={point.get('target_visual_tokens') if point else 'native'}")
+            batch = process_video(
+                processor,
+                sample.resolved_path(args.dataset_root),
+                sample.question,
+                fps,
+                max_pixels=max_pixels,
+            )
+            batch = move_batch_to_device(batch, device)
+            prepared = prepare_qwen25_prefill(model, batch, device)
+            masks = find_instruction_masks(batch["input_ids"], processor, prepared.video_positions.tolist())
+            target_tokens, timing, _target_output = target_generation(model, batch, args.max_new_tokens)
+            target_text = _decode(processor, target_tokens)
+            if args.experiments in {"figure3", "both"}:
+                rows.extend(_run_figure3(
+                    model, processor, batch, sample, args, prepared, point, fps, max_pixels,
+                    target_tokens, target_text, masks,
+                ))
+                rows.extend(_run_figure3_attention(
+                    model, processor, batch, sample, args, prepared, point, fps, max_pixels, masks,
+                ))
+            if args.experiments in {"figure6", "both"}:
+                rows.extend(_run_figure6(
+                    model, processor, batch, sample, args, prepared, point, fps, max_pixels, masks,
+                ))
+
+
+
+
+        except Exception as exc:  # noqa: BLE001 - transient video/OOM errors
+            print(f"  ERROR {sample.sample_id}: {exc}", flush=True)
+            rows.append({
+                "row_id": f"{sample.sample_id}:error",
+                "paper_figure": "Figure 1(a)",
+                "sample_id": sample.sample_id,
+                "target_model": args.model,
+                "temperature": 0.0,
+                "target_visual_tokens": point.get("target_visual_tokens") if point else None,
+                "actual_visual_tokens": None,
+                "target_input_fingerprint": "unavailable",
+                "draft_input_fingerprint": "unavailable",
+                "condition": "error",
+                "status": "error",
+                "error": str(exc),
+            })
+            continue
     write_jsonl(args.output, rows)
     print(f"Wrote {len(rows)} layer-analysis rows to {args.output}")
     return 0
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", default="dataset/VideoDetailCaption/subset_manifest.jsonl")
@@ -278,7 +299,5 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="float16")
     parser.add_argument("--quantized", action="store_true")
     return parser
-
-
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(run(build_parser().parse_args()))

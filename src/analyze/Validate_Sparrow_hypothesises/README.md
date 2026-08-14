@@ -139,6 +139,24 @@ python -m src.analyze.Validate_Sparrow_hypothesises attention \
   --output results/sparrow_validation/figure2_attention.jsonl
 ```
 
+The paper attributes attention dilution to the *draft* model, so an additional
+runner probes the official MSD draft's own attention (EAGLE `ea_layer` layers)
+during its full-context prefill — the only draft forward with an empty KV
+cache inside `topK_genrate`:
+
+```bash
+python -m src.analyze.Validate_Sparrow_hypothesises draft_attention \
+  --calibration results/sparrow_validation/calibration.jsonl \
+  --visual-targets 400 3000 \
+  --output results/sparrow_validation/figure2_draft_attention.jsonl
+```
+
+Rows share the Figure 2 schema and are distinguished by `attention_source`
+(`target` vs `msd_draft`); the audit accepts both, and the report renders them
+as separate figures (`figure2_insight_attention.png` vs
+`figure2_insight_attention_draft.png`). `--selection top_attention` in the MSD
+runner consumes either file's last-instruction scores.
+
 ## Figure 3 and Figure 6: layer analyses
 
 `layers` runs Figure 3(a) visual-KV truncation, Figure 3(b) final-instruction
@@ -169,6 +187,18 @@ python -m src.analyze.Validate_Sparrow_hypothesises all \
   --output-dir results/sparrow_validation \
   --quantized
 ```
+
+A single-script wrapper for a GPU host (T4-class) is also provided; it runs
+calibration when missing, then `all` with `--quantized` and
+`--allow-out-of-tolerance` (several short VDC videos cannot reach the 25k
+milestone, so the closest measured point is used and recorded):
+
+```bash
+src/analyze/Validate_Sparrow_hypothesises/run_sparrow_validation_gpu.sh
+```
+
+See `RUN_ON_GPU.md` for the full environment setup and per-insight
+verification criteria.
 
 Use `--limit 1` for a smoke run, or `--skip-msd`, `--skip-attention` and
 `--skip-layers` when validating one stage. The final evidence file is

@@ -140,9 +140,24 @@ def _write_paper_figure1(rows: list[dict[str, Any]], output: Path, plt: Any) -> 
 
 
 def _write_paper_figure2(rows: list[dict[str, Any]], output: Path, plt: Any) -> list[str]:
+    files: list[str] = []
+    for source, suffix in (("target", ""), ("msd_draft", "_draft")):
+        files.extend(_figure2_for_source(rows, output, plt, source, suffix))
+    return files
+
+
+def _figure2_for_source(
+    rows: list[dict[str, Any]],
+    output: Path,
+    plt: Any,
+    source: str,
+    suffix: str,
+) -> list[str]:
     attention_rows = [
         row for row in rows
-        if row.get("paper_figure") == "Figure 2" and row.get("modality") in {"visual", "instruction", "text"}
+        if row.get("paper_figure") == "Figure 2"
+        and row.get("attention_source", "target") == source
+        and row.get("modality") in {"visual", "instruction", "text"}
         and row.get("attention_weight") is not None
     ]
     groups = _group_by_value(attention_rows, _paper_group)
@@ -198,9 +213,10 @@ def _write_paper_figure2(rows: list[dict[str, Any]], output: Path, plt: Any) -> 
         axis.set_title(f"{_token_axis_label(target)} visual tokens")
         axis.grid(alpha=0.2)
         axis.legend(fontsize=8)
-    fig.suptitle("Figure 2. Final-instruction attention distribution", y=1.02, fontsize=12)
+    model_label = "MSD draft" if source == "msd_draft" else "Target"
+    fig.suptitle(f"Figure 2. Final-instruction attention distribution ({model_label})", y=1.02, fontsize=12)
     fig.tight_layout()
-    path = output / "figure2_insight_attention.png"
+    path = output / f"figure2_insight_attention{suffix}.png"
     fig.savefig(path, dpi=220, bbox_inches="tight")
     plt.close(fig)
     files.append(path.name)
@@ -379,23 +395,29 @@ def write_plots(rows: Iterable[dict[str, Any]], output_dir: str | Path) -> list[
         axis.grid(alpha=0.25)
         save(fig, "figure1b_lossless_rate_vs_retention.png")
 
-    attention_rows = [
-        row for row in rows
-        if row.get("paper_figure") == "Figure 2" and row.get("modality") == "visual"
-        and row.get("attention_weight") is not None
-    ]
-    if attention_rows:
-        grouped: dict[float, list[dict[str, Any]]] = defaultdict(list)
-        for row in attention_rows:
-            grouped[float(row["token_position"])].append(row)
-        points = sorted((position, sum(float(row["attention_weight"]) for row in values) / len(values)) for position, values in grouped.items())
-        fig, axis = plt.subplots(figsize=(7.0, 4.2))
-        axis.plot([x for x, _ in points], [y for _, y in points], color="#762a83")
-        axis.set_xlabel("Token position")
-        axis.set_ylabel("Attention weight")
-        axis.set_title("Figure 2 validation: final-instruction visual attention")
-        axis.grid(alpha=0.25)
-        save(fig, "figure2_attention_dilution.png")
+    attention_sources = ("target", "msd_draft")
+    for source in attention_sources:
+        attention_rows = [
+            row for row in rows
+            if row.get("paper_figure") == "Figure 2"
+            and row.get("attention_source", "target") == source
+            and row.get("modality") == "visual"
+            and row.get("attention_weight") is not None
+        ]
+        if attention_rows:
+            grouped: dict[float, list[dict[str, Any]]] = defaultdict(list)
+            for row in attention_rows:
+                grouped[float(row["token_position"])].append(row)
+            points = sorted((position, sum(float(row["attention_weight"]) for row in values) / len(values)) for position, values in grouped.items())
+            fig, axis = plt.subplots(figsize=(7.0, 4.2))
+            axis.plot([x for x, _ in points], [y for _, y in points], color="#762a83")
+            axis.set_xlabel("Token position")
+            axis.set_ylabel("Attention weight")
+            model_label = "MSD draft" if source == "msd_draft" else "target"
+            axis.set_title(f"Figure 2 validation: final-instruction visual attention ({model_label})")
+            axis.grid(alpha=0.25)
+            name = "figure2_draft_attention_dilution.png" if source == "msd_draft" else "figure2_attention_dilution.png"
+            save(fig, name)
 
     layer_attention_rows = [
         row for row in rows

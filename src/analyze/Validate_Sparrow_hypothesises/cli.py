@@ -69,18 +69,61 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
     except Exception as exc:
         raise SystemExit(f"Cannot initialize Qwen2-VL processor: {exc}") from exc
     candidates = candidate_grid()
+    if args.grid_frames or args.grid_pixels:
+        frames = (
+            [int(value) for value in args.grid_frames.split(",")]
+            if args.grid_frames
+            else tuple(candidate.frames for candidate in candidates)
+        )
+        pixels = (
+            [int(value) for value in args.grid_pixels.split(",")]
+            if args.grid_pixels
+            else tuple(candidate.max_pixels for candidate in candidates)
+        )
+        from .calibrate import VideoCandidate
+
+        candidates = [VideoCandidate(int(frames_value), int(pixels_value))
+                      for frames_value in frames for pixels_value in pixels]
+        print(f"Using reduced grid: {len(candidates)} candidates", flush=True)
     rows = []
     for index, sample in enumerate(samples, start=1):
-        print(f"[{index}/{len(samples)}] calibrating {sample.sample_id}")
-        rows.extend(calibrate_sample(
-            sample,
-            args.dataset_root,
-            processor,
-            contract.visual_token_milestones,
-            contract.calibration_tolerance,
-            candidates,
-        ))
-    write_calibration(args.output, rows)
+        print(f"[{index}/{len(samples)}] calibrating {sample.sample_id}", flush=True)
+        try:
+            sample_rows = calibrate_sample(
+                sample,
+                args.dataset_root,
+                processor,
+                contract.visual_token_milestones,
+                contract.calibration_tolerance,
+                candidates,
+            )
+        except Exception as exc:  # pragma: no cover - transient video read failures
+            # A broken/transient video must not abort the whole calibration;
+            # record an explicit error row and continue with the next sample.
+            print(f"  ERROR {sample.sample_id}: {exc}", flush=True)
+            sample_rows = []
+            for target in contract.visual_token_milestones:
+                sample_rows.append({
+                    "row_id": f"{sample.sample_id}:{target}",
+                    "paper_figure": "Figure 1(a)",
+                    "sample_id": sample.sample_id,
+                    "sample_fingerprint": sample.fingerprint(),
+                    "video_path": str(sample.resolved_path(args.dataset_root)),
+                    "question": sample.question,
+                    "reference_answer": sample.answer,
+                    "target_visual_tokens": int(target),
+                    "actual_visual_tokens": None,
+                    "candidate_id": None,
+                    "status": "error",
+                    "relative_error": None,
+                    "source": "processor",
+                    "calibration_status": "error",
+                    "runtime_status": "not_run",
+                    "error": str(exc),
+                })
+        rows.extend(sample_rows)
+        # Write incrementally so a crash never discards completed samples.
+        write_calibration(args.output, rows)
     print(f"Wrote {len(rows)} measured calibration rows: {args.output}")
     return 0
 
@@ -141,6 +184,15 @@ def build_parser() -> argparse.ArgumentParser:
     calibrate.add_argument("--max-pixels", type=int, default=1024 * 28 * 28)
     calibrate.add_argument("--output", default="results/sparrow_validation/calibration.jsonl")
     calibrate.add_argument("--limit", type=int)
+    calibrate.add_argument(
+        "--grid-frames",
+        help="Comma-separated frame counts replacing the default calibration grid "
+        "(e.g. --grid-frames 2,4,8,16,32,64 --grid-pixels 200704,401408 for a fast T4 calibration).",
+    )
+    calibrate.add_argument(
+        "--grid-pixels",
+        help="Comma-separated max_pixels values replacing the default calibration grid.",
+    )
     calibrate.set_defaults(function=_cmd_calibrate)
 
     audit = sub.add_parser("audit")
@@ -157,12 +209,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     values = list(sys.argv[1:] if argv is None else argv)
-    if values and values[0] in {"msd", "attention", "layers", "all"}:
+    if values and values[0] in {"msd", "attention", "layers", "draft_attention", "all"}:
         command = values.pop(0)
         if command == "msd":
             from .run_msd import build_parser as delegated_parser, run as delegated_run
         elif command == "attention":
             from .run_attention import build_parser as delegated_parser, run as delegated_run
+        elif command == "draft_attention":
+            from .run_draft_attention import build_parser as delegated_parser, run as delegated_run
         elif command == "layers":
             from .run_layer_analysis import build_parser as delegated_parser, run as delegated_run
         else:

@@ -219,3 +219,30 @@ def test_retention_compacts_only_the_draft_and_removes_markers_at_zero():
     assert half.video_positions.tolist() == [2]
     assert empty.input_ids.tolist() == [[10, 20]]
     assert empty.video_positions.tolist() == []
+
+
+def test_losslessness_audit_warns_on_late_near_tie():
+    from src.analyze.Validate_Sparrow_hypothesises.audit import audit_losslessness
+
+    rows = [
+        {"row_id": "late", "target_output_ids": [1, 2, 3, 4, 5, 6, 7, 8],
+         "speculative_output_ids": [1, 2, 3, 4, 5, 6, 7, 9]},
+        {"row_id": "early", "target_output_ids": [1, 2, 3, 4],
+         "speculative_output_ids": [1, 9, 3, 4]},
+        {"row_id": "exact", "target_output_ids": [1, 2, 3],
+         "speculative_output_ids": [1, 2, 3]},
+    ]
+    report = audit_losslessness(rows)
+    codes = {(issue.code, issue.severity) for issue in report.issues}
+    assert ("near_tie_divergence", "warning") in codes
+    assert ("lossless_mismatch", "error") in codes
+    # The early divergence still fails the gate; the late one is only a warning.
+    assert not report.valid
+
+
+def test_losslessness_audit_allows_longer_speculative_tail():
+    from src.analyze.Validate_Sparrow_hypothesises.audit import audit_losslessness
+
+    rows = [{"row_id": "tail", "target_output_ids": [1, 2, 3],
+             "speculative_output_ids": [1, 2, 3, 4]}]
+    assert audit_losslessness(rows).valid

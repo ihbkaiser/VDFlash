@@ -52,6 +52,7 @@ def run(args: argparse.Namespace) -> int:
     calibration = output_dir / "calibration.jsonl"
     msd = output_dir / "msd.jsonl"
     attention = output_dir / "figure2_attention.jsonl"
+    draft_attention = output_dir / "figure2_draft_attention.jsonl"
     layers = output_dir / "layer_analysis.jsonl"
     combined = output_dir / "results.jsonl"
     audit = output_dir / "audit.json"
@@ -68,6 +69,8 @@ def run(args: argparse.Namespace) -> int:
         ] + (["--limit", str(args.limit)] if args.limit is not None else []), root)
 
     calibration_arg = [] if args.skip_calibration else ["--calibration", str(calibration)]
+    if args.allow_out_of_tolerance:
+        calibration_arg.append("--allow-out-of-tolerance")
     common = ["--limit", str(args.limit)] if args.limit is not None else []
     model_flags = ["--device-map", args.device_map, "--dtype", args.dtype]
     if args.quantized:
@@ -92,6 +95,15 @@ def run(args: argparse.Namespace) -> int:
             *common,
         ], root)
         produced.append(attention)
+    if not args.skip_draft_attention:
+        _run(base + [
+            "draft_attention",
+            "--output", str(draft_attention),
+            *calibration_arg,
+            "--visual-targets", "400", "3000",
+            *common,
+        ], root)
+        produced.append(draft_attention)
     if not args.skip_layers:
         _run(base + [
             "layers",
@@ -122,10 +134,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="float16")
     parser.add_argument("--quantized", action="store_true")
+    parser.add_argument(
+        "--allow-out-of-tolerance",
+        action="store_true",
+        help="Run calibration points whose measured visual-token count is outside "
+        "the 10 percent tolerance (needed when a video is too short to reach the 25k milestone).",
+    )
     parser.add_argument("--skip-preflight", action="store_true")
     parser.add_argument("--skip-calibration", action="store_true")
     parser.add_argument("--skip-msd", action="store_true")
     parser.add_argument("--skip-attention", action="store_true")
+    parser.add_argument("--skip-draft-attention", action="store_true")
     parser.add_argument("--skip-layers", action="store_true")
     return parser
 
