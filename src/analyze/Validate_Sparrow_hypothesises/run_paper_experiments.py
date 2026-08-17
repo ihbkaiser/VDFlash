@@ -83,6 +83,11 @@ def run(args: argparse.Namespace) -> int:
     model_flags = ["--device-map", args.device_map, "--dtype", args.dtype]
     if args.quantized:
         model_flags.append("--quantized")
+    msd_flags: list[str] = []
+    if args.msd_device_map:
+        msd_flags.extend(["--device-map", args.msd_device_map])
+    if args.msd_max_memory:
+        msd_flags.extend(["--max-memory", args.msd_max_memory])
     produced: list[Path] = []
     if not args.skip_attention:
         _run(base + global_flags + [
@@ -100,7 +105,7 @@ def run(args: argparse.Namespace) -> int:
             "--output", str(draft_attention),
             *calibration_arg,
             "--visual-targets", str(contract.attention_short_tokens), str(contract.attention_long_tokens),
-            *common,
+            *common, *msd_flags,
         ], root)
         produced.append(draft_attention)
     if not args.skip_msd:
@@ -110,7 +115,7 @@ def run(args: argparse.Namespace) -> int:
         _run(base + global_flags + [
             "msd", "--condition", "full", "--output", str(msd_full),
             "--visual-targets", *[str(value) for value in contract.visual_token_milestones],
-            *calibration_arg, *common,
+            *calibration_arg, *common, *msd_flags,
         ], root)
         produced.append(msd_full)
         _run(base + global_flags + [
@@ -118,7 +123,7 @@ def run(args: argparse.Namespace) -> int:
             "--selection", "uniform", "--retention-percentages", "0",
             "--output", str(msd_remove_all), "--visual-targets",
             *[str(value) for value in contract.visual_token_milestones],
-            *calibration_arg, *common,
+            *calibration_arg, *common, *msd_flags,
         ], root)
         produced.append(msd_remove_all)
         if args.skip_draft_attention:
@@ -130,7 +135,7 @@ def run(args: argparse.Namespace) -> int:
                     "--selection-scores", str(draft_attention),
                     "--retention-percentages", *[str(value) for value in contract.retention_percentages],
                     "--visual-targets", str(contract.retention_anchor_visual_tokens),
-                    "--output", str(destination), *calibration_arg, *common,
+                    "--output", str(destination), *calibration_arg, *common, *msd_flags,
                 ], root)
                 produced.append(destination)
     if not args.skip_layers:
@@ -162,6 +167,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--layer-experiments", choices=("figure3", "figure6", "both"), default="both")
     parser.add_argument("--layer-visual-targets", type=int, nargs="+", default=[3000])
     parser.add_argument("--device-map", default="auto")
+    parser.add_argument(
+        "--msd-device-map",
+        choices=("cuda", "auto", "model_parallel"),
+        default=None,
+        help="Optional device map for MSD stages; use model_parallel on the 3090+A4000 pair.",
+    )
+    parser.add_argument(
+        "--msd-max-memory",
+        help="Per-device budgets passed to MSD, for example 0:22GiB,1:14GiB.",
+    )
     parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="float16")
     parser.add_argument("--quantized", action="store_true")
     parser.add_argument(

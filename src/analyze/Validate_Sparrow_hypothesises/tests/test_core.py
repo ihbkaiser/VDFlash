@@ -81,12 +81,23 @@ def test_paper_statistics_report_n_mean_and_bootstrap_interval():
             "instruction_mass": 0.1,
             "visual_entropy": 0.8,
         },
+        {
+            "paper_figure": "Figure 3",
+            "sample_id": "a",
+            "layer_cut": 20,
+            "prefix_agreement": 1.0,
+            "rouge_l": 1.0,
+            "native_answer_rouge_l": 0.9,
+            "ablated_answer_rouge_l": 0.9,
+            "answer_quality_delta": 0.0,
+        },
     ]
     statistics = build_paper_statistics(rows, replicates=200, seed=7)
     assert statistics["figure1a"][0]["visual_tokens"] == 400
     assert statistics["figure1a"][0]["accepted_prefix_tokens"]["n"] == 2
     assert statistics["figure2"][0]["visual_tokens"] == 400
     assert statistics["figure2"][0]["visual_mass"]["mean"] == 0.4
+    assert statistics["figure3a"][0]["answer_quality_delta"]["mean"] == 0.0
 
 
 def _valid_row(**overrides):
@@ -158,6 +169,9 @@ def test_analysis_rows_require_their_provenance_and_use_contract_models():
         target_model=DEFAULT_CONTRACT.layer_target_model,
         visual_kv_masked_from=20,
         layer_cut=20,
+        native_answer_rouge_l=0.8,
+        ablated_answer_rouge_l=0.79,
+        answer_quality_delta=-0.01,
     )
     retention = _valid_row(
         row_id="sample:cosine",
@@ -182,6 +196,35 @@ def test_paper_audit_rejects_wrong_attention_query_and_missing_layer_mask():
     codes = {issue.code for issue in report.issues}
     assert "wrong_attention_query" in codes
     assert "missing_layer_intervention" in codes
+
+
+def test_layer_audit_requires_vdc_answer_quality_metrics():
+    row = _valid_row(
+        row_id="sample:layer-quality",
+        paper_figure="Figure 3",
+        target_model=DEFAULT_CONTRACT.layer_target_model,
+        visual_kv_masked_from=20,
+        layer_cut=20,
+    )
+    report = audit_rows([row], DEFAULT_CONTRACT)
+    assert not report.valid
+    assert any(issue.code == "missing_answer_quality" for issue in report.issues)
+
+
+def test_layer_audit_rejects_out_of_range_vdc_answer_quality_metrics():
+    row = _valid_row(
+        row_id="sample:layer-quality-range",
+        paper_figure="Figure 3",
+        target_model=DEFAULT_CONTRACT.layer_target_model,
+        visual_kv_masked_from=20,
+        layer_cut=20,
+        native_answer_rouge_l=1.2,
+        ablated_answer_rouge_l=0.8,
+        answer_quality_delta=-0.4,
+    )
+    report = audit_rows([row], DEFAULT_CONTRACT)
+    assert not report.valid
+    assert any(issue.code == "invalid_answer_quality" for issue in report.issues)
 
 
 def test_losslessness_audit_compares_token_ids_not_text():

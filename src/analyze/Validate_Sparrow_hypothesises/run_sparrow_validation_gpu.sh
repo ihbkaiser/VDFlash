@@ -25,6 +25,8 @@ LOG_PATH="${LOG_PATH:-$OUTPUT_DIR/gpu_run.log}"
 # Strict local evidence defaults to calibrated points only.  Set
 # ALLOW_OUT_OF_TOLERANCE=1 explicitly for a separately-labelled diagnostic.
 ALLOW_OUT_OF_TOLERANCE="${ALLOW_OUT_OF_TOLERANCE:-0}"
+MSD_DEVICE_MAP="${MSD_DEVICE_MAP:-}"
+MSD_MAX_MEMORY="${MSD_MAX_MEMORY:-}"
 EXTRA_ARGS=("$@")
 
 mkdir -p "$OUTPUT_DIR"
@@ -55,10 +57,18 @@ ALLOW_FLAG=()
 if [[ "$ALLOW_OUT_OF_TOLERANCE" == "1" ]]; then
     ALLOW_FLAG+=(--allow-out-of-tolerance)
 fi
+MSD_FLAGS=()
+if [[ -n "$MSD_DEVICE_MAP" ]]; then
+    MSD_FLAGS+=(--msd-device-map "$MSD_DEVICE_MAP")
+fi
+if [[ -n "$MSD_MAX_MEMORY" ]]; then
+    MSD_FLAGS+=(--msd-max-memory "$MSD_MAX_MEMORY")
+fi
 
 python -u -m src.analyze.Validate_Sparrow_hypothesises all \
     --output-dir "$OUTPUT_DIR" \
     --quantized \
+    "${MSD_FLAGS[@]}" \
     "${ALLOW_FLAG[@]}" \
     "${EXTRA_ARGS[@]}"
 

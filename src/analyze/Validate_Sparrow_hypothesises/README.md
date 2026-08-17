@@ -1,10 +1,12 @@
 # Validate Sparrow hypotheses
 
-This directory contains the paper-conformance harness for the insight
+This directory contains a local MSD-based verification harness for the insight
 experiments in `externals/Sparrow/2026.acl-long.450.pdf`.
 
 The harness uses the local duration-representative 50-sample
-`VideoDetailCaption` subset. It does not download or commit model weights.
+`VideoDetailCaption` subset. It verifies MSD mechanisms and trends; it is not
+intended to reproduce the paper's ViSpec baseline, benchmark mix, or hardware
+specific absolute numbers. It does not download or commit model weights.
 The official MSD/Qwen2-VL and Qwen2.5-VL checkpoints are selected in the
 contract; actual inference requires a Python 3.10 CUDA environment.
 
@@ -106,6 +108,10 @@ src/analyze/Validate_Sparrow_hypothesises/run_msd_2gpu.sh \
 Use `--limit 2` for a smoke test so each GPU receives one video. The launcher
 calibrates once, starts both workers, merges `msd_gpu*.jsonl`, and writes the
 combined audit and report. Use `--dry-run` to inspect the generated commands.
+For the Figure 1(a) `Remove All` series, pass
+`--length-series remove_all --retention-percentages 0` together with
+`--condition both`; this labels the zero-retention rows as Figure 1(a) while
+keeping the target input unchanged.
 
 ### Memory-aware runner for 3090 + A4000
 
@@ -148,6 +154,14 @@ src/analyze/Validate_Sparrow_hypothesises/run_msd_model_parallel_2gpu.sh \
   --output results/sparrow_validation_model_parallel_2gpu/msd.jsonl
 ```
 
+To run the Figure 1(a) keep/remove-all pair at the long milestones, add
+`--length-series remove_all --retention-percentages 0`. The full run then
+emits `msd_keep_visual` and `msd_remove_all` rows without mixing the
+zero-retention condition into Figure 1(b). If a video has no point within the
+10% calibration tolerance, strict mode skips it; use
+`--allow-out-of-tolerance` only for a separately labelled nearest-point
+diagnostic.
+
 This path uses explicit layer placement, chunks video vision frames, avoids
 full-sequence vocabulary logits, and allocates MSD KV cache to the actual
 context length. It was validated on `v_SEVVSei-r6w` at 25,168 visual tokens:
@@ -187,7 +201,7 @@ The report renderer produces paper-shaped outputs from measured rows:
 
 - `figure1_insight_summary.{png,pdf,svg}`: two-panel local Figure 1 analogue with MSD keep/remove-all length series and attention-guided retention curves.
 - `figure2_insight_attention.{png,pdf,svg}`: exactly the short/long MSD-draft panels with disjoint Instruction/Visual/Text regions.
-- `figure3_insight_layer_analysis.{png,pdf,svg}`: local prefix-agreement proxy beside an aggregated, head-sorted layer heatmap.
+- `figure3_insight_layer_analysis.{png,pdf,svg}`: local output-agreement and VDC answer-quality proxy beside an aggregated, head-sorted layer heatmap.
 - `figure6_insight_retention.{png,pdf,svg}`: visual/text hidden-state retention curves with the middle-layer marker.
 - `paper_statistics.json` and `figure*_statistics.csv`: per-condition N, mean, spread, and deterministic bootstrap 95% intervals.
 
@@ -250,9 +264,12 @@ python -m src.analyze.Validate_Sparrow_hypothesises layers \
 ```
 
 Figure 3(a) masks visual KV columns from each requested layer onward and
-compares greedy output IDs, prefix agreement and ROUGE-L with the native
-target. Figure 6 computes cosine similarity to the fused input embedding per
-layer without retaining all hidden-state tensors in memory.
+compares greedy output IDs, prefix agreement, output ROUGE-L, and VDC answer
+quality (ROUGE-L against the dataset answer) with the native target. The
+answer-quality delta is a local task-quality proxy; it is not the paper's
+original benchmark accuracy. Figure 6 computes cosine similarity to the fused
+input embedding per layer without retaining all hidden-state tensors in
+memory.
 
 ## Complete orchestration
 

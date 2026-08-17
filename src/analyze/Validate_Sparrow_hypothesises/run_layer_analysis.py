@@ -117,6 +117,11 @@ def _run_figure3(
             "prefix_agreement": common / max(1, len(target_tokens)),
             "target_text": target_text,
             "speculative_text": candidate_text,
+            "reference_answer": sample.answer,
+            "native_answer_rouge_l": rouge_l(sample.answer, target_text),
+            "ablated_answer_rouge_l": rouge_l(sample.answer, candidate_text),
+            "answer_quality_delta": rouge_l(sample.answer, candidate_text)
+            - rouge_l(sample.answer, target_text),
             "rouge_l": rouge_l(target_text, candidate_text),
             "condition": "layer_visual_kv_ablation",
         })

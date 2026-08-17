@@ -184,6 +184,7 @@ def build_coverage(rows: Iterable[Mapping[str, Any]], contract: PaperContract) -
                 and row.get("layer_cut") is not None
                 and int(row.get("layer_cut")) == cut
                 and row.get("prefix_agreement") is not None
+                and row.get("answer_quality_delta") is not None
             ),
             figure="Figure 3",
         )

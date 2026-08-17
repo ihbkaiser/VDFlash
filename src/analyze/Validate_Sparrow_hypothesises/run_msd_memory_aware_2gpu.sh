@@ -18,11 +18,13 @@ OUTPUT_DIR="results/sparrow_validation_memory_aware_2gpu"
 CALIBRATION=""
 LIMIT=""
 CONDITION="both"
+LENGTH_SERIES="keep_visual"
+RETENTION_PERCENTAGES=""
 VISUAL_TARGETS="400,3000,13000,25000"
 A4000_MAX_VISUAL_TOKENS="${A4000_MAX_VISUAL_TOKENS:-5500}"
 STRONG_MAX_VISUAL_TOKENS="${STRONG_MAX_VISUAL_TOKENS:-11000}"
 STRONG_GPU_SPEED_WEIGHT="${STRONG_GPU_SPEED_WEIGHT:-1.6}"
-ALLOW_OUT_OF_TOLERANCE=1
+ALLOW_OUT_OF_TOLERANCE=0
 SKIP_CALIBRATION=0
 DRY_RUN=0
 
@@ -43,11 +45,14 @@ Options:
   --calibration PATH         existing measured calibration JSONL
   --limit N                  use the first N samples
   --condition full|retention|both
+  --length-series keep_visual|remove_all
+  --retention-percentages LIST comma-separated retention values
   --visual-targets LIST      comma-separated targets, e.g. 400,3000,13000,25000
   --a4000-max-visual-tokens N maximum measured tokens allowed on GPU 2 (default: 5500)
   --strong-max-visual-tokens N maximum measured tokens allowed on GPU 1 (default: 11000)
   --strong-gpu-speed-weight X estimated 3090/A4000 throughput ratio (default: 1.6)
   --skip-calibration         require --calibration to already exist
+  --allow-out-of-tolerance   run measured points outside the 10% calibration tolerance
   --no-allow-out-of-tolerance
   --dry-run                  require calibration, print assignments, do not run models
 EOF
@@ -62,10 +67,13 @@ while [[ $# -gt 0 ]]; do
         --calibration) CALIBRATION="$2"; shift 2 ;;
         --limit) LIMIT="$2"; shift 2 ;;
         --condition) CONDITION="$2"; shift 2 ;;
+        --length-series) LENGTH_SERIES="$2"; shift 2 ;;
+        --retention-percentages) RETENTION_PERCENTAGES="$2"; shift 2 ;;
         --visual-targets) VISUAL_TARGETS="$2"; shift 2 ;;
         --a4000-max-visual-tokens) A4000_MAX_VISUAL_TOKENS="$2"; shift 2 ;;
         --strong-max-visual-tokens) STRONG_MAX_VISUAL_TOKENS="$2"; shift 2 ;;
         --strong-gpu-speed-weight) STRONG_GPU_SPEED_WEIGHT="$2"; shift 2 ;;
+        --allow-out-of-tolerance) ALLOW_OUT_OF_TOLERANCE=1; shift ;;
         --skip-calibration) SKIP_CALIBRATION=1; shift ;;
         --no-allow-out-of-tolerance) ALLOW_OUT_OF_TOLERANCE=0; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
@@ -81,6 +89,10 @@ if [[ "${#GPU_IDS[@]}" -ne 2 || -z "${GPU_IDS[0]}" || -z "${GPU_IDS[1]}" || "${G
 fi
 if [[ "$CONDITION" != "full" && "$CONDITION" != "retention" && "$CONDITION" != "both" ]]; then
     echo "--condition must be full, retention, or both" >&2
+    exit 2
+fi
+if [[ "$LENGTH_SERIES" != "keep_visual" && "$LENGTH_SERIES" != "remove_all" ]]; then
+    echo "--length-series must be keep_visual or remove_all" >&2
     exit 2
 fi
 [[ -f "$MANIFEST" ]] || { echo "Manifest not found: $MANIFEST" >&2; exit 1; }
@@ -200,7 +212,12 @@ COMMON_ARGS=(
     --calibration "$CALIBRATION"
     --visual-targets "${TARGET_ARGS[@]}"
     --condition "$CONDITION"
+    --length-series "$LENGTH_SERIES"
 )
+if [[ -n "$RETENTION_PERCENTAGES" ]]; then
+    IFS=',' read -r -a RETENTION_VALUES <<< "$RETENTION_PERCENTAGES"
+    COMMON_ARGS+=(--retention-percentages "${RETENTION_VALUES[@]}")
+fi
 [[ "$ALLOW_OUT_OF_TOLERANCE" == "1" ]] && COMMON_ARGS+=(--allow-out-of-tolerance)
 
 OUTPUT_STRONG="$OUTPUT_DIR/msd_gpu${GPU_IDS[0]}.jsonl"

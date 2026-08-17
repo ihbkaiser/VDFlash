@@ -26,8 +26,10 @@ OUTPUT_DIR="results/sparrow_validation_2gpu"
 CALIBRATION=""
 LIMIT=""
 CONDITION="both"
+LENGTH_SERIES="keep_visual"
+RETENTION_PERCENTAGES=""
 VISUAL_TARGETS="400,3000,13000,25000"
-ALLOW_OUT_OF_TOLERANCE=1
+ALLOW_OUT_OF_TOLERANCE=0
 SKIP_CALIBRATION=0
 DRY_RUN=0
 
@@ -46,7 +48,10 @@ Options:
   --calibration PATH         existing calibration JSONL
   --limit N                  use the first N samples (minimum 2 for two GPUs)
   --condition full|retention|both
+  --length-series keep_visual|remove_all
+  --retention-percentages LIST comma-separated retention values
   --visual-targets LIST      comma-separated targets, e.g. 400,3000
+  --allow-out-of-tolerance   run measured points outside the 10% calibration tolerance
   --skip-calibration         require --calibration to already exist
   --no-allow-out-of-tolerance
   --dry-run                  print worker commands without running models
@@ -62,7 +67,10 @@ while [[ $# -gt 0 ]]; do
         --calibration) CALIBRATION="$2"; shift 2 ;;
         --limit) LIMIT="$2"; shift 2 ;;
         --condition) CONDITION="$2"; shift 2 ;;
+        --length-series) LENGTH_SERIES="$2"; shift 2 ;;
+        --retention-percentages) RETENTION_PERCENTAGES="$2"; shift 2 ;;
         --visual-targets) VISUAL_TARGETS="$2"; shift 2 ;;
+        --allow-out-of-tolerance) ALLOW_OUT_OF_TOLERANCE=1; shift ;;
         --skip-calibration) SKIP_CALIBRATION=1; shift ;;
         --no-allow-out-of-tolerance) ALLOW_OUT_OF_TOLERANCE=0; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
@@ -80,6 +88,10 @@ if [[ "$CONDITION" != "full" && "$CONDITION" != "retention" && "$CONDITION" != "
     echo "--condition must be full, retention, or both" >&2
     exit 2
 fi
+if [[ "$LENGTH_SERIES" != "keep_visual" && "$LENGTH_SERIES" != "remove_all" ]]; then
+    echo "--length-series must be keep_visual or remove_all" >&2
+    exit 2
+fi
 if [[ ! -f "$MANIFEST" ]]; then
     echo "Manifest not found: $MANIFEST" >&2
     exit 1
@@ -93,7 +105,7 @@ fi
 MANIFEST_GPU0="$OUTPUT_DIR/manifest_gpu${GPU_IDS[0]}.jsonl"
 MANIFEST_GPU1="$OUTPUT_DIR/manifest_gpu${GPU_IDS[1]}.jsonl"
 
-python - "$MANIFEST" "$MANIFEST_GPU0" "$MANIFEST_GPU1" "$LIMIT" <<'PY'
+"$PYTHON" - "$MANIFEST" "$MANIFEST_GPU0" "$MANIFEST_GPU1" "$LIMIT" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -145,7 +157,12 @@ COMMON_ARGS=(
     --calibration "$CALIBRATION"
     --visual-targets "${TARGET_ARGS[@]}"
     --condition "$CONDITION"
+    --length-series "$LENGTH_SERIES"
 )
+if [[ -n "$RETENTION_PERCENTAGES" ]]; then
+    IFS=',' read -r -a RETENTION_VALUES <<< "$RETENTION_PERCENTAGES"
+    COMMON_ARGS+=(--retention-percentages "${RETENTION_VALUES[@]}")
+fi
 if [[ "$ALLOW_OUT_OF_TOLERANCE" == "1" ]]; then
     COMMON_ARGS+=(--allow-out-of-tolerance)
 fi

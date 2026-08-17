@@ -16,9 +16,12 @@ OUTPUT="results/sparrow_validation_model_parallel_2gpu/msd.jsonl"
 CALIBRATION=""
 LIMIT=""
 CONDITION="both"
+LENGTH_SERIES="keep_visual"
+RETENTION_PERCENTAGES=""
 VISUAL_TARGETS="400,3000,13000,25000"
 MAX_NEW_TOKENS="512"
 MAX_MEMORY="0:22GiB,1:14GiB"
+ALLOW_OUT_OF_TOLERANCE=0
 DRY_RUN=0
 
 usage() {
@@ -37,9 +40,13 @@ Options:
   --calibration PATH         existing measured calibration JSONL
   --limit N                  use the first N samples
   --condition full|retention|both
+  --length-series keep_visual|remove_all
+  --retention-percentages LIST comma-separated retention values
   --visual-targets LIST      comma-separated targets
   --max-new-tokens N         generation length (default: 512)
   --max-memory SPEC          per-visible-GPU budget (default: 0:22GiB,1:14GiB)
+  --allow-out-of-tolerance   run nearest measured points outside 10% tolerance
+  --no-allow-out-of-tolerance
   --dry-run                  print the command without running
 EOF
 }
@@ -53,9 +60,13 @@ while [[ $# -gt 0 ]]; do
         --calibration) CALIBRATION="$2"; shift 2 ;;
         --limit) LIMIT="$2"; shift 2 ;;
         --condition) CONDITION="$2"; shift 2 ;;
+        --length-series) LENGTH_SERIES="$2"; shift 2 ;;
+        --retention-percentages) RETENTION_PERCENTAGES="$2"; shift 2 ;;
         --visual-targets) VISUAL_TARGETS="$2"; shift 2 ;;
         --max-new-tokens) MAX_NEW_TOKENS="$2"; shift 2 ;;
         --max-memory) MAX_MEMORY="$2"; shift 2 ;;
+        --allow-out-of-tolerance) ALLOW_OUT_OF_TOLERANCE=1; shift ;;
+        --no-allow-out-of-tolerance) ALLOW_OUT_OF_TOLERANCE=0; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -65,6 +76,10 @@ done
 IFS=',' read -r -a GPU_IDS <<< "$GPUS"
 if [[ "${#GPU_IDS[@]}" -ne 2 || "${GPU_IDS[0]}" == "${GPU_IDS[1]}" ]]; then
     echo "--gpus must contain two different IDs, for example --gpus 0,1" >&2
+    exit 2
+fi
+if [[ "$LENGTH_SERIES" != "keep_visual" && "$LENGTH_SERIES" != "remove_all" ]]; then
+    echo "--length-series must be keep_visual or remove_all" >&2
     exit 2
 fi
 [[ -f "$MANIFEST" ]] || { echo "Manifest not found: $MANIFEST" >&2; exit 1; }
@@ -94,11 +109,19 @@ CMD=("$PYTHON" -u -m src.analyze.Validate_Sparrow_hypothesises msd
     --calibration "$CALIBRATION"
     --visual-targets "${TARGET_ARGS[@]}"
     --condition "$CONDITION"
+    --length-series "$LENGTH_SERIES"
     --max-new-tokens "$MAX_NEW_TOKENS"
     --device-map model_parallel
     --max-memory "$MAX_MEMORY"
     --output "$OUTPUT"
     "${LIMIT_ARGS[@]}")
+if [[ -n "$RETENTION_PERCENTAGES" ]]; then
+    IFS=',' read -r -a RETENTION_VALUES <<< "$RETENTION_PERCENTAGES"
+    CMD+=(--retention-percentages "${RETENTION_VALUES[@]}")
+fi
+if [[ "$ALLOW_OUT_OF_TOLERANCE" == "1" ]]; then
+    CMD+=(--allow-out-of-tolerance)
+fi
 
 echo "CUDA_VISIBLE_DEVICES=${GPU_IDS[*]} MSD_VISION_CHUNK_FRAMES=${MSD_VISION_CHUNK_FRAMES:-8}"
 echo "MSD_MODEL_PARALLEL_PREFIX_LAYERS=${MSD_MODEL_PARALLEL_PREFIX_LAYERS:-3}"

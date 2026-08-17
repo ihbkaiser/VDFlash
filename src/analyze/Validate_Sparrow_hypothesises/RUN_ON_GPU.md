@@ -13,7 +13,7 @@ Speculative Decoding in Video LLMs* (ACL 2026) bằng **MSD**
 | I1 | Fig 1(a): accepted length suy giảm khi visual tokens tăng (0.4k→25k) | `msd --condition full` | MSD-Qwen2VL-7B (4-bit) | accepted length, decode/e2e speedup |
 | I2 | Fig 1(b): negative visual gain — prune draft visual input (100→0%) làm accepted length tăng | `msd --condition retention` | MSD-Qwen2VL-7B | accepted length, lossless rate |
 | I3 | Fig 2: attention dilution trong draft model | `attention` (target proxy) + **`draft_attention`** (MSD draft thật) | Qwen2-VL-7B / MSD draft | instruction/visual/text attention mass, visual entropy |
-| I4 | Fig 3(a): visual KV indispensable ở layer đầu, robust sau layer ~20 | `layers` figure3 | Qwen2.5-VL-7B | prefix agreement, ROUGE-L theo layer cut |
+| I4 | Fig 3(a): visual KV indispensable ở layer đầu, robust sau layer ~20 | `layers` figure3 | Qwen2.5-VL-7B | prefix agreement, output ROUGE-L, VDC answer-quality delta theo layer cut |
 | I5 | Fig 3(b): middle layers là arena chính của visual-text interaction | `layers` figure3_attention | Qwen2.5-VL-7B | per-layer/per-head visual mass |
 | I6 | Fig 6/App D: visual semantics internalize — visual cosine < 0.25 gần layer 20 | `layers` figure6 | Qwen2.5-VL-7B | layerwise visual/text cosine |
 
@@ -64,6 +64,15 @@ phải nằm cạnh repo (đã có sẵn trong repo này).
 ### Cách 1 — Một lệnh duy nhất (khuyên dùng)
 
 ```bash
+src/analyze/Validate_Sparrow_hypothesises/run_sparrow_validation_gpu.sh
+```
+
+Trên cặp RTX 3090 + RTX A4000, để MSD và `draft_attention` dùng cùng placement
+model-parallel, chạy:
+
+```bash
+MSD_DEVICE_MAP=model_parallel \
+MSD_MAX_MEMORY=0:22GiB,1:14GiB \
 src/analyze/Validate_Sparrow_hypothesises/run_sparrow_validation_gpu.sh
 ```
 
@@ -144,15 +153,15 @@ có thể dùng: `v_AwgGYaV1lT0` (3k tokens ok, 25k không đạt — dùng
 
 ## 5. Đọc kết quả — tiêu chí kiểm chứng định tính
 
-So với số paper (Table 4/Fig 1/2/3/6) — máy T4 + 4-bit không cần khớp số tuyệt
-đối, chỉ cần khớp **xu hướng**:
+So với số paper (Table 4/Fig 1/2/3/6) — máy 3090+A4000 + 4-bit không cần khớp
+số tuyệt đối, chỉ cần khớp **xu hướng** trên cùng cohort VDC local:
 
 | Insight | Paper nói | Kiểm chứng đạt khi |
 |---|---|---|
 | I1 | MSD accepted length 4.12@0.5k → 1.04@25k; latency tăng | accepted length giảm dần theo milestone; decode latency tăng |
 | I2 | accepted length tăng khi retention giảm; 0% không tệ hơn 100% | accepted length(0%) ≥ accepted length(100%); lossless rate ổn định |
 | I3 | attention bị phân tán ở context dài | visual entropy/mass cao hơn ở 3k so với 0.4k (draft rows là bằng chứng chính) |
-| I4 | cắt visual KV từ layer ≥ 20 không đổi output | prefix agreement/ROUGE-L giữ ~1.0 khi layer_cut ≥ 20 |
+| I4 | cắt visual KV từ layer ≥ 20 không đổi output và chất lượng | prefix agreement giữ ~1.0; VDC answer-quality delta gần 0 khi layer_cut ≥ 20 |
 | I6 | visual cosine tụt < 0.25 quanh layer 20, text gần phẳng | visual_cosine < 0.25 gần layer 20; text_cosine cao hơn rõ |
 
 Report tự phân biệt *paper-conformance* (audit fail-closed) với *numerical

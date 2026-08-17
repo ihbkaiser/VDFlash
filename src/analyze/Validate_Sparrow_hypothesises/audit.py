@@ -73,6 +73,26 @@ def audit_rows(rows: Iterable[Mapping[str, Any]], contract: PaperContract) -> Au
             _add(issues, "error", "wrong_attention_query", "attention probe has no supported paper query policy", row_id)
         if figure == "Figure 3" and row.get("visual_kv_masked_from") is None:
             _add(issues, "error", "missing_layer_intervention", "layer probe has no visual KV metadata", row_id)
+        if figure == "Figure 3":
+            for field in (
+                "native_answer_rouge_l",
+                "ablated_answer_rouge_l",
+                "answer_quality_delta",
+            ):
+                if row.get(field) is None:
+                    _add(issues, "error", "missing_answer_quality", f"missing {field}", row_id)
+            native_quality = row.get("native_answer_rouge_l")
+            ablated_quality = row.get("ablated_answer_rouge_l")
+            quality_delta = row.get("answer_quality_delta")
+            if all(value is not None for value in (native_quality, ablated_quality, quality_delta)):
+                try:
+                    scores = (float(native_quality), float(ablated_quality), float(quality_delta))
+                except (TypeError, ValueError):
+                    scores = ()
+                if len(scores) != 3 or not all(math.isfinite(value) for value in scores):
+                    _add(issues, "error", "invalid_answer_quality", "answer quality metrics must be finite numbers", row_id)
+                elif not all(0.0 <= value <= 1.0 for value in scores[:2]) or not -1.0 <= scores[2] <= 1.0:
+                    _add(issues, "error", "invalid_answer_quality", "answer ROUGE-L metrics must be in [0, 1] and delta in [-1, 1]", row_id)
         if figure in {"Figure 2", "Figure 3(b)"}:
             instruction = set(int(value) for value in row.get("instruction_positions", []))
             visual = set(int(value) for value in row.get("visual_positions", []))

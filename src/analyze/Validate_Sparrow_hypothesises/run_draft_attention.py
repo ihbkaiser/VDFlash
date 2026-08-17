@@ -238,7 +238,12 @@ def run(args: argparse.Namespace) -> int:
     ))
     jobs = _calibration_jobs(samples, args.calibration, targets, args.allow_out_of_tolerance)
     processor = build_qwen2vl_video_processor(args.base_model, args.min_pixels, args.max_pixels)
-    model = load_msd_qwen2vl(args.base_model, args.msd_model)
+    model = load_msd_qwen2vl(
+        args.base_model,
+        args.msd_model,
+        device_map=args.device_map,
+        max_memory=args.max_memory,
+    )
     device = model_device(model.base_model)
     rows: list[dict[str, Any]] = []
     for index, (sample, point) in enumerate(jobs, start=1):
@@ -322,6 +327,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--calibration")
     parser.add_argument("--visual-targets", type=int, nargs="+")
     parser.add_argument("--allow-out-of-tolerance", action="store_true")
+    parser.add_argument(
+        "--device-map",
+        choices=("cuda", "auto", "model_parallel"),
+        default="cuda",
+        help="MSD draft placement; use model_parallel on the 3090+A4000 pair.",
+    )
+    parser.add_argument(
+        "--max-memory",
+        help="Per-device budgets for sharded placement, for example 0:22GiB,1:14GiB.",
+    )
     parser.add_argument("--fps", type=float, default=8.0)
     parser.add_argument("--min-pixels", type=int, default=256 * 28 * 28)
     parser.add_argument("--max-pixels", type=int, default=1024 * 28 * 28)

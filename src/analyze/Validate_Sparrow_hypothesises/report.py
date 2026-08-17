@@ -89,7 +89,8 @@ def write_report(output_dir: str | Path, report: dict[str, Any]) -> None:
         f"**Validity gate:** `{str(report['valid']).upper()}`",
         "",
         "This report distinguishes paper-conformance from numerical reproduction. "
-        "The local run uses the VDC-50 subset and may use T4/4-bit inference.",
+        "The local run uses the VDC-50 subset and may use 4-bit inference on a "
+        "3090+A4000 model-parallel setup.",
         "",
         "## Paper traceability",
         "",

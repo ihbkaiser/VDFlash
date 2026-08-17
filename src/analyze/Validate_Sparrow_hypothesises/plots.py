@@ -96,10 +96,32 @@ def _write_paper_figure1(rows: list[dict[str, Any]], output: Path, plt: Any, for
             row.get("draft_tree_prefill_seconds") if row.get("draft_tree_prefill_seconds") is not None else row.get("prefill_seconds")
             for row in keep_groups.get(value, [])
         ]) for value in x]
+        remove_groups = series_groups.get("msd_remove_all", {})
+        remove_latency = [summarize([
+            row.get("draft_tree_prefill_seconds") if row.get("draft_tree_prefill_seconds") is not None else row.get("prefill_seconds")
+            for row in remove_groups.get(value, [])
+        ]) for value in x]
         axis = axes[0]
         twin = axis.twinx()
         positions = list(range(len(x)))
-        bars = twin.bar(positions, [float(stat["mean"] or 0.0) * 1000 for stat in latency], width=0.58, color="#f4a582", alpha=0.75, label="MSD draft/decode time")
+        keep_bars = twin.bar(
+            [position - 0.16 for position in positions],
+            [float(stat["mean"] or 0.0) * 1000 for stat in latency],
+            width=0.30,
+            color="#f4a582",
+            alpha=0.80,
+            label="Keep Visual draft prefill",
+        )
+        remove_bars = None
+        if remove_groups:
+            remove_bars = twin.bar(
+                [position + 0.16 for position in positions],
+                [float(stat["mean"] or 0.0) * 1000 for stat in remove_latency],
+                width=0.30,
+                color="#d6604d",
+                alpha=0.80,
+                label="Remove All draft prefill",
+            )
         line = axis.plot(
             positions,
             [float(stat["mean"]) if stat["mean"] is not None else float("nan") for stat in accepted],
@@ -121,7 +143,12 @@ def _write_paper_figure1(rows: list[dict[str, Any]], output: Path, plt: Any, for
         twin.set_ylabel("Draft tree prefill (ms)", color="#b2182b")
         axis.set_title("(a) MSD visual-length sweep (VDC-50 local)")
         axis.grid(axis="y", alpha=0.22)
-        axis.legend([line[0], remove_line[0], bars], ["MSD keep visual", "MSD remove all visual", "Draft tree prefill"], loc="best", fontsize=8)
+        handles = [line[0], remove_line[0], keep_bars]
+        labels = ["MSD keep visual", "MSD remove all visual", "Keep Visual draft prefill"]
+        if remove_bars is not None:
+            handles.append(remove_bars)
+            labels.append("Remove All draft prefill")
+        axis.legend(handles, labels, loc="best", fontsize=8)
     else:
         _empty_panel(axes[0], "No measured Figure 1(a) rows")
     if retention_groups:
@@ -264,14 +291,28 @@ def _write_paper_figure3(rows: list[dict[str, Any]], output: Path, plt: Any, for
         cuts = sorted(grouped)
         stats = [summarize([row.get("prefix_agreement") for row in grouped[cut]]) for cut in cuts]
         left.plot(cuts, [stat["mean"] for stat in stats], marker="o", color="#1b7837", label="Local prefix agreement")
+        quality = left.twinx()
+        quality_stats = [summarize([row.get("answer_quality_delta") for row in grouped[cut]]) for cut in cuts]
+        quality.plot(
+            cuts,
+            [stat["mean"] for stat in quality_stats],
+            marker="s",
+            linestyle="--",
+            color="#b2182b",
+            label="VDC answer-quality delta",
+        )
+        quality.axhline(0.0, color="#b2182b", linewidth=0.8, alpha=0.6)
+        quality.set_ylabel("VDC answer ROUGE-L delta vs native", color="#b2182b")
         left.axhline(1.0, color="#555", linestyle="--", linewidth=1, label="Native target")
         left.axvline(20, color="#555", linestyle=":", linewidth=1, label="Layer 20")
         left.set_xlabel("Visual KV removal starting layer")
         left.set_ylabel("Prefix agreement vs native output")
-        left.set_title("(a) Local output-agreement proxy")
+        left.set_title("(a) Output agreement and VDC answer quality")
         left.set_ylim(0, 1.05)
         left.grid(alpha=0.2)
-        left.legend(fontsize=8)
+        handles, labels = left.get_legend_handles_labels()
+        quality_handles, quality_labels = quality.get_legend_handles_labels()
+        left.legend(handles + quality_handles, labels + quality_labels, fontsize=8, loc="best")
     else:
         _empty_panel(left, "No measured Figure 3(a) rows")
     if attention:
@@ -385,7 +426,14 @@ def write_plots(rows: Iterable[dict[str, Any]], output_dir: str | Path) -> list[
         plt.close(fig)
         files.append(name)
 
-    length_rows = [row for row in rows if row.get("paper_figure") == "Figure 1(a)"]
+    # The diagnostic length plots describe the keep-visual sweep.  Remove-All
+    # rows are still rendered in the paper-shaped Figure 1 panel above, but
+    # must not be averaged into the keep-visual latency/speedup curves.
+    length_rows = [
+        row for row in rows
+        if row.get("paper_figure") == "Figure 1(a)"
+        and str(row.get("series_id") or "msd_keep_visual") == "msd_keep_visual"
+    ]
     length = _group_mean(length_rows, "actual_visual_tokens", "accepted_prefix_tokens")
     if length:
         fig, axis = plt.subplots(figsize=(6.4, 4.2))

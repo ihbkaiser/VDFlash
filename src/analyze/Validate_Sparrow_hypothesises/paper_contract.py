@@ -168,7 +168,7 @@ def paper_contract_rows(contract: PaperContract) -> list[dict[str, Any]]:
             "claim": "visual flow becomes less important after the middle layers",
             "model": contract.layer_target_model,
             "layer_cut_points": list(contract.layer_cut_points),
-            "metric": "local_prefix_agreement_proxy",
+            "metric": "local_prefix_agreement_and_vdc_answer_quality_delta",
         },
         {
             "figure": "Figure 6 / Appendix D",

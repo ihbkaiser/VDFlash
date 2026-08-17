@@ -201,7 +201,21 @@ def build_paper_statistics(
         )
     ]
     f3a_stats = [
-        _metric_row(key, ["layer_cut"], group, ["prefix_agreement", "rouge_l", "lossless"], replicates=replicates, seed=seed)
+        _metric_row(
+            key,
+            ["layer_cut"],
+            group,
+            [
+                "prefix_agreement",
+                "rouge_l",
+                "native_answer_rouge_l",
+                "ablated_answer_rouge_l",
+                "answer_quality_delta",
+                "lossless",
+            ],
+            replicates=replicates,
+            seed=seed,
+        )
         for key, group in sorted(_group_rows(f3a, ["layer_cut"]).items(), key=lambda item: float(item[0][0] or 0))
     ]
     f3b_stats = [
