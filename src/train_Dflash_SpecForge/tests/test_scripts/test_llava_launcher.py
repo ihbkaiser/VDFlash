@@ -41,6 +41,10 @@ class LlavaLauncherTest(unittest.TestCase):
         self.assertIn("Skipping LLaVA preflight", result.stdout)
         self.assertNotIn("preflight_llava_caption.py", result.stdout)
         self.assertIn("prepare_llava_caption_hidden_states.py", result.stdout)
+        self.assertIn("--sglang-mem-fraction-static 0.4", result.stdout)
+        self.assertIn("--batch-size 16", result.stdout)
+        self.assertIn("--num-preprocess-workers 8", result.stdout)
+        self.assertIn("--num-io-threads 8", result.stdout)
 
     def test_preflight_runs_by_default(self):
         result = self._run_capture("0")
@@ -54,6 +58,44 @@ class LlavaLauncherTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 2)
         self.assertIn("SKIP_PREFLIGHT must be 0 or 1", result.stderr)
+
+    def test_two_gpu_training_profile_is_forwarded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "hidden_states").mkdir()
+            phase1 = root / "phase1"
+            phase1.touch()
+            env = {
+                **os.environ,
+                "ARTIFACT_ROOT": str(root),
+                "OUTPUT_ROOT": str(root / "outputs"),
+                "PHASE1_CHECKPOINT": str(phase1),
+                "PYTHON_BIN": "/bin/echo",
+                "SPECFORGE_ATTENTION_BACKEND": "flex_attention",
+                "SPECFORGE_DATALOADER_WORKERS": "12",
+                "SPECFORGE_FSDP_SHARDING": "NO_SHARD",
+                "SPECFORGE_GLOBAL_BATCH_SIZE": "64",
+                "SPECFORGE_MICRO_BATCH_SIZE": "16",
+                "SPECFORGE_OBJECTIVE_CHUNK_BLOCKS": "256",
+                "SPECFORGE_USE_LIGER": "0",
+                "TARGET_MODEL_PATH": str(root / "target"),
+            }
+
+            result = subprocess.run(
+                ["bash", str(LAUNCHER), "--phase", "train", "--gpus", "2"],
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("micro/rank=16 accumulation=2 global_batch=64", result.stdout)
+        self.assertIn("model.use_liger_kernel=false", result.stdout)
+        self.assertIn("data.dataloader_num_workers=12", result.stdout)
+        self.assertIn("training.fsdp_sharding=NO_SHARD", result.stdout)
+        self.assertIn("training.attention_backend=flex_attention", result.stdout)
+        self.assertIn("training.objective_chunk_blocks=256", result.stdout)
 
 
 if __name__ == "__main__":

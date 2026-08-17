@@ -16,6 +16,8 @@ from typing import Any, List, Optional
 import torch
 import torch.distributed as dist
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.environ import envs
+from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.dp_attn import prepare_mlp_sync_batch_raw
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -84,6 +86,11 @@ class OfflineSGLangCaptureBackend:
             is_draft_worker=False,
         )
         model_runner.alloc_memory_pool()
+        # The regular SGLang scheduler initializes this process-global cache
+        # while building its KV-cache bundle. The offline runner owns those
+        # pools directly, so multimodal models need the equivalent lifecycle
+        # step before their first vision embedding lookup.
+        init_mm_embedding_cache(envs.SGLANG_VLM_CACHE_SIZE_MB.get() * 1024 * 1024)
         model_runner.init_attention_backends()
         model_runner.init_cuda_graphs()
         wrap_offline_eagle3_logits_processors(model_runner.model)
@@ -310,20 +317,27 @@ class OfflineSGLangCaptureBackend:
         for idx, (input_row, attention_row, loss_row, position_row, media_row) in enumerate(
             zip(input_rows, attention_rows, loss_rows, position_rows, media_rows)
         ):
+            active = attention_row.view(-1).bool()
+            if not bool(active.any()):
+                raise ValueError(f"request row {idx} has no active tokens")
+            request_input_row = input_row[:, active]
+            request_position_row = position_row
+            if position_row is not None:
+                request_position_row = position_row[..., active]
             request_media = None
-            padded_input_ids = input_row.view(-1).tolist()
+            padded_input_ids = request_input_row.view(-1).tolist()
             if media_row:
                 request_media = self._build_multimodal_inputs(
-                    input_ids=input_row,
+                    input_ids=request_input_row,
                     media=media_row,
-                    position_ids=position_row,
+                    position_ids=request_position_row,
                 )
                 padded_input_ids = request_media.padded_input_ids
             req_kwargs = {
                 "rid": str(idx),
                 "origin_input_text": "",
                 "origin_input_ids": padded_input_ids,
-                "origin_input_ids_unpadded": input_row.view(-1).tolist(),
+                "origin_input_ids_unpadded": request_input_row.view(-1).tolist(),
                 "sampling_params": sampling_params,
             }
             req = Req(**req_kwargs)

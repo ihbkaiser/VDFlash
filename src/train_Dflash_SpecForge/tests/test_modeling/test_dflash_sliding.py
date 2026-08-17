@@ -215,6 +215,24 @@ class TestQwen25VLMRoPE(unittest.TestCase):
         self.assertEqual(tuple(sin.shape), (1, 4, 6))
         self.assertFalse(torch.equal(cos[:, 1], cos[:, 2]))
 
+    def test_preserves_activation_dtype(self):
+        config = Qwen3Config(
+            hidden_size=12,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=6,
+        )
+        rotary = Qwen25VLMultiModalRotaryEmbedding(
+            config,
+            {"mrope_section": [1, 1, 1]},
+        )
+        positions = torch.arange(4).view(1, 1, 4).expand(3, -1, -1)
+
+        cos, sin = rotary(torch.zeros(1, 4, 12, dtype=torch.bfloat16), positions)
+
+        self.assertEqual(cos.dtype, torch.bfloat16)
+        self.assertEqual(sin.dtype, torch.bfloat16)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

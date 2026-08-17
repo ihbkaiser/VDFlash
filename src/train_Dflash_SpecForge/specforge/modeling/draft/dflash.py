@@ -129,7 +129,7 @@ class Qwen25VLMultiModalRotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor):
-        del hidden_states
+        output_dtype = hidden_states.dtype
         if position_ids.ndim == 2:
             position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
         if position_ids.ndim != 3 or position_ids.shape[0] != 3:
@@ -150,7 +150,10 @@ class Qwen25VLMultiModalRotaryEmbedding(nn.Module):
         mixed_sin = torch.cat(
             [chunk[index % 3] for index, chunk in enumerate(chunks_sin)], dim=-1
         )
-        return mixed_cos, mixed_sin
+        # Keep RoPE numerics in FP32, then restore the activation dtype.  If
+        # FP32 cos/sin escape this module, applying them promotes q/k while v
+        # remains BF16 and both SDPA and FlexAttention receive mixed dtypes.
+        return mixed_cos.to(dtype=output_dtype), mixed_sin.to(dtype=output_dtype)
 
 
 def _prepare_dflash_eager_mask(

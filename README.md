@@ -20,6 +20,19 @@ Workflow mặc định:
 4. Chỉ projection, 5 draft decoder layers và draft norms được train.
 5. Stage 2 khởi tạo trực tiếp từ final checkpoint của Stage 1.
 
+Với pipeline SpecForge LLaVA trên đúng 2×B200, dùng wrapper ở root sau khi
+điền các đường dẫn riêng của máy:
+
+```bash
+cp src/train_Dflash_SpecForge/train_qwen25vl_dflash_llava_68k.env.example \
+  qwen25vl_llava_phase2.env
+./run.sh --env-file qwen25vl_llava_phase2.env
+```
+
+Wrapper chạy `all`, bỏ full preflight, tái sử dụng hidden states đã capture và
+tự resume Phase 2; nếu chưa có checkpoint Phase 2 thì nó nạp
+`PHASE1_CHECKPOINT`.
+
 Preset 8×B200 nằm tại:
 
 - `src/train_VLM/config_b200_8gpu_stage1_sharegpt.json`

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 import torch
+from torch.nn.utils.rnn import pad_sequence
 
 
 @dataclass
@@ -85,12 +86,8 @@ class OfflineSGLangCapture:
         if position_ids is not None:
             position_batch = position_ids
         return OfflineCaptureBatch(
-            hidden_states=torch.cat(
-                [hidden.unsqueeze(0) for hidden in aux_states], dim=0
-            ),
-            last_hidden_states=torch.cat(
-                [hidden.unsqueeze(0) for hidden in last_states], dim=0
-            ),
+            hidden_states=pad_sequence(list(aux_states), batch_first=True),
+            last_hidden_states=pad_sequence(list(last_states), batch_first=True),
             input_ids=torch.cat([row[0] for row in data], dim=0),
             attention_mask=torch.cat([row[1] for row in data], dim=0),
             loss_mask=torch.cat([row[2] for row in data], dim=0),

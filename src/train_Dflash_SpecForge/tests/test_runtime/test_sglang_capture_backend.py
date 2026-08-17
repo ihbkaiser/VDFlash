@@ -102,6 +102,20 @@ class OfflineSglangBoundaryTest(unittest.TestCase):
         self.assertEqual(len(calls[0].keywords), 1)
         self.assertIsNone(calls[0].keywords[0].arg)
 
+    def test_offline_runner_initializes_multimodal_embedding_cache(self):
+        path = os.path.join(_CAPTURE_DIR, "sglang_backend", "capture.py")
+        with open(path, encoding="utf-8") as source:
+            tree = ast.parse(source.read(), filename=path)
+
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "init_mm_embedding_cache"
+        ]
+        self.assertEqual(len(calls), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

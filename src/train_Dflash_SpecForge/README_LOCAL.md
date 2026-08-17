@@ -146,3 +146,45 @@ feature record contains `input_ids`, `loss_mask`, `hidden_states`, and Qwen
 2.5-VL `position_ids`. The final `infer` phase is an HF smoke test that checks
 image prefill plus DFlash greedy decoding against target-only greedy decoding;
 it is not a production SGLang DFlash serving recipe.
+
+For a two-B200 capture host, the example environment uses two independent
+target replicas (`TP=1`, `DP=2`) and batches 16 requests per GPU. Image
+processing is prefetched by eight worker-local processors per rank, while
+eight writer threads drain feature checkpoints asynchronously. Tune these
+without changing the output contract:
+
+```bash
+SPECFORGE_GPUS=2
+SPECFORGE_CAPTURE_BATCH_SIZE=16
+SPECFORGE_CAPTURE_PREPROCESS_WORKERS=8
+SPECFORGE_CAPTURE_PREPROCESS_QUEUE=32
+SPECFORGE_CAPTURE_IO_THREADS=8
+SPECFORGE_CAPTURE_IO_QUEUE=64
+SPECFORGE_SGLANG_MEM_FRACTION_STATIC=0.4
+```
+
+Keep `SPECFORGE_COMPRESS=0` for maximum capture throughput. After one
+successful full preflight, a failed or interrupted capture can be resumed
+without repeating that scan by setting `SKIP_PREFLIGHT=1`; existing feature
+files are skipped atomically.
+
+From the repository root, `run.sh` applies the complete two-B200 Phase 2
+profile, forces `SKIP_PREFLIGHT=1`, reuses existing hidden-state files, and
+automatically resumes the latest Phase 2 checkpoint. If no Phase 2 checkpoint
+exists, training starts from `PHASE1_CHECKPOINT`:
+
+```bash
+cp src/train_Dflash_SpecForge/train_qwen25vl_dflash_llava_68k.env.example \
+  qwen25vl_llava_phase2.env
+# Edit only the machine-specific paths in qwen25vl_llava_phase2.env.
+./run.sh --env-file qwen25vl_llava_phase2.env
+```
+
+The default training profile is two replicated BF16 drafts (`NO_SHARD`),
+micro-batch 16 per GPU, accumulation 2, global batch 64, FlexAttention,
+objective chunks of 256 anchors, and 12 ordered feature-loader workers per
+rank. If unusually long image sequences exceed memory, first reduce
+`SPECFORGE_MICRO_BATCH_SIZE` to 8; keep the global batch at 64 and the launcher
+will recalculate accumulation to 4. Use
+`SPECFORGE_ATTENTION_BACKEND=sdpa` only as a compatibility fallback on GPUs
+whose shared-memory limit cannot compile the B200 FlexAttention kernel.

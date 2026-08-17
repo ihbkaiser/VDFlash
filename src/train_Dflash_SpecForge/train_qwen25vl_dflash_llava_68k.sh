@@ -51,10 +51,25 @@ EXPECTED_RECORDS=${SPECFORGE_NUM_SAMPLES:-68000}
 MAX_LENGTH=${SPECFORGE_MAX_LENGTH:-3072}
 GLOBAL_BATCH_SIZE=${SPECFORGE_GLOBAL_BATCH_SIZE:-64}
 MICRO_BATCH_SIZE=${SPECFORGE_MICRO_BATCH_SIZE:-1}
+NUM_EPOCHS=${SPECFORGE_NUM_EPOCHS:-6}
+DATALOADER_WORKERS=${SPECFORGE_DATALOADER_WORKERS:-12}
+FSDP_SHARDING=${SPECFORGE_FSDP_SHARDING:-NO_SHARD}
+OBJECTIVE_CHUNK_BLOCKS=${SPECFORGE_OBJECTIVE_CHUNK_BLOCKS:-256}
+OPTIMIZER_CPU_OFFLOAD=${SPECFORGE_OPTIMIZER_CPU_OFFLOAD:-0}
+ATTENTION_BACKEND=${SPECFORGE_ATTENTION_BACKEND:-flex_attention}
+USE_LIGER=${SPECFORGE_USE_LIGER:-auto}
+SAVE_INTERVAL=${SPECFORGE_SAVE_INTERVAL:-1000}
+LOG_INTERVAL=${SPECFORGE_LOG_INTERVAL:-100}
+CAPTURE_BATCH_SIZE=${SPECFORGE_CAPTURE_BATCH_SIZE:-16}
+CAPTURE_PREPROCESS_WORKERS=${SPECFORGE_CAPTURE_PREPROCESS_WORKERS:-8}
+CAPTURE_PREPROCESS_QUEUE=${SPECFORGE_CAPTURE_PREPROCESS_QUEUE:-32}
+CAPTURE_IO_THREADS=${SPECFORGE_CAPTURE_IO_THREADS:-8}
+CAPTURE_IO_QUEUE=${SPECFORGE_CAPTURE_IO_QUEUE:-64}
 PHASE=${PHASE:-all}
 RESUME=0
 COMPRESS=${SPECFORGE_COMPRESS:-0}
 SKIP_PREFLIGHT=${SKIP_PREFLIGHT:-0}
+SGLANG_MEM_FRACTION_STATIC=${SPECFORGE_SGLANG_MEM_FRACTION_STATIC:-0.4}
 
 usage() {
   cat <<'EOF'
@@ -68,6 +83,20 @@ Required environment:
 
 Optional environment:
   SKIP_PREFLIGHT=1   skip the full LLaVA validation pass before capture
+  SPECFORGE_SGLANG_MEM_FRACTION_STATIC
+                     SGLang weights/KV memory fraction (default: 0.4)
+  SPECFORGE_CAPTURE_BATCH_SIZE
+                     requests per GPU capture batch (default: 16)
+  SPECFORGE_CAPTURE_PREPROCESS_WORKERS
+                     image preprocessing threads per GPU (default: 8)
+  SPECFORGE_CAPTURE_IO_THREADS
+                     asynchronous checkpoint writers per GPU (default: 8)
+  SPECFORGE_NUM_EPOCHS, SPECFORGE_DATALOADER_WORKERS
+  SPECFORGE_FSDP_SHARDING=NO_SHARD|SHARD_GRAD_OP|FULL_SHARD
+  SPECFORGE_OBJECTIVE_CHUNK_BLOCKS, SPECFORGE_OPTIMIZER_CPU_OFFLOAD=0|1
+  SPECFORGE_ATTENTION_BACKEND=flex_attention|sdpa|eager
+  SPECFORGE_USE_LIGER=auto|0|1, SPECFORGE_SAVE_INTERVAL,
+  SPECFORGE_LOG_INTERVAL
 
 Options:
   --env-file FILE
@@ -99,7 +128,15 @@ case "$SKIP_PREFLIGHT" in
   0|1) ;;
   *) echo "SKIP_PREFLIGHT must be 0 or 1" >&2; exit 2 ;;
 esac
-if (( GPU_COUNT < 1 || EXPECTED_RECORDS < 1 || MAX_LENGTH < 32 || GLOBAL_BATCH_SIZE < 1 || MICRO_BATCH_SIZE < 1 )); then
+if (( GPU_COUNT < 1 || EXPECTED_RECORDS < 1 || MAX_LENGTH < 32 || GLOBAL_BATCH_SIZE < 1 || MICRO_BATCH_SIZE < 1 || NUM_EPOCHS < 1 || DATALOADER_WORKERS < 1 || LOG_INTERVAL < 1 )); then
+  echo "invalid numeric configuration" >&2
+  exit 2
+fi
+if (( OBJECTIVE_CHUNK_BLOCKS < 0 || SAVE_INTERVAL < 0 )); then
+  echo "invalid numeric configuration" >&2
+  exit 2
+fi
+if (( CAPTURE_BATCH_SIZE < 1 || CAPTURE_PREPROCESS_WORKERS < 0 || CAPTURE_PREPROCESS_QUEUE < 1 || CAPTURE_IO_THREADS < 1 || CAPTURE_IO_QUEUE < 1 )); then
   echo "invalid numeric configuration" >&2
   exit 2
 fi
@@ -108,6 +145,31 @@ if (( GLOBAL_BATCH_SIZE % (GPU_COUNT * MICRO_BATCH_SIZE) != 0 )); then
   exit 2
 fi
 ACCUMULATION_STEPS=$((GLOBAL_BATCH_SIZE / (GPU_COUNT * MICRO_BATCH_SIZE)))
+case "$FSDP_SHARDING" in
+  NO_SHARD|SHARD_GRAD_OP|FULL_SHARD) ;;
+  *) echo "SPECFORGE_FSDP_SHARDING must be NO_SHARD, SHARD_GRAD_OP, or FULL_SHARD" >&2; exit 2 ;;
+esac
+case "$OPTIMIZER_CPU_OFFLOAD" in
+  0) OPTIMIZER_CPU_OFFLOAD=false ;;
+  1) OPTIMIZER_CPU_OFFLOAD=true ;;
+  *) echo "SPECFORGE_OPTIMIZER_CPU_OFFLOAD must be 0 or 1" >&2; exit 2 ;;
+esac
+case "$ATTENTION_BACKEND" in
+  flex_attention|sdpa|eager) ;;
+  *) echo "SPECFORGE_ATTENTION_BACKEND must be flex_attention, sdpa, or eager" >&2; exit 2 ;;
+esac
+case "$USE_LIGER" in
+  auto)
+    if "$PYTHON_BIN" -c 'import importlib.util; raise SystemExit(0 if importlib.util.find_spec("liger_kernel") else 1)'; then
+      USE_LIGER=true
+    else
+      USE_LIGER=false
+    fi
+    ;;
+  0) USE_LIGER=false ;;
+  1) USE_LIGER=true ;;
+  *) echo "SPECFORGE_USE_LIGER must be auto, 0, or 1" >&2; exit 2 ;;
+esac
 
 MANIFEST="$ARTIFACT_ROOT/manifest.jsonl"
 FEATURE_ROOT="$ARTIFACT_ROOT/hidden_states"
@@ -173,13 +235,23 @@ if [[ "$PHASE" == capture || "$PHASE" == all ]]; then
   if [[ "$COMPRESS" == 1 ]]; then
     compress_args+=(--compress)
   fi
+  printf '[capture] GPUs=%s TP=1 DP=%s batch/rank=%s preprocess_workers/rank=%s io_threads/rank=%s\n' \
+    "$GPU_COUNT" "$GPU_COUNT" "$CAPTURE_BATCH_SIZE" \
+    "$CAPTURE_PREPROCESS_WORKERS" "$CAPTURE_IO_THREADS"
   "$PYTHON_BIN" -m torch.distributed.run --standalone --nproc_per_node="$GPU_COUNT" \
     "$ROOT_DIR/scripts/prepare_llava_caption_hidden_states.py" \
     --target-model-path "$TARGET_MODEL_PATH" \
     --draft-model-config "$ROOT_DIR/configs/qwen2.5-vl-3b-dflash.json" \
     --manifest "$MANIFEST" --image-root "$IMAGE_ROOT" \
     --output-path "$FEATURE_ROOT" --max-length "$MAX_LENGTH" \
-    --expected-records "$EXPECTED_RECORDS" --tp-size 1 "${compress_args[@]}"
+    --expected-records "$EXPECTED_RECORDS" --tp-size 1 \
+    --batch-size "$CAPTURE_BATCH_SIZE" \
+    --num-preprocess-workers "$CAPTURE_PREPROCESS_WORKERS" \
+    --preprocess-queue-size "$CAPTURE_PREPROCESS_QUEUE" \
+    --num-io-threads "$CAPTURE_IO_THREADS" \
+    --io-queue-size "$CAPTURE_IO_QUEUE" \
+    --sglang-mem-fraction-static "$SGLANG_MEM_FRACTION_STATIC" \
+    "${compress_args[@]}"
 fi
 
 if [[ "$PHASE" == train || "$PHASE" == all ]]; then
@@ -189,10 +261,19 @@ if [[ "$PHASE" == train || "$PHASE" == all ]]; then
     "model.target_model_path=$TARGET_MODEL_PATH"
     "model.draft_model_config=$ROOT_DIR/configs/qwen2.5-vl-3b-dflash.json"
     "model.input_modality=qwen2_5_vl"
+    "model.use_liger_kernel=$USE_LIGER"
     "data.hidden_states_path=$FEATURE_ROOT"
     "data.max_length=$MAX_LENGTH"
+    "data.dataloader_num_workers=$DATALOADER_WORKERS"
+    "training.num_epochs=$NUM_EPOCHS"
     "training.batch_size=$MICRO_BATCH_SIZE"
     "training.accumulation_steps=$ACCUMULATION_STEPS"
+    "training.fsdp_sharding=$FSDP_SHARDING"
+    "training.optimizer_cpu_offload=$OPTIMIZER_CPU_OFFLOAD"
+    "training.attention_backend=$ATTENTION_BACKEND"
+    "training.objective_chunk_blocks=$OBJECTIVE_CHUNK_BLOCKS"
+    "training.save_interval=$SAVE_INTERVAL"
+    "training.log_interval=$LOG_INTERVAL"
     "deployment.trainer.nproc_per_node=$GPU_COUNT"
     "output_dir=$RUN_OUTPUT"
     "run_id=qwen25vl-3b-dflash-llava68k"
@@ -204,6 +285,10 @@ if [[ "$PHASE" == train || "$PHASE" == all ]]; then
     require_value PHASE1_CHECKPOINT
     train_args+=("model.draft_checkpoint_path=$PHASE1_CHECKPOINT")
   fi
+  printf '[train] GPUs=%s micro/rank=%s accumulation=%s global_batch=%s epochs=%s sharding=%s objective_chunk=%s loader_workers/rank=%s liger=%s\n' \
+    "$GPU_COUNT" "$MICRO_BATCH_SIZE" "$ACCUMULATION_STEPS" \
+    "$GLOBAL_BATCH_SIZE" "$NUM_EPOCHS" "$FSDP_SHARDING" \
+    "$OBJECTIVE_CHUNK_BLOCKS" "$DATALOADER_WORKERS" "$USE_LIGER"
   (cd "$ROOT_DIR" && "$PYTHON_BIN" -m specforge.cli train --config "$CONFIG" "${train_args[@]}")
 fi
 
