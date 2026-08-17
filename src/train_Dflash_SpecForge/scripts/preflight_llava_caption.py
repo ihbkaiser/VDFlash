@@ -8,6 +8,8 @@ import json
 import shutil
 from pathlib import Path
 
+from tqdm.auto import tqdm
+
 from specforge.qwen25vl import prepare_training_example
 
 
@@ -45,7 +47,14 @@ def main(argv: list[str] | None = None) -> int:
     total_tokens = 0
     truncated = 0
     minimum_response = None
-    for record in records:
+    progress = tqdm(
+        records,
+        desc="Preflight LLaVA",
+        unit="sample",
+        dynamic_ncols=True,
+        mininterval=0.5,
+    )
+    for record in progress:
         prepared = prepare_training_example(
             processor,
             target_config,
@@ -59,7 +68,12 @@ def main(argv: list[str] | None = None) -> int:
         total_tokens += length
         truncated += int(bool(prepared["response_truncated"]))
         response_tokens = int(prepared["loss_mask"].sum().item())
-        minimum_response = response_tokens if minimum_response is None else min(minimum_response, response_tokens)
+        minimum_response = (
+            response_tokens
+            if minimum_response is None
+            else min(minimum_response, response_tokens)
+        )
+        progress.set_postfix(truncated=truncated, refresh=False)
 
     raw_bytes = total_tokens * feature_count * hidden_size * 2
     required_bytes = int(raw_bytes * 1.2)

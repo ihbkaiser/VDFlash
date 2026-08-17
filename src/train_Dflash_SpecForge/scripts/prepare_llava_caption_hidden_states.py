@@ -13,6 +13,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from tqdm.auto import tqdm
 
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
 from specforge.offline_capture import load_offline_capture
@@ -115,7 +116,17 @@ def main() -> int:
 
         processed = 0
         skipped = 0
-        for index in range(rank, len(records), world_size):
+        local_indices = range(rank, len(records), world_size)
+        progress = tqdm(
+            local_indices,
+            total=len(local_indices),
+            desc=f"Capture LLaVA (rank {rank} shard)",
+            unit="sample",
+            dynamic_ncols=True,
+            mininterval=0.5,
+            disable=rank != 0,
+        )
+        for index in progress:
             output_file = _output_path(output_root, index, args.compress)
             if output_file.exists() and not args.overwrite:
                 processed += 1
@@ -165,6 +176,12 @@ def main() -> int:
             except (FileNotFoundError, ValueError) as exc:
                 skipped += 1
                 print(f"[rank={rank}] skip id={record.get('id', index)}: {exc}")
+            if rank == 0:
+                progress.set_postfix(
+                    processed=processed,
+                    skipped=skipped,
+                    refresh=False,
+                )
         counts = torch.tensor([processed, skipped], device="cuda", dtype=torch.long)
         dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=dp_group)
         if rank == 0:
