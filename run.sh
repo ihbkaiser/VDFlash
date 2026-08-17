@@ -98,6 +98,58 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   exit 1
 fi
 
+# FlashInfer's fastest Blackwell backend JIT-compiles a small TRT-LLM MHA
+# launcher. CUDA runtime images often have nvcc but omit nvrtc.h from
+# /usr/local/cuda; PyTorch's CUDA wheel carries the matching header and library
+# under site-packages/nvidia. Discover that location from the selected Python
+# instead of hard-coding one machine's virtualenv path.
+NVRTC_ROOT=${SPECFORGE_NVRTC_ROOT:-}
+if [[ -z "$NVRTC_ROOT" && -n "${CUDA_HOME:-}" && -f "$CUDA_HOME/include/nvrtc.h" ]]; then
+  NVRTC_ROOT=$CUDA_HOME
+fi
+if [[ -z "$NVRTC_ROOT" && -f /usr/local/cuda/include/nvrtc.h ]]; then
+  NVRTC_ROOT=/usr/local/cuda
+fi
+if [[ -z "$NVRTC_ROOT" ]]; then
+  NVRTC_ROOT=$("$PYTHON_BIN" - <<'PY'
+from pathlib import Path
+import sys
+
+candidates = []
+for entry in sys.path:
+    if not entry:
+        continue
+    root = Path(entry)
+    candidates.extend(root.glob("nvidia/cu*/include/nvrtc.h"))
+    candidates.extend(root.glob("nvidia/cuda_nvrtc/include/nvrtc.h"))
+if candidates:
+    print(sorted(candidates)[-1].parent.parent)
+PY
+  )
+fi
+
+if [[ -n "$NVRTC_ROOT" ]]; then
+  if [[ ! -f "$NVRTC_ROOT/include/nvrtc.h" ]]; then
+    echo "SPECFORGE_NVRTC_ROOT does not contain include/nvrtc.h: $NVRTC_ROOT" >&2
+    exit 1
+  fi
+  if [[ -d "$NVRTC_ROOT/lib" ]]; then
+    NVRTC_LIB="$NVRTC_ROOT/lib"
+  elif [[ -d "$NVRTC_ROOT/lib64" ]]; then
+    NVRTC_LIB="$NVRTC_ROOT/lib64"
+  else
+    echo "NVRTC library directory not found under: $NVRTC_ROOT" >&2
+    exit 1
+  fi
+  export CPATH="$NVRTC_ROOT/include${CPATH:+:$CPATH}"
+  export CPLUS_INCLUDE_PATH="$NVRTC_ROOT/include${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"
+  export LIBRARY_PATH="$NVRTC_LIB${LIBRARY_PATH:+:$LIBRARY_PATH}"
+  export LD_LIBRARY_PATH="$NVRTC_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  echo "[run] NVRTC include=$NVRTC_ROOT/include lib=$NVRTC_LIB"
+else
+  echo "[run] warning: nvrtc.h was not found; Blackwell FlashInfer JIT may fail" >&2
+fi
+
 "$PYTHON_BIN" - <<'PY'
 import sys
 
