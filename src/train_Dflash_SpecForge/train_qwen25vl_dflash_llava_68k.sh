@@ -54,6 +54,7 @@ MICRO_BATCH_SIZE=${SPECFORGE_MICRO_BATCH_SIZE:-1}
 PHASE=${PHASE:-all}
 RESUME=0
 COMPRESS=${SPECFORGE_COMPRESS:-0}
+SKIP_PREFLIGHT=${SKIP_PREFLIGHT:-0}
 
 usage() {
   cat <<'EOF'
@@ -64,6 +65,9 @@ Required environment:
   TARGET_MODEL_PATH  same Qwen2.5-VL-3B target used by Phase 1
   PHASE1_CHECKPOINT  Phase 1 DFlash draft checkpoint for a new Phase 2 run
   IMAGE_ROOT         extracted LLaVA image hierarchy, or set IMAGE_ARCHIVE
+
+Optional environment:
+  SKIP_PREFLIGHT=1   skip the full LLaVA validation pass before capture
 
 Options:
   --env-file FILE
@@ -90,6 +94,10 @@ done
 case "$PHASE" in
   data|capture|train|infer|all) ;;
   *) echo "invalid phase: $PHASE" >&2; exit 2 ;;
+esac
+case "$SKIP_PREFLIGHT" in
+  0|1) ;;
+  *) echo "SKIP_PREFLIGHT must be 0 or 1" >&2; exit 2 ;;
 esac
 if (( GPU_COUNT < 1 || EXPECTED_RECORDS < 1 || MAX_LENGTH < 32 || GLOBAL_BATCH_SIZE < 1 || MICRO_BATCH_SIZE < 1 )); then
   echo "invalid numeric configuration" >&2
@@ -151,12 +159,16 @@ if [[ "$PHASE" == capture || "$PHASE" == all ]]; then
   fi
   require_value IMAGE_ROOT
   mkdir -p "$FEATURE_ROOT"
-  "$PYTHON_BIN" "$ROOT_DIR/scripts/preflight_llava_caption.py" \
-    --manifest "$MANIFEST" --image-root "$IMAGE_ROOT" \
-    --target-model-path "$TARGET_MODEL_PATH" \
-    --draft-model-config "$ROOT_DIR/configs/qwen2.5-vl-3b-dflash.json" \
-    --output-path "$FEATURE_ROOT" --max-length "$MAX_LENGTH" \
-    --expected-records "$EXPECTED_RECORDS"
+  if [[ "$SKIP_PREFLIGHT" == 1 ]]; then
+    echo "Skipping LLaVA preflight (SKIP_PREFLIGHT=1)"
+  else
+    "$PYTHON_BIN" "$ROOT_DIR/scripts/preflight_llava_caption.py" \
+      --manifest "$MANIFEST" --image-root "$IMAGE_ROOT" \
+      --target-model-path "$TARGET_MODEL_PATH" \
+      --draft-model-config "$ROOT_DIR/configs/qwen2.5-vl-3b-dflash.json" \
+      --output-path "$FEATURE_ROOT" --max-length "$MAX_LENGTH" \
+      --expected-records "$EXPECTED_RECORDS"
+  fi
   compress_args=()
   if [[ "$COMPRESS" == 1 ]]; then
     compress_args+=(--compress)
