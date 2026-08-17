@@ -33,6 +33,9 @@ env/
 .hf_cache/
 .matplotlib/
 
+# Private Phase 2 machine paths (copy from the tracked .env.example).
+/qwen25vl_llava_phase2.env
+
 # Downloaded evaluation data (large, reproducible from the Hugging Face source)
 dataset/VideoDetailCaption/
 
