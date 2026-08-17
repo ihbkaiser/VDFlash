@@ -63,14 +63,23 @@ def _prepare_prompt_inputs(processor: Any, messages: list[dict[str, Any]]) -> di
         messages,
         return_video_kwargs=True,
     )
-    kwargs = dict(video_kwargs or {})
+    processor_kwargs = {
+        "text": [rendered],
+        "padding": True,
+        "return_tensors": "pt",
+    }
+    if image_inputs:
+        processor_kwargs["images"] = image_inputs
+    # qwen-vl-utils returns ``video_inputs=[]`` and ``{"fps": []}`` for an
+    # image-only conversation.  Recent Transformers/huggingface_hub releases
+    # validate ``fps`` as a scalar before Qwen's processor can ignore it, so
+    # forwarding those empty video values raises during image preprocessing.
+    # Video-only keyword arguments are meaningful only when a video is present.
+    if video_inputs:
+        processor_kwargs["videos"] = video_inputs
+        processor_kwargs.update(dict(video_kwargs or {}))
     inputs = processor(
-        text=[rendered],
-        images=image_inputs,
-        videos=video_inputs,
-        padding=True,
-        return_tensors="pt",
-        **kwargs,
+        **processor_kwargs,
     )
     return dict(inputs)
 

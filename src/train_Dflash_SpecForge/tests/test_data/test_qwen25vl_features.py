@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import sys
 import types
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -9,10 +11,38 @@ from specforge.algorithms.common.dflash_family_data import (
     build_qwen25vl_collator,
     normalize_qwen25vl_offline_sample,
 )
-from specforge.qwen25vl import compute_qwen25vl_position_ids
+from specforge.qwen25vl import _prepare_prompt_inputs, compute_qwen25vl_position_ids
 
 
 class Qwen25VLFeatureTest(unittest.TestCase):
+    def test_image_only_prompt_omits_empty_video_arguments(self):
+        class Processor:
+            def __init__(self):
+                self.kwargs = None
+
+            def apply_chat_template(self, *args, **kwargs):
+                return "rendered prompt"
+
+            def __call__(self, **kwargs):
+                self.kwargs = kwargs
+                return {"input_ids": torch.ones(1, 2, dtype=torch.long)}
+
+        processor = Processor()
+        vision_utils = types.SimpleNamespace(
+            process_vision_info=lambda *args, **kwargs: (
+                ["image"],
+                [],
+                {"fps": []},
+            )
+        )
+        with patch.dict(sys.modules, {"qwen_vl_utils": vision_utils}):
+            result = _prepare_prompt_inputs(processor, [{"role": "user"}])
+
+        self.assertIn("input_ids", result)
+        self.assertEqual(processor.kwargs["images"], ["image"])
+        self.assertNotIn("videos", processor.kwargs)
+        self.assertNotIn("fps", processor.kwargs)
+
     def test_normalizer_accepts_topology_and_promotes_int32_token_ids(self):
         raw = {
             "input_ids": torch.arange(5, dtype=torch.int32),
