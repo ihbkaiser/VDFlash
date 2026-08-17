@@ -49,7 +49,12 @@ class OfflineSGLangCaptureBackend:
         **kwargs,
     ) -> "OfflineSGLangCaptureBackend":
         tp_size = dist.get_world_size(get_tp_group())
-        server_args = ServerArgs(
+        # Build a single mapping before forwarding to ServerArgs. Some callers
+        # explicitly repeat these pinned offline-capture options in ``kwargs``;
+        # passing named arguments alongside ``**kwargs`` would then raise a
+        # duplicate-keyword TypeError before SGLang is initialized.
+        server_args_kwargs = dict(kwargs)
+        server_args_kwargs.update(
             model_path=pretrained_model_name_or_path,
             trust_remote_code=trust_remote_code,
             dtype=torch_dtype if torch_dtype is not None else "auto",
@@ -58,8 +63,8 @@ class OfflineSGLangCaptureBackend:
             chunked_prefill_size=-1,
             tp_size=tp_size,
             pp_size=1,
-            **kwargs,
         )
+        server_args = ServerArgs(**server_args_kwargs)
 
         tp_rank = dist.get_rank(get_tp_group())
         moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)

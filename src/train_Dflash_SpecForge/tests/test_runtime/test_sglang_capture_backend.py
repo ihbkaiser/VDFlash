@@ -86,6 +86,22 @@ class OfflineSglangBoundaryTest(unittest.TestCase):
             "own direct SGLang imports",
         )
 
+    def test_server_args_are_forwarded_from_one_mapping(self):
+        path = os.path.join(_CAPTURE_DIR, "sglang_backend", "capture.py")
+        with open(path, encoding="utf-8") as source:
+            tree = ast.parse(source.read(), filename=path)
+
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "ServerArgs"
+        ]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls[0].keywords), 1)
+        self.assertIsNone(calls[0].keywords[0].arg)
+
 
 if __name__ == "__main__":
     unittest.main()
