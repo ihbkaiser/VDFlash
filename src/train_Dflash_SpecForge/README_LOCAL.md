@@ -188,3 +188,18 @@ rank. If unusually long image sequences exceed memory, first reduce
 will recalculate accumulation to 4. Use
 `SPECFORGE_ATTENTION_BACKEND=sdpa` only as a compatibility fallback on GPUs
 whose shared-memory limit cannot compile the B200 FlexAttention kernel.
+
+The launcher supports both target sizes. The default is 3B; a 7B Phase 2 run
+must select the matching draft architecture and use a 7B Phase 1 checkpoint:
+
+```bash
+SPECFORGE_MODEL_SIZE=7b
+TARGET_MODEL_PATH=/models/qwen25-vl-7b
+PHASE1_CHECKPOINT=/runs/qwen25vl-7b-phase1/latest
+ARTIFACT_ROOT=/data/artifacts/qwen25vl_7b_dflash_llava68k
+```
+
+Never point 3B and 7B at the same `ARTIFACT_ROOT`. Their captured feature
+widths differ, so existing files from one size are not valid for the other.
+The 7B profile captures target layers `[1, 7, 13, 19, 25]` and uses the same
+Qwen2.5-VL three-axis M-RoPE contract as the 3B multimodal profile.

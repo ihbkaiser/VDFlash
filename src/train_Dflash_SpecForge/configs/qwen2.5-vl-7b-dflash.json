@@ -7,7 +7,9 @@
   "bos_token_id": 151643,
   "dflash_config": {
     "mask_token_id": 151669,
-    "target_layer_ids": [1, 7, 13, 19, 25]
+    "target_layer_ids": [1, 7, 13, 19, 25],
+    "position_encoding": "qwen2_5_vl_mrope",
+    "mrope_section": [16, 24, 24]
   },
   "dtype": "bfloat16",
   "eos_token_id": 151645,

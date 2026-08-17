@@ -190,6 +190,24 @@ class TestDFlashSlidingConfig(unittest.TestCase):
 
 
 class TestQwen25VLMRoPE(unittest.TestCase):
+    def test_checked_in_7b_config_enables_multimodal_rope(self):
+        config_path = (
+            Path(__file__).resolve().parents[2]
+            / "configs"
+            / "qwen2.5-vl-7b-dflash.json"
+        )
+        config = Qwen3Config.from_json_file(str(config_path))
+
+        self.assertEqual(
+            config.dflash_config["target_layer_ids"],
+            [1, 7, 13, 19, 25],
+        )
+        self.assertEqual(
+            config.dflash_config["position_encoding"],
+            "qwen2_5_vl_mrope",
+        )
+        self.assertEqual(config.dflash_config["mrope_section"], [16, 24, 24])
+
     def test_three_axis_positions_produce_dflash_attention_embeddings(self):
         config = Qwen3Config(
             hidden_size=12,

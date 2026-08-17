@@ -44,7 +44,8 @@ IMAGE_ROOT=${IMAGE_ROOT:-}
 IMAGE_ARCHIVE=${IMAGE_ARCHIVE:-}
 TARGET_MODEL_PATH=${TARGET_MODEL_PATH:-}
 PHASE1_CHECKPOINT=${PHASE1_CHECKPOINT:-}
-ARTIFACT_ROOT=${ARTIFACT_ROOT:-"$ROOT_DIR/artifacts/qwen25vl_dflash_llava68k"}
+MODEL_SIZE=${SPECFORGE_MODEL_SIZE:-3b}
+ARTIFACT_ROOT=${ARTIFACT_ROOT:-}
 OUTPUT_ROOT=${OUTPUT_ROOT:-"$ROOT_DIR/outputs"}
 GPU_COUNT=${SPECFORGE_GPUS:-4}
 EXPECTED_RECORDS=${SPECFORGE_NUM_SAMPLES:-68000}
@@ -77,11 +78,12 @@ Usage: train_qwen25vl_dflash_llava_68k.sh [options]
 
 Required environment:
   SOURCE_JSONL       complete flat LLaVA caption JSONL on the Phase 2 server
-  TARGET_MODEL_PATH  same Qwen2.5-VL-3B target used by Phase 1
-  PHASE1_CHECKPOINT  Phase 1 DFlash draft checkpoint for a new Phase 2 run
+  TARGET_MODEL_PATH  Qwen2.5-VL target matching SPECFORGE_MODEL_SIZE
+  PHASE1_CHECKPOINT  same-size Phase 1 DFlash checkpoint for a new Phase 2 run
   IMAGE_ROOT         extracted LLaVA image hierarchy, or set IMAGE_ARCHIVE
 
 Optional environment:
+  SPECFORGE_MODEL_SIZE=3b|7b (default: 3b)
   SKIP_PREFLIGHT=1   skip the full LLaVA validation pass before capture
   SPECFORGE_SGLANG_MEM_FRACTION_STATIC
                      SGLang weights/KV memory fraction (default: 0.4)
@@ -171,11 +173,30 @@ case "$USE_LIGER" in
   *) echo "SPECFORGE_USE_LIGER must be auto, 0, or 1" >&2; exit 2 ;;
 esac
 
+case "$MODEL_SIZE" in
+  3b)
+    DRAFT_CONFIG="$ROOT_DIR/configs/qwen2.5-vl-3b-dflash.json"
+    CONFIG="$ROOT_DIR/examples/configs/qwen2.5-vl-3b-dflash-llava68k-offline.yaml"
+    RUN_ID=qwen25vl-3b-dflash-llava68k
+    ;;
+  7b)
+    DRAFT_CONFIG="$ROOT_DIR/configs/qwen2.5-vl-7b-dflash.json"
+    CONFIG="$ROOT_DIR/examples/configs/qwen2.5-vl-7b-dflash-offline-b200.yaml"
+    RUN_ID=qwen25vl-7b-dflash-llava68k
+    ;;
+  *)
+    echo "SPECFORGE_MODEL_SIZE must be 3b or 7b" >&2
+    exit 2
+    ;;
+esac
+if [[ -z "$ARTIFACT_ROOT" ]]; then
+  ARTIFACT_ROOT="$ROOT_DIR/artifacts/qwen25vl_${MODEL_SIZE}_dflash_llava68k"
+fi
+
 MANIFEST="$ARTIFACT_ROOT/manifest.jsonl"
 FEATURE_ROOT="$ARTIFACT_ROOT/hidden_states"
 IMAGE_STAGE_ROOT="$ARTIFACT_ROOT/images"
-CONFIG="$ROOT_DIR/examples/configs/qwen2.5-vl-3b-dflash-llava68k-offline.yaml"
-RUN_OUTPUT="$OUTPUT_ROOT/qwen25vl-3b-dflash-llava68k"
+RUN_OUTPUT="$OUTPUT_ROOT/$RUN_ID"
 
 require_value() {
   local name=$1 value=${!1:-}
@@ -227,7 +248,7 @@ if [[ "$PHASE" == capture || "$PHASE" == all ]]; then
     "$PYTHON_BIN" "$ROOT_DIR/scripts/preflight_llava_caption.py" \
       --manifest "$MANIFEST" --image-root "$IMAGE_ROOT" \
       --target-model-path "$TARGET_MODEL_PATH" \
-      --draft-model-config "$ROOT_DIR/configs/qwen2.5-vl-3b-dflash.json" \
+      --draft-model-config "$DRAFT_CONFIG" \
       --output-path "$FEATURE_ROOT" --max-length "$MAX_LENGTH" \
       --expected-records "$EXPECTED_RECORDS"
   fi
@@ -241,7 +262,7 @@ if [[ "$PHASE" == capture || "$PHASE" == all ]]; then
   "$PYTHON_BIN" -m torch.distributed.run --standalone --nproc_per_node="$GPU_COUNT" \
     "$ROOT_DIR/scripts/prepare_llava_caption_hidden_states.py" \
     --target-model-path "$TARGET_MODEL_PATH" \
-    --draft-model-config "$ROOT_DIR/configs/qwen2.5-vl-3b-dflash.json" \
+    --draft-model-config "$DRAFT_CONFIG" \
     --manifest "$MANIFEST" --image-root "$IMAGE_ROOT" \
     --output-path "$FEATURE_ROOT" --max-length "$MAX_LENGTH" \
     --expected-records "$EXPECTED_RECORDS" --tp-size 1 \
@@ -259,7 +280,7 @@ if [[ "$PHASE" == train || "$PHASE" == all ]]; then
   [[ -d "$FEATURE_ROOT" ]] || { echo "feature directory missing: $FEATURE_ROOT" >&2; exit 1; }
   train_args=(
     "model.target_model_path=$TARGET_MODEL_PATH"
-    "model.draft_model_config=$ROOT_DIR/configs/qwen2.5-vl-3b-dflash.json"
+    "model.draft_model_config=$DRAFT_CONFIG"
     "model.input_modality=qwen2_5_vl"
     "model.use_liger_kernel=$USE_LIGER"
     "data.hidden_states_path=$FEATURE_ROOT"
@@ -276,17 +297,17 @@ if [[ "$PHASE" == train || "$PHASE" == all ]]; then
     "training.log_interval=$LOG_INTERVAL"
     "deployment.trainer.nproc_per_node=$GPU_COUNT"
     "output_dir=$RUN_OUTPUT"
-    "run_id=qwen25vl-3b-dflash-llava68k"
+    "run_id=$RUN_ID"
   )
-  latest="$RUN_OUTPUT/qwen25vl-3b-dflash-llava68k-latest"
+  latest="$RUN_OUTPUT/$RUN_ID-latest"
   if (( RESUME == 1 )) && [[ -e "$latest" ]]; then
     train_args+=("training.resume_from=$RUN_OUTPUT")
   else
     require_value PHASE1_CHECKPOINT
     train_args+=("model.draft_checkpoint_path=$PHASE1_CHECKPOINT")
   fi
-  printf '[train] GPUs=%s micro/rank=%s accumulation=%s global_batch=%s epochs=%s sharding=%s objective_chunk=%s loader_workers/rank=%s liger=%s\n' \
-    "$GPU_COUNT" "$MICRO_BATCH_SIZE" "$ACCUMULATION_STEPS" \
+  printf '[train:%s] GPUs=%s micro/rank=%s accumulation=%s global_batch=%s epochs=%s sharding=%s objective_chunk=%s loader_workers/rank=%s liger=%s\n' \
+    "$MODEL_SIZE" "$GPU_COUNT" "$MICRO_BATCH_SIZE" "$ACCUMULATION_STEPS" \
     "$GLOBAL_BATCH_SIZE" "$NUM_EPOCHS" "$FSDP_SHARDING" \
     "$OBJECTIVE_CHUNK_BLOCKS" "$DATALOADER_WORKERS" "$USE_LIGER"
   (cd "$ROOT_DIR" && "$PYTHON_BIN" -m specforge.cli train --config "$CONFIG" "${train_args[@]}")
@@ -303,7 +324,7 @@ if [[ "$PHASE" == infer ]]; then
   require_value IMAGE_ROOT
   "$PYTHON_BIN" "$ROOT_DIR/scripts/infer_qwen25vl_dflash.py" \
     --target-model-path "$TARGET_MODEL_PATH" \
-    --draft-model-config "$ROOT_DIR/configs/qwen2.5-vl-3b-dflash.json" \
+    --draft-model-config "$DRAFT_CONFIG" \
     --checkpoint "$RUN_OUTPUT" \
     --manifest "$MANIFEST" --image-root "$IMAGE_ROOT"
 fi

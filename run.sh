@@ -65,6 +65,7 @@ fi
 # this wrapper.
 export SKIP_PREFLIGHT=1
 export SPECFORGE_GPUS=2
+export SPECFORGE_MODEL_SIZE=${SPECFORGE_MODEL_SIZE:-3b}
 export SPECFORGE_GLOBAL_BATCH_SIZE=${SPECFORGE_GLOBAL_BATCH_SIZE:-64}
 export SPECFORGE_MICRO_BATCH_SIZE=${SPECFORGE_MICRO_BATCH_SIZE:-16}
 export SPECFORGE_NUM_EPOCHS=${SPECFORGE_NUM_EPOCHS:-6}
@@ -167,7 +168,7 @@ if any("B200" not in name.upper() for name in names):
     print("[run] warning: the selected profile is tuned for B200 GPUs", file=sys.stderr)
 PY
 
-echo "[run] phase=all GPUs=2 skip_preflight=1 resume=auto"
+echo "[run] phase=all model=$SPECFORGE_MODEL_SIZE GPUs=2 skip_preflight=1 resume=auto"
 echo "[run] micro/rank=$SPECFORGE_MICRO_BATCH_SIZE global_batch=$SPECFORGE_GLOBAL_BATCH_SIZE attention=$SPECFORGE_ATTENTION_BACKEND"
 
 # The wrapper has already sourced the trusted file. Prevent the child launcher

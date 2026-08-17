@@ -53,6 +53,32 @@ class LlavaLauncherTest(unittest.TestCase):
         self.assertIn("preflight_llava_caption.py", result.stdout)
         self.assertIn("prepare_llava_caption_hidden_states.py", result.stdout)
 
+    def test_7b_capture_uses_7b_draft_layers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifact_root = Path(directory)
+            (artifact_root / "manifest.jsonl").touch()
+            env = {
+                **os.environ,
+                "ARTIFACT_ROOT": str(artifact_root),
+                "IMAGE_ROOT": str(artifact_root / "images"),
+                "PYTHON_BIN": "/bin/echo",
+                "SKIP_PREFLIGHT": "1",
+                "SPECFORGE_MODEL_SIZE": "7b",
+                "TARGET_MODEL_PATH": str(artifact_root / "target-7b"),
+            }
+
+            result = subprocess.run(
+                ["bash", str(LAUNCHER), "--phase", "capture"],
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("configs/qwen2.5-vl-7b-dflash.json", result.stdout)
+        self.assertNotIn("configs/qwen2.5-vl-3b-dflash.json", result.stdout)
+
     def test_invalid_skip_preflight_value_is_rejected(self):
         result = self._run_capture("yes")
 
@@ -96,6 +122,38 @@ class LlavaLauncherTest(unittest.TestCase):
         self.assertIn("training.fsdp_sharding=NO_SHARD", result.stdout)
         self.assertIn("training.attention_backend=flex_attention", result.stdout)
         self.assertIn("training.objective_chunk_blocks=256", result.stdout)
+
+    def test_7b_training_uses_separate_run_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "hidden_states").mkdir()
+            phase1 = root / "phase1-7b"
+            phase1.touch()
+            env = {
+                **os.environ,
+                "ARTIFACT_ROOT": str(root),
+                "OUTPUT_ROOT": str(root / "outputs"),
+                "PHASE1_CHECKPOINT": str(phase1),
+                "PYTHON_BIN": "/bin/echo",
+                "SPECFORGE_GLOBAL_BATCH_SIZE": "64",
+                "SPECFORGE_MICRO_BATCH_SIZE": "16",
+                "SPECFORGE_MODEL_SIZE": "7b",
+                "SPECFORGE_USE_LIGER": "0",
+                "TARGET_MODEL_PATH": str(root / "target-7b"),
+            }
+
+            result = subprocess.run(
+                ["bash", str(LAUNCHER), "--phase", "train", "--gpus", "2"],
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("configs/qwen2.5-vl-7b-dflash.json", result.stdout)
+        self.assertIn("run_id=qwen25vl-7b-dflash-llava68k", result.stdout)
+        self.assertIn("[train:7b]", result.stdout)
 
 
 if __name__ == "__main__":
