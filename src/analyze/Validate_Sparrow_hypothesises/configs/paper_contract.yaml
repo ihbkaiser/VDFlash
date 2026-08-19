@@ -5,7 +5,7 @@ visual_token_milestones: [400, 3000, 13000, 25000]
 retention_percentages: [100.0, 25.0, 10.0, 5.0, 1.0, 0.0]
 msd_target_model: "Qwen/Qwen2-VL-7B-Instruct"
 msd_weights: "lucylyn/MSD-Qwen2VL-7B-Instruct"
-layer_target_model: "Qwen/Qwen2.5-VL-7B-Instruct"
+layer_target_model: "Qwen/Qwen2-VL-7B-Instruct"
 tree_total_tokens: 30
 tree_depth: 4
 tree_top_k: 8

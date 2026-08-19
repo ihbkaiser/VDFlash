@@ -13,7 +13,7 @@ import os
 import sys
 import time
 import types
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -294,6 +294,46 @@ def compact_qwen2vl_prefill(
     )
 
 
+@contextmanager
+def last_position_lm_head(model: Any, threshold: int = 4096):
+    """Limit long-context LM-head calls to the final position.
+
+    Accelerate wraps dispatched modules and stores the original callable in
+    ``_old_forward``.  Replacing only ``lm_head.forward`` therefore has no
+    effect on a sharded/quantized model: the hook still invokes the old full
+    sequence projection and allocates ``[batch, sequence, vocab]`` logits.
+    Patch the saved callable when present, while retaining the ordinary-module
+    path for un-dispatched models.
+    """
+
+    lm_head = model.lm_head
+    original_forward = lm_head.forward
+    missing = object()
+    original_hook_forward = getattr(lm_head, "_old_forward", missing)
+    underlying_forward = (
+        original_hook_forward if original_hook_forward is not missing else original_forward
+    )
+
+    def _last_position_only(hidden_states: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        if hidden_states.ndim == 3 and hidden_states.shape[1] > threshold:
+            hidden_states = hidden_states[:, -1:]
+        return underlying_forward(hidden_states, *args, **kwargs)
+
+    if original_hook_forward is not missing:
+        # Functions stored directly on an instance are not descriptor-bound;
+        # this is the same calling convention used by Accelerate's hook.
+        lm_head._old_forward = _last_position_only
+    else:
+        lm_head.forward = _last_position_only
+    try:
+        yield
+    finally:
+        if original_hook_forward is not missing:
+            lm_head._old_forward = original_hook_forward
+        else:
+            lm_head.forward = original_forward
+
+
 def validate_native_prefill_parity(model: Any, batch: Any, device: torch.device | str = "cuda", atol: float = 5e-3) -> dict[str, Any]:
     """Compare standard multimodal forward with manually fused prefill."""
 
@@ -313,14 +353,8 @@ def validate_native_prefill_parity(model: Any, batch: Any, device: torch.device 
     # full-length comparison.
     sequence_length = int(prepared.input_ids.shape[1])
     last_only = sequence_length > 4096
-    if last_only:
-        lm_head_original = model.lm_head.forward
-
-        def _last_position_only(input: torch.Tensor) -> torch.Tensor:
-            return lm_head_original(input[:, -1:])
-
-        model.lm_head.forward = _last_position_only
-    try:
+    lm_head_context = last_position_lm_head(model) if last_only else nullcontext()
+    with lm_head_context:
         with torch.inference_mode():
             native = model(
                 input_ids=prepared.input_ids,
@@ -342,9 +376,6 @@ def validate_native_prefill_parity(model: Any, batch: Any, device: torch.device 
             )
             hidden = inner.last_hidden_state if hasattr(inner, "last_hidden_state") else inner[0]
             fused_logits = model.lm_head(hidden)
-    finally:
-        if last_only:
-            model.lm_head.forward = lm_head_original
     max_error = float((native_logits - fused_logits).abs().max().item())
     return {
         "valid": max_error <= atol,
@@ -627,6 +658,59 @@ def apply_msd_memory_patches() -> None:
     ea_mod.Qwen2VLAttention.forward = _draft_sdpa_forward
 
 
+def refresh_msd_memory_patch_hooks(model: Any) -> None:
+    """Refresh Accelerate's saved forwards after memory monkey-patching.
+
+    ``load_in_4bit`` installs Accelerate hooks before the runtime patches the
+    vendored attention classes.  A hook keeps the old bound method in
+    ``_old_forward``, so changing the class method alone does not affect the
+    actual call path.  Replace those saved methods for the loaded instances.
+    """
+
+    try:
+        from eagle.model import ea_qwen2vl_model as ea_mod
+        from eagle.model import modeling_qwen2vl_kv as kv_mod
+    except ImportError:  # pragma: no cover - only used with the MSD runtime
+        return
+
+    for module in model.modules():
+        if not hasattr(module, "_old_forward"):
+            continue
+        if isinstance(module, kv_mod.VisionSdpaAttention):
+            module._old_forward = types.MethodType(kv_mod.VisionSdpaAttention.forward, module)
+        elif isinstance(module, kv_mod.Qwen2VLSdpaAttention):
+            module._old_forward = types.MethodType(kv_mod.Qwen2VLSdpaAttention.forward, module)
+        elif isinstance(module, ea_mod.Qwen2VLAttention):
+            module._old_forward = types.MethodType(ea_mod.Qwen2VLAttention.forward, module)
+
+
+def clear_msd_runtime_state(model: Any) -> None:
+    """Release per-job MSD caches and reset mutable tree state.
+
+    The official EAGLE wrapper intentionally retains its KV buffers for reuse.
+    That is useful for one long decode, but harmful for this benchmark where
+    adjacent jobs can have very different visual-token counts and failed OOM
+    attempts must not poison the next retry.
+    """
+
+    for cache_name in ("past_key_values", "past_key_values_data", "current_length_data"):
+        if hasattr(model, cache_name):
+            delattr(model, cache_name)
+    try:
+        model.ea_layer.reset_kv()
+    except (AttributeError, RuntimeError):
+        pass
+    try:
+        qwen = model.base_model.model
+        if hasattr(qwen, "tree_mask"):
+            qwen.tree_mask = None
+        if hasattr(qwen, "tree_mode"):
+            qwen.tree_mode = None
+        model.base_model.rope_deltas = None
+    except AttributeError:
+        pass
+
+
 def apply_chunked_video_vision(model: Any, chunk_frames: int = 8) -> None:
     """Run Qwen2-VL vision frames in bounded chunks.
 
@@ -754,6 +838,7 @@ def load_msd_qwen2vl(
     # returns a single-element tuple. eval() disables that branch.
     result.eval()
     apply_msd_memory_patches()
+    refresh_msd_memory_patch_hooks(result.base_model)
     vision_chunk_frames = int(os.environ.get("MSD_VISION_CHUNK_FRAMES", "8"))
     apply_chunked_video_vision(result.base_model, vision_chunk_frames)
     return result
@@ -855,14 +940,8 @@ def patched_msd_video_path(model: Any, prepared: PreparedPrefill):
     old_tree = ea_module.tree_decoding
     old_evaluate = ea_module.evaluate_posterior
     old_forward = model.forward
-    old_lm_head = model.base_model.lm_head.forward
-
-    def _last_position_lm_head(hidden_states: torch.Tensor) -> torch.Tensor:
-        if hidden_states.ndim == 3 and hidden_states.shape[1] > 4096:
-            return old_lm_head(hidden_states[:, -1:])
-        return old_lm_head(hidden_states)
-
-    model.base_model.lm_head.forward = _last_position_lm_head
+    lm_head_context = last_position_lm_head(model.base_model)
+    lm_head_context.__enter__()
     capture: dict[str, Any] = {
         "trace": [],
         "prefill_seconds": None,
@@ -907,7 +986,7 @@ def patched_msd_video_path(model: Any, prepared: PreparedPrefill):
         yield capture
     finally:
         model.forward = old_forward
-        model.base_model.lm_head.forward = old_lm_head
+        lm_head_context.__exit__(None, None, None)
         model._video_prefill_position_ids = None
         model._video_rope_delta = None
         ea_module.initialize_tree = old_initialize
@@ -946,6 +1025,13 @@ def generate_msd_full_video(
     start = time.perf_counter()
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+    # EaModel.msdgenerate caches its preallocated KV tensors on the wrapper.
+    # Reusing that cache across calibration points is unsafe: a later point
+    # can have a longer prompt than the first point, while msdgenerate only
+    # zeroes (rather than reallocates) the cached tensors.  The resulting
+    # index error looks like a sequence-length/parity failure.  Force the
+    # official allocator to size a fresh cache for every independent job.
+    clear_msd_runtime_state(model)
     with patched_msd_video_path(model, prepared) as capture:
         output = model.msdgenerate(
             prepared.input_ids,
@@ -1010,6 +1096,7 @@ def generate_msd_retention_video(
     start = time.perf_counter()
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+    clear_msd_runtime_state(model)
     with patched_msd_video_path(model, prepared_full) as capture:
         model.ea_layer.reset_kv()
         past_key_values, past_key_values_data, current_length_data = ea_module.initialize_past_key_values(

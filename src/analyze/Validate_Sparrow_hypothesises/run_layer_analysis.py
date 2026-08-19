@@ -16,7 +16,7 @@ from .model_analysis import (
     layerwise_input_cosine,
     load_qwen_model,
     mask_visual_keys,
-    prepare_qwen25_prefill,
+    prepare_qwen2vl_prefill,
     prefix_length,
     target_generation,
 )
@@ -216,6 +216,11 @@ def run(args: argparse.Namespace) -> int:
         raise SystemExit(str(exc)) from exc
     contract = load_contract(args.contract)
     samples = load_vdc_manifest(args.manifest, args.dataset_root)
+    if args.sample_id:
+        requested = set(args.sample_id)
+        samples = [sample for sample in samples if sample.sample_id in requested]
+        if not samples:
+            raise SystemExit(f"No manifest samples matched --sample-id {sorted(requested)}")
     if args.limit is not None:
         samples = samples[: args.limit]
     targets = list(args.visual_targets or (contract.attention_long_tokens,))
@@ -228,6 +233,7 @@ def run(args: argparse.Namespace) -> int:
         device_map=args.device_map,
         dtype=args.dtype,
         quantized=args.quantized,
+        attn_implementation="sdpa",
     )
     device = model_device(model)
     rows: list[dict[str, Any]] = []
@@ -250,7 +256,7 @@ def run(args: argparse.Namespace) -> int:
                 max_pixels=max_pixels,
             )
             batch = move_batch_to_device(batch, device)
-            prepared = prepare_qwen25_prefill(model, batch, device)
+            prepared = prepare_qwen2vl_prefill(model, batch, device)
             masks = find_instruction_masks(batch["input_ids"], processor, prepared.video_positions.tolist())
             target_tokens, timing, _target_output = target_generation(model, batch, args.max_new_tokens)
             target_text = _decode(processor, target_tokens)
@@ -298,7 +304,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--manifest", default="dataset/VideoDetailCaption/subset_manifest.jsonl")
     parser.add_argument("--dataset-root", default="dataset/VideoDetailCaption")
-    parser.add_argument("--model", default="Qwen/Qwen2.5-VL-7B-Instruct")
+    parser.add_argument("--model", default="Qwen/Qwen2-VL-7B-Instruct")
     parser.add_argument("--output", default="results/sparrow_validation/layer_analysis.jsonl")
     parser.add_argument("--experiments", choices=("figure3", "figure6", "both"), default="both")
     parser.add_argument("--calibration")
@@ -310,6 +316,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-pixels", type=int, default=1024 * 28 * 28)
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--sample-id", action="append", help="Run only the named manifest sample(s); may be repeated.")
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="float16")
     parser.add_argument("--quantized", action="store_true")

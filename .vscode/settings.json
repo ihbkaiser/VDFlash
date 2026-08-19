@@ -1,4 +1,8 @@
 {
     "python-envs.defaultEnvManager": "ms-python.python:venv",
-    "python-envs.defaultPackageManager": "ms-python.python:pip"
+    "python-envs.defaultPackageManager": "ms-python.python:pip",
+    "git.autorefresh": true,
+    "git.decorations.enabled": true,
+    "explorer.decorations.badges": true,
+    "explorer.decorations.colors": true
 }

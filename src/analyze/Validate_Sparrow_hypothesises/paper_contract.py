@@ -58,7 +58,9 @@ DEFAULT_CONTRACT = PaperContract(
     retention_percentages=(100.0, 25.0, 10.0, 5.0, 1.0, 0.0),
     msd_target_model="Qwen/Qwen2-VL-7B-Instruct",
     msd_weights="lucylyn/MSD-Qwen2VL-7B-Instruct",
-    layer_target_model="Qwen/Qwen2.5-VL-7B-Instruct",
+    # Use the cached Qwen2-VL checkpoint for all remaining local analyses.
+    # This is a local substitution for the paper's Qwen2.5-VL layer model.
+    layer_target_model="Qwen/Qwen2-VL-7B-Instruct",
     tree_total_tokens=30,
     tree_depth=4,
     tree_top_k=8,
@@ -124,7 +126,7 @@ def validate_contract(contract: PaperContract) -> list[str]:
     if not contract.msd_target_model.startswith("Qwen/"):
         errors.append("MSD target must be the Qwen2-VL family used by Figure 1/2")
     if not contract.layer_target_model.startswith("Qwen/"):
-        errors.append("layer analysis target must be the Qwen2.5-VL family")
+        errors.append("layer analysis target must be a Qwen-VL family model")
     if contract.minimum_paired_samples <= 0:
         errors.append("minimum_paired_samples must be positive")
     if contract.retention_anchor_visual_tokens not in contract.visual_token_milestones:

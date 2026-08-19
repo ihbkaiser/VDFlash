@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +35,16 @@ def _read_jsonl(path: str | Path) -> list[dict[str, Any]]:
             if line.strip():
                 rows.append(json.loads(line))
     return rows
+
+
+def _append_jsonl(path: str | Path, rows: list[dict[str, Any]]) -> None:
+    """Append one completed attention job without retaining prior jobs in RAM."""
+
+    if not rows:
+        return
+    with Path(path).open("a", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
 
 def _calibration_jobs(
@@ -97,10 +109,17 @@ def run(args: argparse.Namespace) -> int:
         device_map=args.device_map,
         dtype=args.dtype,
         quantized=args.quantized,
+        attn_implementation="sdpa",
     )
     device = model_device(model)
     video_token_id = int(model.config.video_token_id)
     rows: list[dict[str, Any]] = []
+    compact = os.environ.get("SPARROW_COMPACT_ATTENTION") == "1"
+    written_rows = 0
+    # Attention traces are large (one row per visual token).  Start a fresh
+    # output and append each completed job so a full 50-video run does not
+    # accumulate the entire JSONL document in Python memory.
+    write_jsonl(args.output, [])
     for index, (sample, point) in enumerate(jobs, start=1):
         try:
             if point and point.get("candidate_settings"):
@@ -187,26 +206,27 @@ def run(args: argparse.Namespace) -> int:
                     "fps": fps,
                     "max_pixels": max_pixels,
                 }
-                for position, weight in enumerate(attention[visual].tolist()):
-                    row = dict(common)
-                    row.update({
-                        "row_id": f"{sample.sample_id}:{actual_count}:{attention_policy}:visual:{position}",
-                        "modality": "visual",
-                        "token_position": int(visual[position].item()),
-                        "visual_index": position,
-                        "attention_weight": float(weight),
-                    })
-                    rows.append(row)
-                for modality, positions in (("instruction", instruction), ("text", text)):
-                    for position in positions.tolist():
+                if not compact:
+                    for position, weight in enumerate(attention[visual].tolist()):
                         row = dict(common)
                         row.update({
-                            "row_id": f"{sample.sample_id}:{actual_count}:{attention_policy}:{modality}:{position}",
-                            "modality": modality,
-                            "token_position": int(position),
-                            "attention_weight": float(attention[position].item()),
+                            "row_id": f"{sample.sample_id}:{actual_count}:{attention_policy}:visual:{position}",
+                            "modality": "visual",
+                            "token_position": int(visual[position].item()),
+                            "visual_index": position,
+                            "attention_weight": float(weight),
                         })
                         rows.append(row)
+                    for modality, positions in (("instruction", instruction), ("text", text)):
+                        for position in positions.tolist():
+                            row = dict(common)
+                            row.update({
+                                "row_id": f"{sample.sample_id}:{actual_count}:{attention_policy}:{modality}:{position}",
+                                "modality": modality,
+                                "token_position": int(position),
+                                "attention_weight": float(attention[position].item()),
+                            })
+                            rows.append(row)
                 summary = dict(common)
                 summary.update({
                     "row_id": f"{sample.sample_id}:{actual_count}:{attention_policy}:summary",
@@ -244,9 +264,18 @@ def run(args: argparse.Namespace) -> int:
                 "status": "error",
                 "error": str(exc),
             })
+            _append_jsonl(args.output, rows)
+            written_rows += len(rows)
+            rows.clear()
+            gc.collect()
+            torch.cuda.empty_cache()
             continue
-    write_jsonl(args.output, rows)
-    print(f"Wrote {len(rows)} Figure 2 rows to {args.output}")
+        _append_jsonl(args.output, rows)
+        written_rows += len(rows)
+        rows.clear()
+        gc.collect()
+        torch.cuda.empty_cache()
+    print(f"Wrote {written_rows} Figure 2 rows to {args.output}")
     return 0
 def _fingerprint(input_ids: torch.Tensor) -> str:
     values = input_ids.detach().to("cpu").contiguous()

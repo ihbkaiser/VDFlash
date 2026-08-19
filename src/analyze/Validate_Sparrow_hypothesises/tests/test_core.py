@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 
 from src.analyze.Validate_Sparrow_hypothesises.audit import audit_losslessness, audit_rows
@@ -7,17 +9,29 @@ from src.analyze.Validate_Sparrow_hypothesises.dataset import (
     choose_nearest_calibration,
     qwen2vl_video_token_count,
 )
+from src.analyze.Validate_Sparrow_hypothesises.calibrate import (
+    adaptive_candidate_grid,
+    audit_calibration,
+    select_paired_cohort,
+)
 from src.analyze.Validate_Sparrow_hypothesises.metrics import (
     common_prefix_length,
     normalized_entropy,
     rouge_l,
 )
-from src.analyze.Validate_Sparrow_hypothesises.model_analysis import find_instruction_masks
+from src.analyze.Validate_Sparrow_hypothesises.model_analysis import (
+    PreparedQwen2,
+    PreparedQwen25,
+    find_instruction_masks,
+    prepare_qwen2vl_prefill,
+    prepare_qwen25_prefill,
+)
 from src.analyze.Validate_Sparrow_hypothesises.paper_statistics import build_paper_statistics, summarize
 from src.analyze.Validate_Sparrow_hypothesises.paper_contract import DEFAULT_CONTRACT, validate_contract
 from src.analyze.Validate_Sparrow_hypothesises.runtime import (
     PreparedPrefill,
     compact_qwen2vl_prefill,
+    last_position_lm_head,
     select_visual_positions,
 )
 
@@ -26,6 +40,25 @@ def test_default_contract_matches_paper_milestones():
     assert validate_contract(DEFAULT_CONTRACT) == []
     assert DEFAULT_CONTRACT.visual_token_milestones == (400, 3000, 13000, 25000)
     assert DEFAULT_CONTRACT.layer_cut_points[5] == 20
+
+
+def test_last_position_lm_head_patches_accelerate_saved_forward():
+    head = torch.nn.Linear(4, 7)
+    original_forward = head.forward
+    head._old_forward = original_forward
+
+    def accelerated_forward(hidden_states):
+        return head._old_forward(hidden_states)
+
+    head.forward = accelerated_forward
+    model = SimpleNamespace(lm_head=head)
+    inputs = torch.randn(1, 8, 4)
+
+    with last_position_lm_head(model, threshold=4):
+        assert model.lm_head(inputs).shape == (1, 1, 7)
+
+    assert model.lm_head(inputs).shape == (1, 8, 7)
+    assert head._old_forward == original_forward
 
 
 def test_video_token_count_uses_qwen_grid_and_merge_size():
@@ -39,6 +72,49 @@ def test_calibration_is_nearest_and_marks_tolerance():
     assert point.status == "ok"
     point = choose_nearest_calibration("sample", 400, [("a", 500)], tolerance=0.10)
     assert point.status == "out_of_tolerance"
+
+
+def test_adaptive_grid_covers_short_frames_and_dense_short_context_pixels():
+    candidates = adaptive_candidate_grid()
+    assert any(candidate.frames < 4 for candidate in candidates)
+    short_pixels = {candidate.max_pixels for candidate in candidates if candidate.max_pixels <= 256 * 28 * 28}
+    assert len(short_pixels) >= 6
+
+
+def test_paired_cohort_requires_ok_at_every_target_and_minimum():
+    rows = []
+    for sample_id in ("a", "b", "c"):
+        for target in (400, 3000):
+            rows.append({
+                "sample_id": sample_id,
+                "target_visual_tokens": target,
+                "actual_visual_tokens": target,
+                "status": "ok",
+            })
+    rows[-1]["status"] = "out_of_tolerance"
+    cohort = select_paired_cohort(rows, (400, 3000), minimum_samples=2)
+    assert cohort.sample_ids == ("a", "b")
+    assert cohort.valid
+    assert "c" in cohort.invalid_by_target[3000]
+
+
+def test_calibration_audit_reports_paired_coverage_without_promoting_outliers():
+    rows = [
+        {"sample_id": sample, "target_visual_tokens": target,
+         "actual_visual_tokens": target, "status": "ok"}
+        for sample in ("a", "b")
+        for target in (400, 3000)
+    ]
+    rows[-1]["status"] = "out_of_tolerance"
+    summary = audit_calibration(rows, (400, 3000), minimum_samples=1)
+    assert summary["valid"]
+    assert summary["paired_samples"] == 1
+    assert summary["status_counts"]["3000"]["non_ok"] == 1
+
+
+def test_layer_analysis_exposes_qwen2_contract_names():
+    assert PreparedQwen2 is PreparedQwen25
+    assert prepare_qwen2vl_prefill is prepare_qwen25_prefill
 
 
 def test_metrics_are_deterministic_and_bounded():

@@ -13,7 +13,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .dataset import write_jsonl
+from .evidence import collect_evidence, write_evidence
 from .paper_contract import load_contract
 
 
@@ -28,32 +28,37 @@ def _run(command: list[str], cwd: Path, *, allow_failure: bool = False) -> int:
     return result.returncode
 
 
-def _merge(paths: list[Path], output: Path) -> None:
-    rows = []
-    for path in paths:
-        if not path.exists():
-            continue
-        with path.open("r", encoding="utf-8") as handle:
-            import json
+def _merge(paths: list[Path], output: Path, diagnostic: Path):
+    """Strictly merge stage files and separate evidence from diagnostics."""
 
-            for line in handle:
-                if line.strip():
-                    rows.append(json.loads(line))
-    if not rows:
-        raise SystemExit("No measured rows were produced; refusing to build a report")
-    write_jsonl(output, rows)
-    print(f"Merged {len(rows)} rows into {output}")
+    result = collect_evidence(paths)
+    if not result.evidence_rows:
+        raise SystemExit("No evidence rows were produced; refusing to build a report")
+    write_evidence(result, output, diagnostic)
+    if result.malformed_files:
+        print("Excluded malformed stage files: " + ", ".join(result.malformed_files), flush=True)
+    print(
+        f"Merged {len(result.evidence_rows)} evidence rows and "
+        f"{len(result.diagnostic_rows)} diagnostic rows into {output}",
+        flush=True,
+    )
+    return result
 
 
 def run(args: argparse.Namespace) -> int:
     root = Path(args.repo_root).resolve()
     output_dir = root / args.output_dir
+    if output_dir.exists() and any(output_dir.iterdir()) and not args.resume:
+        raise SystemExit(
+            f"Output directory is not empty: {output_dir}. "
+            "Choose a fresh --output-dir or pass --resume explicitly."
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
     python = sys.executable
     contract_path = root / args.contract
     contract = load_contract(contract_path)
     preflight = output_dir / "preflight.json"
-    calibration = output_dir / "calibration.jsonl"
+    calibration = root / args.calibration_input if args.calibration_input else output_dir / "calibration.jsonl"
     msd_full = output_dir / "msd_full.jsonl"
     msd_remove_all = output_dir / "msd_remove_all.jsonl"
     msd_retention_last = output_dir / "msd_retention_last_instruction.jsonl"
@@ -62,6 +67,7 @@ def run(args: argparse.Namespace) -> int:
     draft_attention = output_dir / "figure2_draft_attention.jsonl"
     layers = output_dir / "layer_analysis.jsonl"
     combined = output_dir / "results.jsonl"
+    diagnostics = output_dir / "diagnostic_rows.jsonl"
     audit = output_dir / "audit.json"
     report = output_dir / "report"
 
@@ -70,16 +76,34 @@ def run(args: argparse.Namespace) -> int:
     if not args.skip_preflight:
         _run(base + global_flags + ["preflight", "--require-gpu", "--require-models", "--output", str(preflight)], root)
     if not args.skip_calibration:
-        _run(base + global_flags + [
+        calibration_command = base + global_flags + [
             "calibrate",
             "--output", str(calibration),
             "--model", args.calibration_model,
-        ] + (["--limit", str(args.limit)] if args.limit is not None else []), root)
+        ]
+        if args.reuse_calibration:
+            calibration_command += ["--reuse-calibration", str(root / args.reuse_calibration)]
+        if args.limit is not None:
+            calibration_command += ["--limit", str(args.limit)]
+        _run(calibration_command, root)
 
-    calibration_arg = [] if args.skip_calibration else ["--calibration", str(calibration)]
+    if args.skip_calibration:
+        if not calibration.is_file() or calibration.stat().st_size == 0:
+            raise SystemExit(
+                f"--skip-calibration was requested, but calibration is missing or empty: {calibration}"
+            )
+        # Skipping recalibration must still feed the existing measurements to
+        # every GPU stage; otherwise attention/MSD silently fall back to the
+        # unbounded native video path.
+        calibration_arg = ["--calibration", str(calibration)]
+    else:
+        calibration_arg = ["--calibration", str(calibration)]
     if args.allow_out_of_tolerance:
         calibration_arg.append("--allow-out-of-tolerance")
-    common = ["--limit", str(args.limit)] if args.limit is not None else []
+    stage_manifest = root / args.cohort_manifest if args.cohort_manifest else root / "dataset/VideoDetailCaption/subset_manifest.jsonl"
+    common = ["--manifest", str(stage_manifest)]
+    if args.limit is not None:
+        common += ["--limit", str(args.limit)]
     model_flags = ["--device-map", args.device_map, "--dtype", args.dtype]
     if args.quantized:
         model_flags.append("--quantized")
@@ -99,14 +123,20 @@ def run(args: argparse.Namespace) -> int:
             *common,
         ], root)
         produced.append(attention)
+    elif attention.exists():
+        # Resume runs may intentionally skip the expensive target probe while
+        # still needing its completed output in the final merged report.
+        produced.append(attention)
     if not args.skip_draft_attention:
         _run(base + global_flags + [
             "draft_attention",
             "--output", str(draft_attention),
             *calibration_arg,
-            "--visual-targets", str(contract.attention_short_tokens), str(contract.attention_long_tokens),
+            "--visual-targets", str(contract.attention_short_tokens), str(contract.attention_long_tokens), str(contract.retention_anchor_visual_tokens),
             *common, *msd_flags,
         ], root)
+        produced.append(draft_attention)
+    elif draft_attention.exists():
         produced.append(draft_attention)
     if not args.skip_msd:
         # Run attention first: the retention selectors consume the draft
@@ -115,7 +145,7 @@ def run(args: argparse.Namespace) -> int:
         _run(base + global_flags + [
             "msd", "--condition", "full", "--output", str(msd_full),
             "--visual-targets", *[str(value) for value in contract.visual_token_milestones],
-            *calibration_arg, *common, *msd_flags,
+            "--strict-losslessness", *calibration_arg, *common, *msd_flags,
         ], root)
         produced.append(msd_full)
         _run(base + global_flags + [
@@ -123,7 +153,7 @@ def run(args: argparse.Namespace) -> int:
             "--selection", "uniform", "--retention-percentages", "0",
             "--output", str(msd_remove_all), "--visual-targets",
             *[str(value) for value in contract.visual_token_milestones],
-            *calibration_arg, *common, *msd_flags,
+            "--strict-losslessness", *calibration_arg, *common, *msd_flags,
         ], root)
         produced.append(msd_remove_all)
         if args.skip_draft_attention:
@@ -135,7 +165,7 @@ def run(args: argparse.Namespace) -> int:
                     "--selection-scores", str(draft_attention),
                     "--retention-percentages", *[str(value) for value in contract.retention_percentages],
                     "--visual-targets", str(contract.retention_anchor_visual_tokens),
-                    "--output", str(destination), *calibration_arg, *common, *msd_flags,
+                    "--output", str(destination), "--strict-losslessness", *calibration_arg, *common, *msd_flags,
                 ], root)
                 produced.append(destination)
     if not args.skip_layers:
@@ -149,8 +179,12 @@ def run(args: argparse.Namespace) -> int:
             *common,
         ], root)
         produced.append(layers)
-    _merge(produced, combined)
-    audit_rc = _run(base + global_flags + ["audit", "--input", str(combined), "--output", str(audit)], root, allow_failure=True)
+    _merge(produced, combined, diagnostics)
+    audit_rc = _run(base + global_flags + [
+        "audit", "--input", str(combined), "--output", str(audit),
+        "--calibration", str(calibration),
+        "--calibration-targets", *[str(value) for value in contract.visual_token_milestones],
+    ], root, allow_failure=True)
     report_rc = _run(base + global_flags + ["report", "--input", str(combined), "--output-dir", str(report)], root, allow_failure=True)
     print(f"Complete report: {report / 'REPORT.md'}")
     return report_rc or audit_rc
@@ -161,6 +195,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--contract", default="src/analyze/Validate_Sparrow_hypothesises/configs/local_insight_vdc50.yaml")
     parser.add_argument("--repo-root", default=".")
     parser.add_argument("--output-dir", default="results/sparrow_validation")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Allow an existing output directory to be reused; merge remains strict.",
+    )
+    parser.add_argument(
+        "--calibration-input",
+        help="Use an existing measured calibration JSONL, e.g. a supplementary 400-token run.",
+    )
+    parser.add_argument(
+        "--reuse-calibration",
+        help="Copy strict non-requested targets from this file when creating calibration.",
+    )
+    parser.add_argument(
+        "--cohort-manifest",
+        help="Use the manifest emitted by the paired-cohort selector for every stage.",
+    )
     parser.add_argument("--limit", type=int)
     parser.add_argument("--calibration-model", default="Qwen/Qwen2-VL-7B-Instruct")
     parser.add_argument("--msd-condition", choices=("full", "retention", "both"), default="both", help="Legacy compatibility; the local profile runs the required series explicitly.")

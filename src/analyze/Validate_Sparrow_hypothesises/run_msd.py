@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import os
@@ -18,12 +19,14 @@ from .runtime import (
     RuntimeUnavailableError,
     build_qwen2vl_video_processor,
     compact_qwen2vl_prefill,
+    clear_msd_runtime_state,
     generate_msd_full_video,
     generate_msd_retention_video,
     move_batch_to_device,
     prepare_qwen2vl_prefill,
     process_video,
     load_msd_qwen2vl,
+    last_position_lm_head,
     model_device,
     require_cuda,
     validate_native_prefill_parity,
@@ -45,17 +48,8 @@ def _target_reference(base_model: Any, batch: Any, input_length: int, max_new_to
     # generation only consume the final position.  Keep the long-context
     # path compatible with model-parallel inference by returning last-position
     # logits from the language-model head.
-    lm_head_original = None
-    input_ids = batch.get("input_ids") if isinstance(batch, dict) else getattr(batch, "input_ids", None)
-    if input_ids is not None and input_ids.shape[1] > 4096:
-        lm_head_original = base_model.lm_head.forward
-
-        def _last_position_only(hidden_states: torch.Tensor) -> torch.Tensor:
-            return lm_head_original(hidden_states[:, -1:])
-
-        base_model.lm_head.forward = _last_position_only
     start = time.perf_counter()
-    try:
+    with last_position_lm_head(base_model):
         with torch.inference_mode():
             base_model(**batch, use_cache=True, return_dict=True)
         if torch.cuda.is_available():
@@ -73,9 +67,6 @@ def _target_reference(base_model: Any, batch: Any, input_length: int, max_new_to
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         end_to_end_seconds = time.perf_counter() - start
-    finally:
-        if lm_head_original is not None:
-            base_model.lm_head.forward = lm_head_original
     return _new_tokens(output, input_length), prefill_seconds, end_to_end_seconds
 
 
@@ -302,11 +293,22 @@ def run(args: argparse.Namespace) -> int:
                 print(f"  ERROR {sample.sample_id} attempt {attempt}: {exc}", flush=True)
                 if attempt == 1:
                     time.sleep(5)
+            finally:
+                # A failed prefill can leave Python references and CUDA
+                # allocator blocks alive until the next GC cycle.  Clear the
+                # wrapper's retained EAGLE buffers before retrying the same
+                # job or moving to the next one.
+                clear_msd_runtime_state(model)
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         if last_exc is not None:
             # Record an explicit error row (audit-compatible) and continue with
             # the next sample instead of aborting the whole multi-hour stage.
+            error_row_id = f"{sample.sample_id}:{_job_target(point)}:error"
+            rows = [row for row in rows if row.get("row_id") != error_row_id]
             rows.append({
-                "row_id": f"{sample.sample_id}:{_job_target(point)}:error",
+                "row_id": error_row_id,
                 "paper_figure": "Figure 1(a)",
                 "sample_id": sample.sample_id,
                 "target_model": args.base_model,
@@ -321,6 +323,9 @@ def run(args: argparse.Namespace) -> int:
                 "calibration_target_visual_tokens": point.get("target_visual_tokens") if point else None,
                 "calibration_status": point.get("status") if point else "not_requested",
             })
+            # Persist failures as well as successes so a killed run does not
+            # silently lose the diagnostic row and retry the same bad job.
+            write_jsonl(args.output, rows)
             continue
         # Drop stale rows for the re-done job (resume may have loaded partial
         # rows from a killed run) so the file never contains duplicates.

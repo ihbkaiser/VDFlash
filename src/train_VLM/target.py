@@ -347,7 +347,7 @@ class Qwen25VLTargetAdapter:
                         positions = positions.unsqueeze(0).expand(3, -1, -1)
                     if positions.ndim == 3 and positions.shape[0] == 3:
                         return positions
-                except (TypeError, ValueError, RuntimeError) as exc:
+                except (AttributeError, TypeError, ValueError, RuntimeError) as exc:
                     failures.append(
                         f"{type(model_object).__name__}.{method_name}: {exc}"
                     )

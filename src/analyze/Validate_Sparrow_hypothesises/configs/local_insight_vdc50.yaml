@@ -2,6 +2,7 @@
 profile: local_insight_vdc50
 minimum_paired_samples: 10
 strict_calibration: true
+layer_target_model: "Qwen/Qwen2-VL-7B-Instruct"
 retention_anchor_visual_tokens: 25000
 layer_count: 28
 required_figures:

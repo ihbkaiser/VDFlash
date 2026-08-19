@@ -9,7 +9,14 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .audit import audit_coverage, audit_losslessness, audit_rows
-from .calibrate import calibrate_sample, candidate_grid, write_calibration
+from .calibrate import (
+    adaptive_candidate_grid,
+    audit_calibration,
+    calibrate_sample,
+    read_calibration,
+    select_paired_cohort,
+    write_calibration,
+)
 from .dataset import load_vdc_manifest, planned_calibration, write_jsonl
 from .paper_contract import load_contract, validate_contract
 from .preflight import run_preflight, write_preflight
@@ -68,7 +75,26 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
         processor = build_qwen2vl_video_processor(args.model, args.min_pixels, args.max_pixels)
     except Exception as exc:
         raise SystemExit(f"Cannot initialize Qwen2-VL processor: {exc}") from exc
-    candidates = candidate_grid()
+    targets = tuple(int(value) for value in (args.targets or contract.visual_token_milestones))
+    if not targets:
+        raise SystemExit("--targets must contain at least one visual-token target")
+    rows = []
+    if args.reuse_calibration:
+        try:
+            reused = read_calibration(args.reuse_calibration)
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f"Cannot reuse calibration: {exc}") from exc
+        requested = set(targets)
+        rows.extend(
+            row for row in reused
+            if int(row.get("target_visual_tokens", -1)) not in requested
+        )
+        print(
+            f"Reusing {len(rows)} strict rows from {args.reuse_calibration}; "
+            f"measuring targets {list(targets)}",
+            flush=True,
+        )
+    candidates = adaptive_candidate_grid()
     if args.grid_frames or args.grid_pixels:
         frames = (
             [int(value) for value in args.grid_frames.split(",")]
@@ -85,7 +111,6 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
         candidates = [VideoCandidate(int(frames_value), int(pixels_value))
                       for frames_value in frames for pixels_value in pixels]
         print(f"Using reduced grid: {len(candidates)} candidates", flush=True)
-    rows = []
     for index, sample in enumerate(samples, start=1):
         print(f"[{index}/{len(samples)}] calibrating {sample.sample_id}", flush=True)
         try:
@@ -93,7 +118,7 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
                 sample,
                 args.dataset_root,
                 processor,
-                contract.visual_token_milestones,
+                targets,
                 contract.calibration_tolerance,
                 candidates,
             )
@@ -102,7 +127,7 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
             # record an explicit error row and continue with the next sample.
             print(f"  ERROR {sample.sample_id}: {exc}", flush=True)
             sample_rows = []
-            for target in contract.visual_token_milestones:
+            for target in targets:
                 sample_rows.append({
                     "row_id": f"{sample.sample_id}:{target}",
                     "paper_figure": "Figure 1(a)",
@@ -128,6 +153,28 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_cohort(args: argparse.Namespace) -> int:
+    contract = _contract(args)
+    targets = tuple(int(value) for value in (args.targets or contract.visual_token_milestones))
+    try:
+        rows = read_calibration(args.input)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+    cohort = select_paired_cohort(rows, targets, args.minimum_samples)
+    selection = cohort.to_dict()
+    Path(args.output_selection).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.output_selection).write_text(
+        json.dumps(selection, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    samples = load_vdc_manifest(args.manifest, args.dataset_root)
+    selected = set(cohort.sample_ids)
+    selected_samples = [sample for sample in samples if sample.sample_id in selected]
+    write_jsonl(args.output_manifest, [asdict(sample) for sample in selected_samples])
+    print(json.dumps(selection, ensure_ascii=False, indent=2))
+    return 0 if cohort.valid else 2
+
+
 def _cmd_audit(args: argparse.Namespace) -> int:
     contract = _contract(args)
     rows = read_jsonl(args.input)
@@ -141,6 +188,18 @@ def _cmd_audit(args: argparse.Namespace) -> int:
     payload["coverage"] = coverage.to_dict()
     report.valid = report.valid and coverage.valid
     payload["valid"] = report.valid
+    if args.calibration:
+        try:
+            calibration_rows = read_calibration(args.calibration)
+            calibration_audit = audit_calibration(
+                calibration_rows,
+                args.calibration_targets or contract.visual_token_milestones,
+                args.minimum_samples,
+            )
+        except (OSError, ValueError) as exc:
+            calibration_audit = {"valid": False, "error": str(exc)}
+        payload["calibration"] = calibration_audit
+        payload["valid"] = payload["valid"] and calibration_audit["valid"]
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     Path(args.output).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -185,10 +244,15 @@ def build_parser() -> argparse.ArgumentParser:
     calibrate.add_argument("--manifest", default="dataset/VideoDetailCaption/subset_manifest.jsonl")
     calibrate.add_argument("--dataset-root", default="dataset/VideoDetailCaption")
     calibrate.add_argument("--model", default="Qwen/Qwen2-VL-7B-Instruct")
-    calibrate.add_argument("--min-pixels", type=int, default=256 * 28 * 28)
+    calibrate.add_argument("--min-pixels", type=int, default=128 * 28 * 28)
     calibrate.add_argument("--max-pixels", type=int, default=1024 * 28 * 28)
     calibrate.add_argument("--output", default="results/sparrow_validation/calibration.jsonl")
     calibrate.add_argument("--limit", type=int)
+    calibrate.add_argument("--targets", type=int, nargs="+", help="Only measure these token targets.")
+    calibrate.add_argument(
+        "--reuse-calibration",
+        help="Strict existing calibration JSONL whose other targets are copied into the new output.",
+    )
     calibrate.add_argument(
         "--grid-frames",
         help="Comma-separated frame counts replacing the default calibration grid "
@@ -200,8 +264,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     calibrate.set_defaults(function=_cmd_calibrate)
 
+    cohort = sub.add_parser("cohort", help="Select a paired status=ok calibration cohort.")
+    cohort.add_argument("--input", required=True)
+    cohort.add_argument("--manifest", default="dataset/VideoDetailCaption/subset_manifest.jsonl")
+    cohort.add_argument("--dataset-root", default="dataset/VideoDetailCaption")
+    cohort.add_argument("--output-manifest", required=True)
+    cohort.add_argument("--output-selection", required=True)
+    cohort.add_argument("--targets", type=int, nargs="+")
+    cohort.add_argument("--minimum-samples", type=int, default=10)
+    cohort.set_defaults(function=_cmd_cohort)
+
     audit = sub.add_parser("audit")
     audit.add_argument("--input", required=True)
+    audit.add_argument("--calibration")
+    audit.add_argument("--calibration-targets", type=int, nargs="+", default=None)
+    audit.add_argument("--minimum-samples", type=int, default=10)
     audit.add_argument("--output", default="results/sparrow_validation/audit.json")
     audit.set_defaults(function=_cmd_audit)
 
@@ -214,8 +291,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     values = list(sys.argv[1:] if argv is None else argv)
-    if values and values[0] in {"msd", "attention", "layers", "draft_attention", "all"}:
-        command = values.pop(0)
+    delegated_commands = {"msd", "attention", "layers", "draft_attention", "all"}
+    command_index = None
+    if values and values[0] in delegated_commands:
+        command_index = 0
+    elif len(values) >= 3 and values[0] == "--contract" and values[2] in delegated_commands:
+        # The paper runner passes the global contract option before the
+        # delegated GPU command.  Remove only the command token and let the
+        # delegated parser consume --contract itself.
+        command_index = 2
+    if command_index is not None:
+        command = values.pop(command_index)
         if command == "msd":
             from .run_msd import build_parser as delegated_parser, run as delegated_run
         elif command == "attention":

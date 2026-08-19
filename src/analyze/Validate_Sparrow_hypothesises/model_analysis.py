@@ -57,6 +57,7 @@ def load_qwen_model(
     device_map: str = "auto",
     dtype: str = "float16",
     quantized: bool = False,
+    attn_implementation: str = "eager",
 ) -> Any:
     """Load a Qwen-VL checkpoint with eager attention for inspectable probes."""
 
@@ -74,7 +75,7 @@ def load_qwen_model(
         "trust_remote_code": True,
         "device_map": device_map,
         "torch_dtype": torch_dtype,
-        "attn_implementation": "eager",
+        "attn_implementation": attn_implementation,
         "low_cpu_mem_usage": True,
     }
     if quantized:
@@ -107,8 +108,41 @@ def _video_token_id(model: Any) -> int:
     return int(value)
 
 
+def _as_feature_tensor(features: Any) -> torch.Tensor:
+    """Normalize Qwen vision feature return values across Transformers versions."""
+
+    if isinstance(features, torch.Tensor):
+        return features
+    if isinstance(features, (list, tuple)):
+        if not features:
+            raise ValueError("vision encoder returned no features")
+        return torch.cat(list(features), dim=0)
+    raise TypeError(f"unsupported vision feature type: {type(features)!r}")
+
+
+def _scatter_feature_tokens(
+    input_ids: torch.Tensor,
+    inputs_embeds: torch.Tensor,
+    features: torch.Tensor,
+    token_id: int,
+    name: str,
+) -> torch.Tensor:
+    """Replace multimodal placeholder embeddings using Qwen2-VL masks."""
+
+    token_mask = input_ids == int(token_id)
+    token_count = int(token_mask.sum().item())
+    feature_count = int(features.shape[0])
+    if token_count != feature_count:
+        raise ValueError(
+            f"{name} features and tokens do not match: tokens={token_count}, "
+            f"features={feature_count}"
+        )
+    expanded = token_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+    return inputs_embeds.masked_scatter(expanded, features)
+
+
 @dataclass
-class PreparedQwen25:
+class PreparedQwen2:
     input_ids: torch.Tensor
     attention_mask: torch.Tensor | None
     inputs_embeds: torch.Tensor
@@ -118,8 +152,8 @@ class PreparedQwen25:
     input_fingerprint: str
 
 
-def prepare_qwen25_prefill(model: Any, batch: Any, device: torch.device | str | None = None) -> PreparedQwen25:
-    """Construct the fused Qwen2.5-VL input embedding and M-RoPE positions."""
+def prepare_qwen2vl_prefill(model: Any, batch: Any, device: torch.device | str | None = None) -> PreparedQwen2:
+    """Construct the fused Qwen2-VL input embedding and M-RoPE positions."""
 
     input_ids = _tensor(batch, "input_ids")
     if input_ids is None:
@@ -145,29 +179,50 @@ def prepare_qwen25_prefill(model: Any, batch: Any, device: torch.device | str | 
     with torch.inference_mode():
         inputs_embeds = vl_model.get_input_embeddings()(input_ids)
         if pixel_values is not None:
-            image_features = vl_model.get_image_features(pixel_values, image_grid)
-            image_features = torch.cat(image_features, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            image_mask, _ = vl_model.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, image_features=image_features
+            image_features = _as_feature_tensor(
+                vl_model.get_image_features(pixel_values, image_grid)
+            ).to(inputs_embeds.device, inputs_embeds.dtype)
+            inputs_embeds = _scatter_feature_tokens(
+                input_ids,
+                inputs_embeds,
+                image_features,
+                getattr(model.config, "image_token_id"),
+                "image",
             )
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
         if pixel_values_videos is None:
             raise ValueError("video experiment requires processor key pixel_values_videos")
-        video_features = vl_model.get_video_features(pixel_values_videos, video_grid)
-        video_features = torch.cat(video_features, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-        _, video_mask = vl_model.get_placeholder_mask(
-            input_ids, inputs_embeds=inputs_embeds, video_features=video_features
-        )
-        inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_features)
-        position_ids, rope_deltas = vl_model.get_rope_index(
+        video_features = _as_feature_tensor(
+            vl_model.get_video_features(pixel_values_videos, video_grid)
+        ).to(inputs_embeds.device, inputs_embeds.dtype)
+        inputs_embeds = _scatter_feature_tokens(
             input_ids,
-            image_grid,
-            video_grid,
-            second_per_grid_ts=second_per_grid_ts,
-            attention_mask=attention_mask,
+            inputs_embeds,
+            video_features,
+            getattr(model.config, "video_token_id"),
+            "video",
         )
+        try:
+            # Newer Qwen2.5 processors expose temporal seconds in the RoPE
+            # API.  Qwen2-VL's released API does not; keep the local layer
+            # contract on Qwen2-VL without routing to a Qwen2.5 checkpoint.
+            position_ids, rope_deltas = vl_model.get_rope_index(
+                input_ids,
+                image_grid,
+                video_grid,
+                second_per_grid_ts=second_per_grid_ts,
+                attention_mask=attention_mask,
+            )
+        except TypeError as exc:
+            if "second_per_grid_ts" not in str(exc):
+                raise
+            position_ids, rope_deltas = vl_model.get_rope_index(
+                input_ids,
+                image_grid,
+                video_grid,
+                attention_mask=attention_mask,
+            )
     video_positions = (input_ids[0] == _video_token_id(model)).nonzero(as_tuple=False).flatten()
-    return PreparedQwen25(
+    return PreparedQwen2(
         input_ids=input_ids,
         attention_mask=attention_mask,
         inputs_embeds=inputs_embeds,
@@ -176,6 +231,12 @@ def prepare_qwen25_prefill(model: Any, batch: Any, device: torch.device | str | 
         video_positions=video_positions,
         input_fingerprint=_hash_tensor(input_ids),
     )
+
+
+# Compatibility name for older local scripts.  The implementation above is
+# the Qwen2-VL path used by the contract; no Qwen2.5 checkpoint is loaded.
+PreparedQwen25 = PreparedQwen2
+prepare_qwen25_prefill = prepare_qwen2vl_prefill
 
 
 def _special_ids(processor: Any) -> set[int]:
@@ -229,7 +290,10 @@ def find_instruction_masks(
     if not instruction:
         instruction = [index for index in range(upper) if index not in visual]
     query_index = instruction[-1] if instruction else max(0, upper - 1)
-    text = [index for index in range(len(ids)) if index not in visual and index not in instruction]
+    # Only prompt text before the assistant generation marker is queryable
+    # evidence.  Including the assistant marker/suffix can select rows whose
+    # causal mask is entirely ``-inf`` and produces NaN softmax values.
+    text = [index for index in range(upper) if index not in visual and index not in instruction]
     return {
         "instruction_positions": instruction,
         "visual_positions": sorted(visual),
@@ -285,9 +349,9 @@ def _query_attention(
     rotary = _attention_position_embeddings(module, hidden_states, position_ids, position_embeddings)
     if rotary is not None:
         try:
-            from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import apply_multimodal_rotary_pos_emb
-        except ImportError:
             from transformers.models.qwen2_vl.modeling_qwen2_vl import apply_multimodal_rotary_pos_emb
+        except ImportError:
+            from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import apply_multimodal_rotary_pos_emb
         query, key = apply_multimodal_rotary_pos_emb(
             query, key, rotary[0], rotary[1], _mrope_section(module)
         )
@@ -316,7 +380,10 @@ def _query_attention(
             query_indices, device=scores.device
         )[:, None]
         scores = scores.masked_fill(causal[None, None, :, :], torch.finfo(scores.dtype).min)
-    weights = torch.softmax(scores.float(), dim=-1)
+    finite_rows = torch.isfinite(scores).any(dim=-1, keepdim=True)
+    safe_scores = torch.where(finite_rows, scores, torch.zeros_like(scores))
+    weights = torch.softmax(safe_scores.float(), dim=-1)
+    weights = torch.where(finite_rows, weights, torch.zeros_like(weights))
     result = weights[0].detach().to("cpu")
     return result[:, 0, :] if len(query_indices) == 1 else result.permute(1, 0, 2)
 
@@ -448,11 +515,17 @@ def _record_cosine(
     visual: torch.Tensor,
     text: torch.Tensor,
 ) -> None:
-    values = torch.nn.functional.cosine_similarity(hidden[0].float(), input_embeds[0].float(), dim=-1)
+    # Accelerate may place decoder blocks on different devices.  Hooks see
+    # each block's output on that block's device, while the fused input
+    # embedding lives on the embedding device; align them before comparing.
+    reference = input_embeds[0].to(hidden.device)
+    visual_indices = visual.to(hidden.device)
+    text_indices = text.to(hidden.device)
+    values = torch.nn.functional.cosine_similarity(hidden[0].float(), reference.float(), dim=-1)
     result.append({
         "layer": int(layer),
-        "visual_cosine": float(values[visual].mean().item()),
-        "text_cosine": float(values[text].mean().item()),
+        "visual_cosine": float(values[visual_indices].mean().item()),
+        "text_cosine": float(values[text_indices].mean().item()),
     })
 
 

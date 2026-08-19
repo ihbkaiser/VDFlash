@@ -9,7 +9,7 @@
 #   - Hugging Face models cached (see RUN_ON_GPU.md).
 #
 # It reproduces Figure 1(a)/1(b) with MSD, Figure 2 on both the target model
-# and the MSD draft model, Figure 3/6 layer analyses on Qwen2.5-VL-7B, then
+# and the MSD draft model, Figure 3/6 layer analyses on the cached Qwen2-VL-7B, then
 # audits everything and renders REPORT.md + figures + statistics.
 #
 # Usage:

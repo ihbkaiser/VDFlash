@@ -78,16 +78,16 @@ def run_preflight(
     try:
         import transformers
 
-        qwen25_available = hasattr(transformers, "Qwen2_5_VLForConditionalGeneration")
+        qwen_vl_available = hasattr(transformers, "Qwen2VLForConditionalGeneration")
         add(
-            "qwen25_vl",
-            "ok" if qwen25_available else "error",
-            "Qwen2.5-VL Transformers integration available"
-            if qwen25_available
-            else "Qwen2.5-VL is unavailable; install Transformers 4.49.0 or newer",
+            "qwen_vl",
+            "ok" if qwen_vl_available else "error",
+            "Qwen2-VL Transformers integration available"
+            if qwen_vl_available
+            else "Qwen2-VL is unavailable; install a recent Transformers release",
         )
     except Exception as exc:  # pragma: no cover
-        add("qwen25_vl", "error", str(exc))
+        add("qwen_vl", "error", str(exc))
 
     eagle_root = root / "externals" / "MSD" / "EAGLE"
     if eagle_root.exists():

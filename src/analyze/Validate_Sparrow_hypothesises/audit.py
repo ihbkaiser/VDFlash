@@ -139,6 +139,11 @@ def audit_losslessness(rows: Iterable[Mapping[str, Any]]) -> AuditReport:
     valid = 0
     for row in rows:
         row_id = str(row.get("row_id")) if row.get("row_id") is not None else None
+        # Layer ablation rows intentionally compare a modified generation to
+        # the native target.  Their prefix/ROUGE metrics belong to Figure 3;
+        # they are not speculative-decoding losslessness evidence.
+        if row.get("paper_figure") in {"Figure 3", "Figure 3(b)", "Figure 6 / Appendix D"}:
+            continue
         target = row.get("target_output_ids")
         speculative = row.get("speculative_output_ids")
         if target is None and speculative is None:

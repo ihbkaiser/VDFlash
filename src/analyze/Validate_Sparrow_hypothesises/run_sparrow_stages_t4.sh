@@ -3,8 +3,7 @@
 #
 # Stages run one after another (single 16 GB T4), each in its own process so
 # VRAM is released between stages.  Completed stages are skipped on re-run
-# (resume).  The script waits for the fast calibration to finish and for the
-# Qwen2.5-VL-7B download (needed by the layer analysis) to complete.
+# (resume). The layer analysis reuses the cached Qwen2-VL-7B checkpoint.
 #
 # Usage: ./run_sparrow_stages_t4.sh [--limit N] [--skip-msd] ...
 set -euo pipefail
@@ -81,19 +80,10 @@ else
         > "$LOG_DIR/draft_attention.log" 2>&1 || { echo "draft_attention FAILED"; tail -20 "$LOG_DIR/draft_attention.log"; exit 1; }
 fi
 
-# 2. Wait for the Qwen2.5-VL-7B download before the layer analysis.
-for _ in $(seq 1 400); do
-    if [[ -d "$HOME/.cache/huggingface/hub/models--Qwen--Qwen2.5-VL-7B-Instruct" ]] \
-        && [[ -f "$HOME/.cache/huggingface/hub/models--Qwen--Qwen2.5-VL-7B-Instruct/refs/main" ]]; then
-        break
-    fi
-    sleep 15
-done
-
 if [[ -s "$LAYERS_OUT" ]]; then
     echo "skip layers (exists)"
 else
-    echo "== stage layers (Figure 3+6, Qwen2.5-VL-7B) $(date -Is) =="
+    echo "== stage layers (Figure 3+6, Qwen2-VL-7B) $(date -Is) =="
     python -u -m src.analyze.Validate_Sparrow_hypothesises layers \
         "${CAL_ARGS[@]}" --experiments both --quantized \
         --output "$LAYERS_OUT" "${EXTRA_ARGS[@]}" \

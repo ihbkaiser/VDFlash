@@ -7,8 +7,11 @@ The harness uses the local duration-representative 50-sample
 `VideoDetailCaption` subset. It verifies MSD mechanisms and trends; it is not
 intended to reproduce the paper's ViSpec baseline, benchmark mix, or hardware
 specific absolute numbers. It does not download or commit model weights.
-The official MSD/Qwen2-VL and Qwen2.5-VL checkpoints are selected in the
-contract; actual inference requires a Python 3.10 CUDA environment.
+The local contract uses the cached Qwen2-VL checkpoint for both MSD and the
+remaining layer analyses; actual inference requires a Python 3.10 CUDA
+environment. This is a local substitution for the paper's Qwen2.5-VL layer
+checkpoint, so layer results are local Qwen2-VL validation rather than an exact
+model reproduction.
 
 The default `local_insight_vdc50` profile is deliberately strict: only rows
 whose calibration status is `ok` are evidence, every required milestone and
@@ -46,6 +49,30 @@ python -m src.analyze.Validate_Sparrow_hypothesises calibrate \
 Every row records the nearest measured point to 0.4K, 3K, 13K or 25K and is
 marked `ok` or `out_of_tolerance`. No estimated count is accepted as a final
 experiment result.
+
+When 3K/13K/25K calibration is already trusted, the 0.4K point can be
+supplemented without repeating those three targets.  The command below copies
+only the strict existing non-400 rows and measures 400 with a denser short
+context grid:
+
+```bash
+HF_HOME=/path/to/hf-cache HF_HUB_OFFLINE=1 \
+python -m src.analyze.Validate_Sparrow_hypothesises calibrate \
+  --targets 400 \
+  --reuse-calibration results/sparrow_validation_20260818/calibration.jsonl \
+  --grid-frames 1,2,3,4,6,8,12,16 \
+  --grid-pixels 100352,125440,150528,163072,175616,188160,200704,225792,250880,301056 \
+  --output results/sparrow_validation_qwen2vl_supplement/calibration.jsonl
+```
+
+Then create one shared, status=`ok` cohort before any GPU stage:
+
+```bash
+python -m src.analyze.Validate_Sparrow_hypothesises cohort \
+  --input results/sparrow_validation_qwen2vl_supplement/calibration.jsonl \
+  --output-manifest results/sparrow_validation_qwen2vl_supplement/cohort_manifest.jsonl \
+  --output-selection results/sparrow_validation_qwen2vl_supplement/cohort_selection.json
+```
 
 ## Audit and report
 
@@ -251,8 +278,9 @@ summary rows provide selector scores without requiring an O(L²) artifact.
 ## Figure 3 and Figure 6: layer analyses
 
 `layers` runs Figure 3(a) visual-KV truncation, Figure 3(b) final-instruction
-visual attention by layer, and Figure 6/Appendix D cosine retention. It uses
-Qwen2.5-VL-7B, eager attention and bounded hooks for hidden states:
+visual attention by layer, and Figure 6/Appendix D cosine retention. The local
+profile uses the cached Qwen2-VL-7B checkpoint, SDPA attention and bounded
+hooks for hidden states:
 
 ```bash
 python -m src.analyze.Validate_Sparrow_hypothesises layers \

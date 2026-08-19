@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
 # Launch the complete local Sparrow verification inside a long-lived tmux job.
-# The wrapper downloads only the missing Qwen2.5-VL layer-analysis checkpoint,
-# then delegates the measured run/report generation to run_sparrow_validation_gpu.sh.
+# The wrapper delegates the measured run/report generation to
+# run_sparrow_validation_gpu.sh. All stages use the cached Qwen2-VL checkpoints.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
 RUN_DIR="${RUN_DIR:-results/sparrow_validation_tmux_20260815_1643}"
-MODEL_ID="Qwen/Qwen2.5-VL-7B-Instruct"
-
 source "$REPO_ROOT/src/analyze/Validate_Sparrow_hypothesises/activate_msd_env.sh"
 mkdir -p "$RUN_DIR"
 exec > >(tee -a "$RUN_DIR/tmux.log") 2>&1
@@ -21,15 +19,6 @@ echo "MSD_DEVICE_MAP=${MSD_DEVICE_MAP:-model_parallel}"
 echo "MSD_MAX_MEMORY=${MSD_MAX_MEMORY:-0:22GiB,1:14GiB}"
 
 nvidia-smi
-
-MODEL_CACHE_DIR="$HF_HOME/hub"
-MODEL_SNAPSHOT_DIR="$MODEL_CACHE_DIR/models--Qwen--Qwen2.5-VL-7B-Instruct/snapshots"
-if [[ ! -d "$MODEL_SNAPSHOT_DIR" ]] || ! find "$MODEL_SNAPSHOT_DIR" -mindepth 1 -maxdepth 1 -type d -print -quit | grep -q .; then
-    echo "Downloading missing $MODEL_ID into $MODEL_CACHE_DIR"
-    hf download "$MODEL_ID" --cache-dir "$MODEL_CACHE_DIR" --max-workers 4
-else
-    echo "Found cached $MODEL_ID"
-fi
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export MSD_DEVICE_MAP="${MSD_DEVICE_MAP:-model_parallel}"

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import os
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Sequence
@@ -39,6 +40,69 @@ from .runtime import (
     require_cuda,
 )
 from .run_attention import _calibration_jobs, _fingerprint
+
+
+def _query_attention_weights(
+    module: Any,
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    position_ids: torch.Tensor | None,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
+    query_positions: Sequence[int],
+) -> torch.Tensor:
+    """Compute only selected draft attention rows.
+
+    The vendored eager EAGLE attention normally creates ``[S, S]`` weights
+    even when the caller needs one final-instruction query.  At 25K visual
+    tokens that tensor is tens of GiB.  This compact path computes Q/K and
+    softmax only for the requested rows; the actual draft forward remains
+    SDPA-backed and therefore has the same model output.
+    """
+
+    from eagle.model import ea_qwen2vl_model as ea_module
+
+    batch, sequence_length, _ = hidden_states.shape
+    query = module.q_proj(hidden_states).view(
+        batch, sequence_length, -1, module.head_dim
+    ).transpose(1, 2)
+    key = module.k_proj(hidden_states).view(
+        batch, sequence_length, -1, module.head_dim
+    ).transpose(1, 2)
+    if position_embeddings is None:
+        if position_ids is None:
+            raise ValueError("draft attention requires position IDs for rotary embeddings")
+        position_embeddings = module.rotary_emb(hidden_states, position_ids)
+    query, key = ea_module.apply_multimodal_rotary_pos_emb(
+        query,
+        key,
+        position_embeddings[0],
+        position_embeddings[1],
+        module.rope_scaling["mrope_section"],
+    )
+    key = ea_module.repeat_kv(key, module.num_key_value_groups)
+    selected = [int(value) for value in query_positions]
+    if not selected or min(selected) < 0 or max(selected) >= sequence_length:
+        raise IndexError("draft attention query position is outside the prefill sequence")
+    scores = torch.matmul(query[:, :, selected, :], key.transpose(-1, -2))
+    scores = scores / (float(module.head_dim) ** 0.5)
+    key_length = scores.shape[-1]
+    if attention_mask is not None:
+        mask = attention_mask[..., :key_length]
+        if mask.ndim == 4:
+            mask = mask[:, :, selected, :]
+        elif mask.ndim == 3:
+            mask = mask[:, selected, :].unsqueeze(1)
+        elif mask.ndim == 2:
+            mask = mask[:, None, None, :]
+        else:
+            raise ValueError(f"unsupported draft attention mask rank: {mask.ndim}")
+        scores = scores + mask.to(scores.dtype)
+    else:
+        causal = torch.arange(key_length, device=scores.device)[None, :] > torch.as_tensor(
+            selected, device=scores.device
+        )[:, None]
+        scores = scores.masked_fill(causal[None, None, :, :], torch.finfo(scores.dtype).min)
+    return torch.softmax(scores.float(), dim=-1)[0].detach().to("cpu")
 
 
 @contextmanager
@@ -64,16 +128,25 @@ def capture_draft_query_attention(
         module = layer.self_attn
         original = module.forward
 
-        def wrapped(*args: Any, _index=layer_index, _original=original, **kwargs: Any):
-            is_prefill = kwargs.get("past_key_value") is None
+        def wrapped(*args: Any, _module=module, _index=layer_index, _original=original, **kwargs: Any):
+            past_key_value = kwargs.get("past_key_value", args[3] if len(args) > 3 else None)
+            is_prefill = past_key_value is None
             if is_prefill:
-                kwargs["output_attentions"] = True
+                hidden_states = kwargs.get("hidden_states", args[0] if args else None)
+                if hidden_states is None:
+                    raise ValueError("draft attention hook received no hidden states")
+                captured[_index] = _query_attention_weights(
+                    _module,
+                    hidden_states,
+                    kwargs.get("attention_mask", args[1] if len(args) > 1 else None),
+                    kwargs.get("position_ids", args[2] if len(args) > 2 else None),
+                    kwargs.get("position_embeddings"),
+                    positions,
+                )
+                # Keep the underlying runtime on its memory-efficient SDPA
+                # path; requesting output_attentions would reintroduce S².
+                kwargs["output_attentions"] = False
             result = _original(*args, **kwargs)
-            if is_prefill:
-                # Post-softmax weights: [1, heads, q_len, key_len].
-                weights = result[1]
-                if weights is not None and weights.shape[2] > max(positions):
-                    captured[_index] = weights[0, :, positions, :].float().detach().to("cpu")
             return result
 
         originals.append((module, original))
@@ -186,26 +259,27 @@ def _rows_for_policy(
         "max_pixels": max_pixels,
     }
     rows: list[dict[str, Any]] = []
-    for position, weight in enumerate(attention[visual].tolist()):
-        row = dict(common)
-        row.update({
-            "row_id": f"{sample.sample_id}:{visual.numel()}:{policy}:draft:visual:{position}",
-            "modality": "visual",
-            "token_position": int(visual[position].item()),
-            "visual_index": position,
-            "attention_weight": float(weight),
-        })
-        rows.append(row)
-    for modality, positions in (("instruction", instruction), ("text", text)):
-        for position in positions.tolist():
+    if os.environ.get("SPARROW_COMPACT_ATTENTION") != "1":
+        for position, weight in enumerate(attention[visual].tolist()):
             row = dict(common)
             row.update({
-                "row_id": f"{sample.sample_id}:{visual.numel()}:{policy}:draft:{modality}:{position}",
-                "modality": modality,
-                "token_position": int(position),
-                "attention_weight": float(attention[position].item()),
+                "row_id": f"{sample.sample_id}:{visual.numel()}:{policy}:draft:visual:{position}",
+                "modality": "visual",
+                "token_position": int(visual[position].item()),
+                "visual_index": position,
+                "attention_weight": float(weight),
             })
             rows.append(row)
+        for modality, positions in (("instruction", instruction), ("text", text)):
+            for position in positions.tolist():
+                row = dict(common)
+                row.update({
+                    "row_id": f"{sample.sample_id}:{visual.numel()}:{policy}:draft:{modality}:{position}",
+                    "modality": modality,
+                    "token_position": int(position),
+                    "attention_weight": float(attention[position].item()),
+                })
+                rows.append(row)
     summary_row = dict(common)
     summary_row.update({
         "row_id": f"{sample.sample_id}:{visual.numel()}:{policy}:draft:summary",

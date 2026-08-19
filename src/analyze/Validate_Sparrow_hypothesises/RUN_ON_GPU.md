@@ -13,9 +13,9 @@ Speculative Decoding in Video LLMs* (ACL 2026) bằng **MSD**
 | I1 | Fig 1(a): accepted length suy giảm khi visual tokens tăng (0.4k→25k) | `msd --condition full` | MSD-Qwen2VL-7B (4-bit) | accepted length, decode/e2e speedup |
 | I2 | Fig 1(b): negative visual gain — prune draft visual input (100→0%) làm accepted length tăng | `msd --condition retention` | MSD-Qwen2VL-7B | accepted length, lossless rate |
 | I3 | Fig 2: attention dilution trong draft model | `attention` (target proxy) + **`draft_attention`** (MSD draft thật) | Qwen2-VL-7B / MSD draft | instruction/visual/text attention mass, visual entropy |
-| I4 | Fig 3(a): visual KV indispensable ở layer đầu, robust sau layer ~20 | `layers` figure3 | Qwen2.5-VL-7B | prefix agreement, output ROUGE-L, VDC answer-quality delta theo layer cut |
-| I5 | Fig 3(b): middle layers là arena chính của visual-text interaction | `layers` figure3_attention | Qwen2.5-VL-7B | per-layer/per-head visual mass |
-| I6 | Fig 6/App D: visual semantics internalize — visual cosine < 0.25 gần layer 20 | `layers` figure6 | Qwen2.5-VL-7B | layerwise visual/text cosine |
+| I4 | Fig 3(a): visual KV indispensable ở layer đầu, robust sau layer ~20 | `layers` figure3 | Qwen2-VL-7B (local substitution) | prefix agreement, output ROUGE-L, VDC answer-quality delta theo layer cut |
+| I5 | Fig 3(b): middle layers là arena chính của visual-text interaction | `layers` figure3_attention | Qwen2-VL-7B (local substitution) | per-layer/per-head visual mass |
+| I6 | Fig 6/App D: visual semantics internalize — visual cosine < 0.25 gần layer 20 | `layers` figure6 | Qwen2-VL-7B (local substitution) | layerwise visual/text cosine |
 
 Lưu ý kiểm chứng trung thực: paper đo attention dilution của **draft model**.
 Runner `draft_attention` (mới) hook vào các `self_attn` layer của EAGLE draft
@@ -48,12 +48,12 @@ Model cần có trong HF cache (hoặc `hf auth login` để tải khi chạy):
 
 - `Qwen/Qwen2-VL-7B-Instruct` (target của MSD, dùng cho Fig 1/2)
 - `lucylyn/MSD-Qwen2VL-7B-Instruct` (draft MSD chính thức)
-- `Qwen/Qwen2.5-VL-7B-Instruct` (~20 GB, dùng cho Fig 3/6)
+- `Qwen/Qwen2-VL-7B-Instruct` (dùng cho Fig 3/6 trong local profile)
 
 ```bash
 hf download Qwen/Qwen2-VL-7B-Instruct --local-dir ~/.cache/...  # hoặc để AutoModel tự tải
 hf download lucylyn/MSD-Qwen2VL-7B-Instruct
-hf download Qwen/Qwen2.5-VL-7B-Instruct
+# Qwen2-VL đã được dùng cho target/MSD và được tái sử dụng cho Fig 3/6
 ```
 
 Dataset: `dataset/VideoDetailCaption/` (50 videos + `subset_manifest.jsonl`)
