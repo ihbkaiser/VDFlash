@@ -53,4 +53,8 @@ dataset/qwen25vl-3b-dflash-sharegpt68k-latest
 results/
 llava_dflash_68k_clean_3b.jsonl
 sample.json
+findings.md
+progress.md
+task_plan.md
+docs/superpowers/
 .venv-msd

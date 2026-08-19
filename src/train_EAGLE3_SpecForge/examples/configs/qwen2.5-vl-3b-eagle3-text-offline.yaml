@@ -1,0 +1,51 @@
+model:
+  target_model_path: Qwen/Qwen2.5-VL-3B-Instruct
+  draft_model_config: configs/qwen2.5-vl-3b-eagle3.json
+  target_backend: sglang
+  input_modality: text
+  embedding_key: model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+  vocab_mapping_path: artifacts/qwen25vl_eagle3_text/hidden_states/vocab_mapping/vocab_mapping.pt
+  torch_dtype: bfloat16
+  sglang_attention_backend: flashinfer
+  sglang_mem_fraction_static: 0.4
+  sglang_disable_radix_cache: true
+
+data:
+  hidden_states_path: artifacts/qwen25vl_eagle3_text/hidden_states
+  max_length: 2048
+  chat_template: qwen
+  train_only_last_turn: true
+  build_dataset_num_proc: 8
+  dataloader_num_workers: 8
+  cache_dir: artifacts/qwen25vl_eagle3_text/cache
+
+training:
+  strategy: eagle3
+  num_epochs: 10
+  batch_size: 1
+  accumulation_steps: 2
+  fsdp_sharding: NO_SHARD
+  learning_rate: 5.0e-5
+  lr_scheduler: cosine
+  warmup_ratio: 0.015
+  max_grad_norm: 0.5
+  optimizer_cpu_offload: false
+  ttt_length: 7
+  attention_backend: flex_attention
+  save_interval: 1000
+  log_interval: 50
+  dist_timeout: 20
+  seed: 0
+
+tracking:
+  report_to: none
+
+run_id: qwen25vl-3b-eagle3-text-offline
+output_dir: artifacts/qwen25vl_eagle3_text/outputs/qwen25vl-3b-eagle3-text-offline
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 2
