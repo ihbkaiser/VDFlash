@@ -105,6 +105,40 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
+def eager_attention_forward(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Reference attention implementation without SDPA/Flex/Flash kernels.
+
+    ``attention_mask`` is expected to be the additive 4-D mask produced by
+    :func:`prepare_decoder_attention_mask`.  When it is omitted, apply a
+    standard causal mask so this helper is also safe for direct callers.
+    """
+    q_len = query_states.shape[-2]
+    kv_len = key_states.shape[-2]
+    attn_weights = torch.matmul(
+        query_states, key_states.transpose(2, 3)
+    ) / math.sqrt(query_states.shape[-1])
+
+    if attention_mask is None:
+        causal_mask = torch.ones(
+            (q_len, kv_len), dtype=torch.bool, device=query_states.device
+        ).triu(diagonal=kv_len - q_len + 1)
+        attn_weights = attn_weights.masked_fill(
+            causal_mask, torch.finfo(attn_weights.dtype).min
+        )
+    else:
+        attn_weights = attn_weights + attention_mask
+
+    attn_weights = nn.functional.softmax(
+        attn_weights, dim=-1, dtype=torch.float32
+    ).to(query_states.dtype)
+    return torch.matmul(attn_weights, value_states)
+
+
 def get_rope_config(config):
     """Get (rope_theta, rope_params) from config, supporting both v4 and v5.
 
@@ -565,6 +599,7 @@ class LlamaAttention(nn.Module):
             self.num_heads * self.head_dim, self.hidden_size, bias=False
         )
         self._init_rope()
+        self._use_eager_attention = False
 
     def _init_rope(self):
         rope_theta, rope_scaling = get_rope_config(self.config)
@@ -705,14 +740,22 @@ class LlamaAttention(nn.Module):
             key_states = repeat_kv(key_states, self.num_key_value_groups)
             value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                query_states,
-                key_states,
-                value_states,
-                attn_mask=attention_mask,
-                is_causal=attention_mask is None,
-                dropout_p=0.0,
-            )
+            if self._use_eager_attention:
+                attn_output = eager_attention_forward(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attention_mask=attention_mask,
+                )
+            else:
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attn_mask=attention_mask,
+                    is_causal=attention_mask is None,
+                    dropout_p=0.0,
+                )
 
         else:
             lck = len(cache_hidden[0])
@@ -783,6 +826,14 @@ class LlamaAttention(nn.Module):
         attn_output = self.o_proj(attn_output)
 
         return attn_output
+
+
+class LlamaEagerAttention(LlamaAttention):
+    """Unfused reference attention used to isolate kernel/compiler issues."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self._use_eager_attention = True
 
 
 class LlamaFlexAttention(LlamaAttention):
@@ -1574,6 +1625,8 @@ class LlamaDecoderLayer(nn.Module):
 
         if attention_backend == "sdpa":
             self.self_attn = LlamaAttention(config=config)
+        elif attention_backend == "eager":
+            self.self_attn = LlamaEagerAttention(config=config)
         elif attention_backend == "flex_attention":
             print_with_rank("Using flex attention on draft model training!")
             self.self_attn = LlamaFlexAttention(config=config)
