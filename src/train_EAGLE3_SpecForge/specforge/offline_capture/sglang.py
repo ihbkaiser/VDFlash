@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 import torch
+from torch.nn.utils.rnn import pad_sequence
 
 
 @dataclass
@@ -76,12 +77,14 @@ class OfflineSGLangCapture:
             multimodal_inputs=multimodal_inputs,
         )
         return OfflineCaptureBatch(
-            hidden_states=torch.cat(
-                [hidden.unsqueeze(0) for hidden in aux_states], dim=0
-            ),
-            last_hidden_states=torch.cat(
-                [hidden.unsqueeze(0) for hidden in last_states], dim=0
-            ),
+            # SGLang returns one tensor per request. Requests in the same
+            # batch can have different active lengths, so concatenating them
+            # directly fails (for example, 1907 vs. 353 tokens). Pad along
+            # the sequence dimension while keeping batch-first layout. The
+            # feature writer later iterates over the batch and persists each
+            # padded sample together with its loss mask.
+            hidden_states=pad_sequence(list(aux_states), batch_first=True),
+            last_hidden_states=pad_sequence(list(last_states), batch_first=True),
             input_ids=torch.cat([row[0] for row in data], dim=0),
             attention_mask=torch.cat([row[1] for row in data], dim=0),
             loss_mask=torch.cat([row[2] for row in data], dim=0),
