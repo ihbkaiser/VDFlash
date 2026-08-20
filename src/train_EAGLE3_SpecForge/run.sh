@@ -19,4 +19,5 @@ TARGET_MODEL_PATH=/workspace/storage-shared/nlp/tungdd11/tungdecoder/models/qwen
 ARTIFACT_ROOT=/data/artifacts/qwen25vl_eagle3_text \
 bash train_qwen25vl_eagle3_text.sh \
   --config examples/configs/qwen2.5-vl-3b-eagle3-text-offline.yaml \
-  --phase all
+  --phase all \
+  "$@"
