@@ -32,6 +32,7 @@ from specforge.algorithms.eagle3.data import (
     build_offline_collator,
     build_offline_normalizer,
     build_offline_reader,
+    build_qwen25vl_offline_reader,
     build_server_collator,
 )
 
@@ -122,6 +123,7 @@ def algorithm_spec() -> AlgorithmSpec:
         "hidden_state",
         "target",
     }
+    multimodal_required = required | {"position_ids"}
     return AlgorithmSpec(
         name=ALGORITHM_NAME,
         draft=DraftRequirement(
@@ -145,6 +147,24 @@ def algorithm_spec() -> AlgorithmSpec:
                         "loss_mask",
                         "hidden_state",
                         "aux_hidden_state",
+                    },
+                    normalizer=NORMALIZER_ID,
+                ),
+            ),
+            FeatureContract(
+                mode=FeatureMode.OFFLINE,
+                modality="qwen2_5_vl",
+                required_tensors=multimodal_required,
+                allowed_target_representations={"hidden_state"},
+                default_target_representation="hidden_state",
+                storage=OfflineStorageContract(
+                    format="specforge_hidden_states_v1",
+                    required_tensors={
+                        "input_ids",
+                        "loss_mask",
+                        "hidden_state",
+                        "aux_hidden_state",
+                        "position_ids",
                     },
                     normalizer=NORMALIZER_ID,
                 ),
@@ -207,6 +227,23 @@ def algorithm_providers() -> AlgorithmProviders:
                     ),
                 ),
                 build_reader=build_offline_reader,
+                build_normalizer=build_offline_normalizer,
+                build_collator=build_offline_collator,
+            ),
+            OfflineDataProvider(
+                modality="qwen2_5_vl",
+                normalizer_id=NORMALIZER_ID,
+                capture_layout=OfflineCaptureLayout(
+                    capture_method="eagle3",
+                    aux_feature="aux_hidden_state",
+                    last_hidden_feature="hidden_state",
+                    passthrough=(
+                        ("input_ids", "input_ids"),
+                        ("loss_mask", "loss_mask"),
+                        ("position_ids", "position_ids"),
+                    ),
+                ),
+                build_reader=build_qwen25vl_offline_reader,
                 build_normalizer=build_offline_normalizer,
                 build_collator=build_offline_collator,
             ),

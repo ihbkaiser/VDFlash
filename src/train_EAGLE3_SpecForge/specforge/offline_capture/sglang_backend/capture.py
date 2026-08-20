@@ -11,11 +11,13 @@
 from __future__ import annotations
 
 from array import array
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import torch
 import torch.distributed as dist
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.environ import envs
+from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.dp_attn import prepare_mlp_sync_batch_raw
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -28,6 +30,7 @@ from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
 
 from specforge.distributed import get_tp_group
 
+from .multimodal import build_qwen25vl_multimodal_inputs
 from .model_runner import SGLangRunner
 from .utils import wrap_offline_eagle3_logits_processors
 
@@ -48,7 +51,8 @@ class OfflineSGLangCaptureBackend:
         **kwargs,
     ) -> "OfflineSGLangCaptureBackend":
         tp_size = dist.get_world_size(get_tp_group())
-        server_args = ServerArgs(
+        server_args_kwargs = dict(kwargs)
+        server_args_kwargs.update(
             model_path=pretrained_model_name_or_path,
             trust_remote_code=trust_remote_code,
             dtype=torch_dtype if torch_dtype is not None else "auto",
@@ -57,8 +61,8 @@ class OfflineSGLangCaptureBackend:
             chunked_prefill_size=-1,
             tp_size=tp_size,
             pp_size=1,
-            **kwargs,
         )
+        server_args = ServerArgs(**server_args_kwargs)
 
         tp_rank = dist.get_rank(get_tp_group())
         moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
@@ -78,6 +82,7 @@ class OfflineSGLangCaptureBackend:
             is_draft_worker=False,
         )
         model_runner.alloc_memory_pool()
+        init_mm_embedding_cache(envs.SGLANG_VLM_CACHE_SIZE_MB.get() * 1024 * 1024)
         model_runner.init_attention_backends()
         model_runner.init_cuda_graphs()
         wrap_offline_eagle3_logits_processors(model_runner.model)
@@ -158,6 +163,21 @@ class OfflineSGLangCaptureBackend:
         self.model_runner.req_to_token_pool.clear()
         self.model_runner.token_to_kv_pool_allocator.clear()
 
+    def _qwen_image_token_id(self) -> int:
+        candidates = (
+            getattr(self.model_runner, "model_config", None),
+            getattr(self.model_runner, "model", None),
+            getattr(getattr(self.model_runner, "model", None), "config", None),
+            getattr(getattr(self.model_runner, "model_config", None), "hf_config", None),
+        )
+        for candidate in candidates:
+            value = getattr(candidate, "image_token_id", None)
+            if value is not None:
+                return int(value)
+        raise RuntimeError(
+            "Qwen2.5-VL capture could not resolve image_token_id from SGLang"
+        )
+
     @torch.no_grad()
     def capture_eagle3(
         self,
@@ -165,6 +185,8 @@ class OfflineSGLangCaptureBackend:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        multimodal_inputs: Optional[list[dict[str, Any]]] = None,
     ):
         """Capture per-request auxiliary and final hidden states without logits."""
 
@@ -174,16 +196,61 @@ class OfflineSGLangCaptureBackend:
         input_rows = torch.split(input_ids, 1, dim=0)
         attention_rows = torch.split(attention_mask, 1, dim=0)
         loss_rows = torch.split(loss_mask, 1, dim=0)
+        if position_ids is None:
+            position_rows = [None] * input_ids.shape[0]
+        elif position_ids.ndim == 3 and position_ids.shape[0] == 3:
+            position_rows = [
+                position_ids[:, index : index + 1]
+                for index in range(input_ids.shape[0])
+            ]
+        else:
+            position_rows = [
+                position_ids[index : index + 1]
+                for index in range(input_ids.shape[0])
+            ]
+        media_rows = (
+            [None] * input_ids.shape[0]
+            if multimodal_inputs is None
+            else multimodal_inputs
+        )
+        if len(media_rows) != input_ids.shape[0]:
+            raise ValueError(
+                "multimodal_inputs must contain one mapping per input row"
+            )
 
-        for idx, (input_row, attention_row, loss_row) in enumerate(
-            zip(input_rows, attention_rows, loss_rows)
+        for idx, (input_row, attention_row, loss_row, position_row, media_row) in enumerate(
+            zip(input_rows, attention_rows, loss_rows, position_rows, media_rows)
         ):
+            active = attention_row.view(-1).bool()
+            if not bool(active.any()):
+                raise ValueError(f"request row {idx} has no active tokens")
+            request_input_row = input_row[:, active]
+            request_position_row = position_row
+            if request_position_row is not None:
+                request_position_row = request_position_row[..., active]
+            request_media = None
+            padded_input_ids = request_input_row.view(-1).tolist()
+            if media_row is not None:
+                if request_position_row is None:
+                    raise ValueError(
+                        "Qwen2.5-VL multimodal capture requires position_ids"
+                    )
+                request_media = build_qwen25vl_multimodal_inputs(
+                    input_ids=request_input_row,
+                    media=media_row,
+                    position_ids=request_position_row,
+                    image_token_id=self._qwen_image_token_id(),
+                )
+                padded_input_ids = request_media.padded_input_ids
             req = Req(
                 rid=str(idx),
                 origin_input_text="",
-                origin_input_ids=input_row.view(-1).tolist(),
+                origin_input_ids=padded_input_ids,
+                origin_input_ids_unpadded=request_input_row.view(-1).tolist(),
                 sampling_params=sampling_params,
             )
+            if request_media is not None:
+                req.multimodal_inputs = request_media
             req.full_untruncated_fill_ids = array("q", req.origin_input_ids)
             req.fill_len = len(req.full_untruncated_fill_ids)
             req.extend_input_len = req.fill_len - len(req.prefix_indices)
@@ -214,6 +281,8 @@ class OfflineSGLangCaptureBackend:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        multimodal_inputs: Optional[list[dict[str, Any]]] = None,
     ):
         """Capture generic auxiliary and final target states."""
 
@@ -221,6 +290,8 @@ class OfflineSGLangCaptureBackend:
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
+            position_ids=position_ids,
+            multimodal_inputs=multimodal_inputs,
         )
 
 

@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import gc
 import hashlib
 import json
 import math
+import random
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 import sys
-from typing import Any
+from typing import Any, Callable
 
 import torch
 
@@ -142,10 +144,23 @@ class SpeculativeDecodeResult:
 class InstrumentedDFlashDecoder:
     """Run SpecForge DFlash while exposing acceptance and timing telemetry."""
 
-    def __init__(self, target: Any, draft: Any, *, device: torch.device):
+    def __init__(
+        self,
+        target: Any,
+        draft: Any,
+        *,
+        device: torch.device,
+        token_decoder: Callable[[list[int]], str] | None = None,
+    ):
         self.target = target
         self.draft = draft
         self.device = torch.device(device)
+        self.token_decoder = token_decoder
+
+    def _decode_token_ids(self, token_ids: list[int]) -> str:
+        if self.token_decoder is None:
+            return ""
+        return str(self.token_decoder(token_ids))
 
     def _target_forward(self, kwargs: dict[str, Any]) -> Any:
         try:
@@ -290,6 +305,9 @@ class InstrumentedDFlashDecoder:
             emitted = accepted + 1
             output_ids[:, start : start + emitted] = block_output_ids[:, :emitted]
             output_ids[:, start + emitted] = posterior[:, accepted]
+            draft_proposal_token_ids = proposals[0].detach().cpu().tolist()
+            block_token_ids = block_output_ids[0, :emitted].detach().cpu().tolist()
+            next_anchor_token_id = int(posterior[0, accepted].item())
             start += emitted
             _crop_cache(target_cache, start)
             target_hidden = _extract_context_feature(
@@ -305,6 +323,16 @@ class InstrumentedDFlashDecoder:
                     "proposal_count": int(proposals.shape[1]),
                     "matched_proposals": accepted,
                     "effective_emitted_tokens": emitted,
+                    "draft_proposal_token_ids": draft_proposal_token_ids,
+                    "draft_proposal_text": self._decode_token_ids(
+                        draft_proposal_token_ids
+                    ),
+                    "block_token_ids": block_token_ids,
+                    "block_text": self._decode_token_ids(block_token_ids),
+                    "next_anchor_token_id": next_anchor_token_id,
+                    "next_anchor_text": self._decode_token_ids(
+                        [next_anchor_token_id]
+                    ),
                     "is_partial_block": int(proposals.shape[1]) < block_size - 1,
                     "is_terminal": bool(stop_hit or start >= max_length - 1),
                 }
@@ -358,25 +386,35 @@ def _new_cache() -> Any:
     return DynamicCache()
 
 
+def load_manifest_records(manifest: str | Path) -> list[dict[str, Any]]:
+    """Load all JSONL records and reject malformed non-object entries."""
+
+    path = Path(manifest).expanduser().resolve(strict=True)
+    records: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        record_index = len(records)
+        record = json.loads(line)
+        if not isinstance(record, dict):
+            raise ValueError(
+                f"manifest record {record_index} must contain a JSON object"
+            )
+        records.append(record)
+    return records
+
+
 def load_manifest_sample(manifest: str | Path, sample_index: int) -> dict[str, Any]:
     """Load one JSONL record by zero-based index with a useful bounds error."""
 
     if sample_index < 0:
         raise IndexError(f"sample-index {sample_index} must be non-negative")
-    path = Path(manifest).expanduser().resolve(strict=True)
-    record_index = 0
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        if record_index == sample_index:
-            record = json.loads(line)
-            if not isinstance(record, dict):
-                raise ValueError(
-                    f"manifest record {record_index} must contain a JSON object"
-                )
-            return record
-        record_index += 1
-    raise IndexError(f"sample-index {sample_index} is outside manifest {path}")
+    records = load_manifest_records(manifest)
+    try:
+        return records[sample_index]
+    except IndexError as exc:
+        path = Path(manifest).expanduser().resolve()
+        raise IndexError(f"sample-index {sample_index} is outside manifest {path}") from exc
 
 
 def _with_video_suffix(path: Path) -> list[Path]:
@@ -507,10 +545,14 @@ __all__ = [
     "InstrumentedDFlashDecoder",
     "PreparedVideoPrompt",
     "SpeculativeDecodeResult",
+    "build_batch_statistics",
+    "load_manifest_records",
     "load_manifest_sample",
     "resolve_video_path",
+    "run_all_comparisons",
     "score_caption",
     "validate_report_success",
+    "write_vdc50_report",
 ]
 
 
@@ -714,8 +756,12 @@ def _sha256_tokens(token_ids: list[int]) -> str:
 
 
 def _decode_text(processor: Any, token_ids: torch.Tensor) -> str:
+    return _decode_token_list(processor, token_ids.detach().cpu().tolist())
+
+
+def _decode_token_list(processor: Any, token_ids: list[int]) -> str:
     tokenizer = getattr(processor, "tokenizer", processor)
-    return tokenizer.decode(token_ids.detach().cpu().tolist(), skip_special_tokens=True).strip()
+    return tokenizer.decode(token_ids, skip_special_tokens=True).strip()
 
 
 def _extend_position_ids(
@@ -950,9 +996,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--video-root", type=Path, default=DEFAULT_VIDEO_ROOT)
     parser.add_argument("--sample-index", type=int, default=0)
+    parser.add_argument(
+        "--all-samples",
+        action="store_true",
+        help="run every non-empty manifest record and write one report per sample",
+    )
     parser.add_argument("--checkpoint", action="append", type=Path, default=None)
     parser.add_argument("--draft-config", type=Path, default=DEFAULT_DRAFT_CONFIG)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("results/infer/qwen25vl_3b_dflash_vdc50"),
+        help="directory for per-sample reports in --all-samples mode",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="skip already completed per-sample reports in --all-samples mode",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--dtype", choices=("auto", "bf16", "fp16", "no"), default="auto")
     parser.add_argument("--target-attention", default="sdpa")
@@ -1049,7 +1111,12 @@ def run_comparison(args: argparse.Namespace) -> dict[str, Any]:
                 device=device,
                 dtype=dtype,
             )
-            decoder = InstrumentedDFlashDecoder(target, draft, device=device)
+            decoder = InstrumentedDFlashDecoder(
+                target,
+                draft,
+                device=device,
+                token_decoder=lambda token_ids: _decode_token_list(processor, token_ids),
+            )
             speculative = decoder.decode(
                 input_ids=prompt.inputs["input_ids"],
                 position_ids=prompt.position_ids,
@@ -1083,6 +1150,406 @@ def run_comparison(args: argparse.Namespace) -> dict[str, Any]:
             )
     report["success"] = validate_report_success(report)
     return report
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _bootstrap_interval(values: list[float], *, seed: int = 0) -> list[float]:
+    if not values:
+        return [0.0, 0.0]
+    if len(values) == 1:
+        return [values[0], values[0]]
+    generator = random.Random(seed)
+    means = []
+    for _ in range(1000):
+        sample = [values[generator.randrange(len(values))] for _ in values]
+        means.append(sum(sample) / len(sample))
+    means.sort()
+    lower = means[int(0.025 * (len(means) - 1))]
+    upper = means[int(0.975 * (len(means) - 1))]
+    return [float(lower), float(upper)]
+
+
+def _numeric_summary(values: list[float]) -> dict[str, Any]:
+    clean = [float(value) for value in values if math.isfinite(float(value))]
+    if not clean:
+        return {"n": 0}
+    mean = sum(clean) / len(clean)
+    variance = (
+        sum((value - mean) ** 2 for value in clean) / (len(clean) - 1)
+        if len(clean) > 1
+        else 0.0
+    )
+    return {
+        "n": len(clean),
+        "mean": float(mean),
+        "std": float(math.sqrt(variance)),
+        "min": float(min(clean)),
+        "max": float(max(clean)),
+        "spread": float(max(clean) - min(clean)),
+        "bootstrap_ci95": _bootstrap_interval(clean),
+    }
+
+
+def _collect_scalar_metrics(
+    row: dict[str, Any],
+    sections: tuple[str, ...],
+    values: dict[str, list[float]],
+) -> None:
+    for section in sections:
+        payload = row.get(section)
+        if not isinstance(payload, dict):
+            continue
+        for key, value in payload.items():
+            if isinstance(value, bool):
+                numeric = float(value)
+            elif isinstance(value, (int, float)) and math.isfinite(float(value)):
+                numeric = float(value)
+            else:
+                continue
+            values.setdefault(f"{section}.{key}", []).append(numeric)
+    for key in ("num_output_tokens", "peak_memory_bytes"):
+        value = row.get(key)
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            values.setdefault(key, []).append(float(value))
+
+
+def build_batch_statistics(reports: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate saved completed reports without filtering mismatch diagnostics."""
+
+    completed = [
+        report
+        for report in reports
+        if report.get("run_status", "completed") == "completed"
+    ]
+    groups: dict[str, dict[str, Any]] = {}
+
+    target_values: dict[str, list[float]] = {}
+    target_rows = []
+    for report in completed:
+        target = report.get("target_baseline")
+        if isinstance(target, dict):
+            target_rows.append(target)
+            _collect_scalar_metrics(target, ("text_metrics", "timing"), target_values)
+    groups["target_baseline"] = {
+        "sample_count": len(target_rows),
+        "metrics": {
+            name: _numeric_summary(target_values[name])
+            for name in sorted(target_values)
+        },
+    }
+
+    checkpoint_rows: dict[str, list[dict[str, Any]]] = {}
+    for report in completed:
+        for checkpoint in report.get("checkpoints", []):
+            if isinstance(checkpoint, dict) and checkpoint.get("label"):
+                checkpoint_rows.setdefault(str(checkpoint["label"]), []).append(checkpoint)
+
+    for label, rows in sorted(checkpoint_rows.items()):
+        values: dict[str, list[float]] = {}
+        for row in rows:
+            _collect_scalar_metrics(
+                row,
+                ("text_metrics", "timing", "acceptance", "speedup"),
+                values,
+            )
+            if isinstance(row.get("outputs_match"), bool):
+                values.setdefault("lossless_match", []).append(
+                    float(row["outputs_match"])
+                )
+        lossless_count = sum(bool(row.get("outputs_match")) for row in rows)
+        groups[label] = {
+            "sample_count": len(rows),
+            "lossless_count": lossless_count,
+            "lossless_rate": lossless_count / len(rows) if rows else 0.0,
+            "metrics": {
+                name: _numeric_summary(values[name]) for name in sorted(values)
+            },
+        }
+
+    return {
+        "source_policy": "completed reports; mismatch rows retained for descriptive metrics",
+        "completed_reports": len(completed),
+        "groups": groups,
+    }
+
+
+def write_batch_statistics(output_dir: Path, statistics: dict[str, Any]) -> None:
+    """Write aggregate metric JSON and a flat CSV for spreadsheet use."""
+
+    _write_json_atomic(output_dir / "metrics.json", statistics)
+    csv_path = output_dir / "metrics.csv"
+    temporary = csv_path.with_suffix(csv_path.suffix + ".tmp")
+    fieldnames = [
+        "group",
+        "metric",
+        "n",
+        "mean",
+        "std",
+        "min",
+        "max",
+        "spread",
+        "bootstrap_ci95_low",
+        "bootstrap_ci95_high",
+    ]
+    with temporary.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for group, payload in statistics["groups"].items():
+            for metric, summary in payload["metrics"].items():
+                interval = summary.get("bootstrap_ci95", [None, None])
+                writer.writerow(
+                    {
+                        "group": group,
+                        "metric": metric,
+                        "n": summary.get("n", 0),
+                        "mean": summary.get("mean"),
+                        "std": summary.get("std"),
+                        "min": summary.get("min"),
+                        "max": summary.get("max"),
+                        "spread": summary.get("spread"),
+                        "bootstrap_ci95_low": interval[0],
+                        "bootstrap_ci95_high": interval[1],
+                    }
+                )
+    temporary.replace(csv_path)
+
+
+def write_vdc50_report(
+    output_dir: Path,
+    summary: dict[str, Any],
+    reports: list[dict[str, Any]],
+) -> Path:
+    """Write a human-readable report for one complete VDC-50 run."""
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    first = next(
+        (
+            report
+            for report in reports
+            if report.get("run_status", "completed") == "completed"
+        ),
+        {},
+    )
+    preprocessing = first.get("preprocessing", {})
+    statistics = summary.get("statistics", {})
+    groups = statistics.get("groups", {})
+    checkpoints = [
+        str(item.get("label"))
+        for item in first.get("checkpoints", [])
+        if isinstance(item, dict) and item.get("label")
+    ]
+
+    def value(group: dict[str, Any], metric: str) -> str:
+        payload = group.get("metrics", {}).get(metric)
+        if not isinstance(payload, dict) or payload.get("n", 0) == 0:
+            return "n/a"
+        return f"{float(payload['mean']):.4f}"
+
+    lines = [
+        "# Qwen2.5-VL DFlash VDC-50 report",
+        "",
+        "This report is generated from the per-sample JSON reports. "
+        "Mismatch rows remain in descriptive metric aggregates and are not "
+        "silently treated as lossless evidence.",
+        "",
+        "## Run configuration",
+        "",
+        f"- Target model: `{first.get('target_model', 'n/a')}`",
+        f"- Draft config: `{first.get('draft_config', 'n/a')}`",
+        f"- Device/dtype: `{first.get('device', 'n/a')}` / `{first.get('dtype', 'n/a')}`",
+        f"- Manifest: `{summary.get('manifest', 'n/a')}`",
+        f"- Checkpoints: {', '.join(f'`{item}`' for item in checkpoints) or 'n/a'}",
+        f"- num_frames: `{preprocessing.get('num_frames', 'n/a')}`",
+        f"- video_min_pixels: `{preprocessing.get('video_min_pixels', 'n/a')}`",
+        f"- video_max_pixels: `{preprocessing.get('video_max_pixels', 'n/a')}`",
+        "",
+        "## Coverage",
+        "",
+        f"- Total samples: **{summary.get('total_samples', 0)}**",
+        f"- Completed: **{summary.get('completed_samples', 0)}**",
+        f"- Runtime errors: **{summary.get('runtime_errors', 0)}**",
+        f"- Lossless samples: **{summary.get('lossless_samples', 0)}**",
+        f"- Mismatch samples: **{summary.get('mismatch_samples', 0)}**",
+        "",
+        "## Aggregate metrics",
+        "",
+        "Means are computed over completed rows; bootstrap intervals and "
+        "per-metric N are in `metrics.json` and `metrics.csv`.",
+        "",
+        "| Group | N | Lossless rate | ROUGE-L | BLEU | tau | ESR | DSR | End-to-end s |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for group_name, group in groups.items():
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    group_name,
+                    str(group.get("sample_count", 0)),
+                    (
+                        f"{float(group['lossless_rate']):.4f}"
+                        if "lossless_rate" in group
+                        else "n/a"
+                    ),
+                    value(group, "text_metrics.rouge_l"),
+                    value(group, "text_metrics.bleu"),
+                    value(group, "acceptance.tau"),
+                    value(group, "speedup.esr"),
+                    value(group, "speedup.dsr"),
+                    value(group, "timing.end_to_end_s"),
+                ]
+            )
+            + " |"
+        )
+    lines.extend(
+        [
+            "",
+            "Full metric keys:",
+            "",
+        ]
+    )
+    for group_name, group in groups.items():
+        metric_names = ", ".join(
+            f"`{name}`" for name in sorted(group.get("metrics", {}))
+        )
+        lines.append(f"- `{group_name}`: {metric_names or 'n/a'}")
+    lines.extend(
+        [
+            "",
+            "## Artifacts",
+            "",
+            "- `summary.json`: run coverage and embedded aggregate statistics.",
+            "- `metrics.json`: structured aggregate statistics with bootstrap CI95.",
+            "- `metrics.csv`: flat spreadsheet-ready aggregate table.",
+            "- `sample_*.json`: detailed target/checkpoint reports.",
+            "",
+            "## Draft-round text fields",
+            "",
+            "Each newly generated checkpoint report stores `block_text`, "
+            "`draft_proposal_text`, their token IDs, and `next_anchor_text` "
+            "inside `acceptance.acceptance_rounds`. Existing reports created "
+            "before this field was added cannot be retrofitted because proposal "
+            "token IDs were not persisted.",
+            "",
+        ]
+    )
+    report_path = output_dir / "VDC50_REPORT.md"
+    temporary = report_path.with_suffix(report_path.suffix + ".tmp")
+    temporary.write_text("\n".join(lines), encoding="utf-8")
+    temporary.replace(report_path)
+    return report_path
+
+
+def run_all_comparisons(args: argparse.Namespace) -> dict[str, Any]:
+    """Run and persist every manifest sample, keeping mismatch diagnostics."""
+
+    records = load_manifest_records(args.manifest)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    entries: list[dict[str, Any]] = []
+    completed_reports: list[dict[str, Any]] = []
+
+    for sample_index, record in enumerate(records):
+        sample_id = str(
+            record.get("video_name") or record.get("id") or sample_index
+        )
+        output_path = output_dir / f"sample_{sample_index:03d}.json"
+        report: dict[str, Any] = {}
+        if getattr(args, "resume", False) and output_path.is_file():
+            try:
+                candidate = json.loads(output_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                candidate = None
+            if (
+                isinstance(candidate, dict)
+                and candidate.get("run_status") == "completed"
+                and int(candidate.get("sample_index", -1)) == sample_index
+            ):
+                report = candidate
+                print(
+                    f"[batch] {sample_index + 1}/{len(records)} "
+                    f"{sample_id} resumed from {output_path}"
+                )
+
+        if not report:
+            sample_args = argparse.Namespace(**vars(args))
+            sample_args.sample_index = sample_index
+            try:
+                report = dict(run_comparison(sample_args))
+                report["run_status"] = "completed"
+                report.setdefault("sample_index", sample_index)
+                report.setdefault("sample_id", sample_id)
+                print(
+                    f"[batch] {sample_index + 1}/{len(records)} "
+                    f"{sample_id} completed success={report.get('success')}"
+                )
+            except Exception as exc:
+                report = {
+                    "run_status": "error",
+                    "sample_index": sample_index,
+                    "sample_id": sample_id,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                print(
+                    f"[batch] {sample_index + 1}/{len(records)} "
+                    f"{sample_id} runtime_error={report['error']}"
+                )
+            _write_json_atomic(output_path, report)
+
+        entries.append(
+            {
+                "sample_index": sample_index,
+                "sample_id": sample_id,
+                "path": str(output_path),
+                "run_status": report.get("run_status", "error"),
+                "success": bool(report.get("success", False)),
+                "error": report.get("error"),
+            }
+        )
+        if report.get("run_status") == "completed":
+            completed_reports.append(report)
+
+    completed = sum(item["run_status"] == "completed" for item in entries)
+    lossless = sum(
+        item["run_status"] == "completed" and item["success"] for item in entries
+    )
+    mismatches = sum(
+        item["run_status"] == "completed" and not item["success"] for item in entries
+    )
+    runtime_errors = sum(item["run_status"] == "error" for item in entries)
+    statistics = build_batch_statistics(completed_reports)
+    write_batch_statistics(output_dir, statistics)
+    summary = {
+        "manifest": str(Path(args.manifest).expanduser().resolve()),
+        "output_dir": str(output_dir.resolve()),
+        "total_samples": len(records),
+        "completed_samples": completed,
+        "lossless_samples": lossless,
+        "mismatch_samples": mismatches,
+        "runtime_errors": runtime_errors,
+        "run_completed": completed == len(records) and runtime_errors == 0,
+        "metric_statistics": str(output_dir / "metrics.json"),
+        "metric_csv": str(output_dir / "metrics.csv"),
+        "statistics": statistics,
+        "reports": entries,
+    }
+    report_path = write_vdc50_report(output_dir, summary, completed_reports)
+    summary["report_markdown"] = str(report_path)
+    _write_json_atomic(output_dir / "summary.json", summary)
+    print(
+        f"[batch-summary] total={len(records)} completed={completed} "
+        f"lossless={lossless} mismatches={mismatches} errors={runtime_errors}"
+    )
+    return summary
 
 
 def _print_report(report: dict[str, Any]) -> None:
@@ -1123,11 +1590,11 @@ def _print_report(report: dict[str, Any]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.all_samples:
+        summary = run_all_comparisons(args)
+        return 0 if summary["run_completed"] else 1
     report = run_comparison(args)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = args.output.with_suffix(args.output.suffix + ".tmp")
-    temporary.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    temporary.replace(args.output)
+    _write_json_atomic(args.output, report)
     _print_report(report)
     return 0 if report["success"] else 1
 

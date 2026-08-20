@@ -456,7 +456,12 @@ class _Processor:
 def test_instrumented_decoder_accepts_stub_block_and_forwards_video_once():
     target = _Target()
     draft = _Draft()
-    decoder = InstrumentedDFlashDecoder(target, draft, device=torch.device("cpu"))
+    decoder = InstrumentedDFlashDecoder(
+        target,
+        draft,
+        device=torch.device("cpu"),
+        token_decoder=lambda token_ids: "|".join(str(token_id) for token_id in token_ids),
+    )
     input_ids = torch.tensor([[1, 2, 3]])
     positions = torch.arange(input_ids.shape[1]).view(1, -1)
 
@@ -471,6 +476,10 @@ def test_instrumented_decoder_accepts_stub_block_and_forwards_video_once():
     assert result.output_ids[0, input_ids.shape[1] :].tolist() == [4, 5, 6, 7, 8]
     assert result.acceptance_rounds
     assert result.acceptance_rounds[0]["matched_proposals"] == 3
+    assert result.acceptance_rounds[0]["block_text"]
+    assert result.acceptance_rounds[0]["draft_proposal_text"]
+    assert result.acceptance_rounds[0]["block_token_ids"]
+    assert result.acceptance_rounds[0]["draft_proposal_token_ids"]
     assert result.target_forward_calls >= 2
     assert target.calls[0]["has_video"] is True
     assert all(call["has_video"] is False for call in target.calls[1:])
@@ -535,8 +544,8 @@ def test_run_comparison_records_mismatch_and_continues_to_second_checkpoint(
         return next(drafts), 0.2
 
     class FakeDecoder:
-        def __init__(self, target_model, draft_model, *, device):
-            del target_model, device
+        def __init__(self, target_model, draft_model, *, device, token_decoder=None):
+            del target_model, device, token_decoder
             self.draft = draft_model
 
         def decode(self, *, input_ids, **kwargs):
@@ -637,3 +646,159 @@ def test_run_comparison_builds_two_checkpoint_report(monkeypatch, tmp_path, caps
     assert "target metrics:" in printed
     assert "rouge_l=1.000" in printed
     assert "bleu=1.000" in printed
+
+
+def test_run_all_comparisons_persists_every_sample_and_counts_mismatches(
+    monkeypatch, tmp_path
+):
+    import src.infer.qwen25vl_dflash_compare as runner
+
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(
+        "\n".join(
+            json.dumps({"video_name": f"sample-{index}"}) for index in range(3)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "batch"
+    calls = []
+
+    def fake_run_comparison(args):
+        calls.append(args.sample_index)
+        return {
+            "sample_index": args.sample_index,
+            "sample_id": f"sample-{args.sample_index}",
+            "success": args.sample_index == 0,
+        }
+
+    monkeypatch.setattr(runner, "run_comparison", fake_run_comparison)
+    args = SimpleNamespace(
+        manifest=manifest,
+        output_dir=output_dir,
+        resume=False,
+    )
+
+    summary = runner.run_all_comparisons(args)
+
+    assert calls == [0, 1, 2]
+    assert summary["total_samples"] == 3
+    assert summary["completed_samples"] == 3
+    assert summary["lossless_samples"] == 1
+    assert summary["mismatch_samples"] == 2
+    assert summary["runtime_errors"] == 0
+    assert len(list(output_dir.glob("sample_*.json"))) == 3
+    assert (output_dir / "summary.json").is_file()
+
+
+def test_build_batch_statistics_reports_numeric_aggregates_and_lossless_rate():
+    import src.infer.qwen25vl_dflash_compare as runner
+
+    reports = [
+        {
+            "run_status": "completed",
+            "target_baseline": {
+                "text_metrics": {"rouge_l": 0.2},
+                "timing": {"end_to_end_s": 2.0},
+            },
+            "checkpoints": [
+                {
+                    "label": "draft-a",
+                    "status": "ok",
+                    "outputs_match": True,
+                    "text_metrics": {"rouge_l": 0.4},
+                    "timing": {"end_to_end_s": 1.0},
+                    "acceptance": {"tau": 2.0},
+                    "speedup": {"esr": 2.0},
+                }
+            ],
+        },
+        {
+            "run_status": "completed",
+            "target_baseline": {
+                "text_metrics": {"rouge_l": 0.6},
+                "timing": {"end_to_end_s": 4.0},
+            },
+            "checkpoints": [
+                {
+                    "label": "draft-a",
+                    "status": "mismatch",
+                    "outputs_match": False,
+                    "text_metrics": {"rouge_l": 0.8},
+                    "timing": {"end_to_end_s": 2.0},
+                    "acceptance": {"tau": 1.0},
+                    "speedup": {"esr": 1.0},
+                }
+            ],
+        },
+    ]
+
+    statistics = runner.build_batch_statistics(reports)
+    target = statistics["groups"]["target_baseline"]
+    draft = statistics["groups"]["draft-a"]
+
+    assert target["sample_count"] == 2
+    assert target["metrics"]["text_metrics.rouge_l"]["n"] == 2
+    assert target["metrics"]["text_metrics.rouge_l"]["mean"] == pytest.approx(0.4)
+    assert draft["sample_count"] == 2
+    assert draft["lossless_count"] == 1
+    assert draft["lossless_rate"] == pytest.approx(0.5)
+    assert draft["metrics"]["acceptance.tau"]["mean"] == pytest.approx(1.5)
+
+
+def test_write_vdc50_report_includes_run_configuration_and_metric_table(tmp_path):
+    import src.infer.qwen25vl_dflash_compare as runner
+
+    summary = {
+        "manifest": "/data/test.jsonl",
+        "total_samples": 2,
+        "completed_samples": 2,
+        "lossless_samples": 1,
+        "mismatch_samples": 1,
+        "runtime_errors": 0,
+        "run_completed": True,
+        "statistics": {
+            "completed_reports": 2,
+            "groups": {
+                "draft-a": {
+                    "sample_count": 2,
+                    "lossless_count": 1,
+                    "lossless_rate": 0.5,
+                    "metrics": {
+                        "acceptance.tau": {
+                            "n": 2,
+                            "mean": 1.5,
+                            "std": 0.5,
+                            "min": 1.0,
+                            "max": 2.0,
+                            "spread": 1.0,
+                            "bootstrap_ci95": [1.0, 2.0],
+                        }
+                    },
+                }
+            },
+        },
+    }
+    reports = [
+        {
+            "target_model": "Qwen/Qwen2.5-VL-3B-Instruct",
+            "draft_config": "draft.json",
+            "device": "cuda:1",
+            "dtype": "torch.bfloat16",
+            "preprocessing": {
+                "num_frames": 8,
+                "video_min_pixels": 50176,
+                "video_max_pixels": 50176,
+                "max_new_tokens": 256,
+            },
+            "checkpoints": [{"label": "draft-a"}],
+        }
+    ]
+
+    runner.write_vdc50_report(tmp_path, summary, reports)
+    report = (tmp_path / "VDC50_REPORT.md").read_text(encoding="utf-8")
+
+    assert "Qwen2.5-VL-3B-Instruct" in report
+    assert "num_frames: `8`" in report
+    assert "draft-a" in report
+    assert "acceptance.tau" in report

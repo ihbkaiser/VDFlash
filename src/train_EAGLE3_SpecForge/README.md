@@ -1,9 +1,9 @@
-# EAGLE3 training for Qwen2.5-VL 3B
+# EAGLE3 training for Qwen2.5-VL 3B/7B
 
-This directory is the phase-one, text-only training slice of SpecForge for
-Qwen2.5-VL 3B. It retains the original SpecForge EAGLE3 runtime and the
-offline data/feature preparation path, while omitting unrelated algorithms,
-benchmarks, exporters, documentation, assets, and upstream test suites.
+This directory contains standalone Phase 1 text training and Phase 2
+image-captioning training for Qwen2.5-VL 3B and 7B. It retains the SpecForge EAGLE3
+runtime and owns both offline feature-preparation paths; the DFlash tree is not
+imported or required.
 
 ## Run
 
@@ -27,8 +27,13 @@ with accumulation 2), ten epochs, and the original EAGLE3 objective settings.
 Set `HF_HOME` and artifact paths for the local machine before a real run.
 
 The authoritative model geometry is in
-`configs/qwen2.5-vl-3b-eagle3.json`; the text-only offline recipe is in
-`examples/configs/qwen2.5-vl-3b-eagle3-text-offline.yaml`.
+`configs/qwen2.5-vl-{3b,7b}-eagle3.json`; the text-only offline recipes are in
+`examples/configs/qwen2.5-vl-{3b,7b}-eagle3-text-offline.yaml`.
+
+For standalone Phase 2 image-captioning training, see
+[PHASE2_TRAINING_GUIDE.md](PHASE2_TRAINING_GUIDE.md) and use
+`examples/configs/qwen2.5-vl-{3b,7b}-eagle3-caption-offline.yaml` with the
+matching size-specific launcher.
 
 For the complete Phase 1 procedure, see
 [PHASE1_TRAINING_GUIDE.md](PHASE1_TRAINING_GUIDE.md).

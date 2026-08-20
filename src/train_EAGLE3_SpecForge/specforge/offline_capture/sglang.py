@@ -65,11 +65,15 @@ class OfflineSGLangCapture:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        multimodal_inputs: Optional[list[dict]] = None,
     ) -> OfflineCaptureBatch:
         data, aux_states, last_states = self._backend.capture(
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
+            position_ids=position_ids,
+            multimodal_inputs=multimodal_inputs,
         )
         return OfflineCaptureBatch(
             hidden_states=torch.cat(

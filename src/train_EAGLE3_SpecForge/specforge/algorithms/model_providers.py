@@ -114,10 +114,22 @@ def resolve_eagle_capture_layers(
         num_layers = int(target_config.num_hidden_layers)
         layers = [1, num_layers // 2 - 1, num_layers - 4]
     layers = list(layers)
-    if len(layers) != 3 or any(not isinstance(i, int) or i < 0 for i in layers):
+    if (
+        len(layers) != 3
+        or len(set(layers)) != 3
+        or any(not isinstance(i, int) or i < 0 for i in layers)
+    ):
         raise ValueError(
             "resolved EAGLE capture layers must contain exactly three "
-            f"non-negative integers, got {layers!r}"
+            "different non-negative integers, got "
+            f"{layers!r}"
+        )
+    target_text_config = getattr(target_config, "text_config", target_config)
+    num_layers = getattr(target_text_config, "num_hidden_layers", None)
+    if num_layers is not None and any(layer >= int(num_layers) for layer in layers):
+        raise ValueError(
+            "resolved EAGLE capture layer is outside the target model: "
+            f"layers={layers!r}, num_hidden_layers={num_layers}"
         )
     return layers
 

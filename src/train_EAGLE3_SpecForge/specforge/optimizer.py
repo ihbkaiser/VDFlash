@@ -139,6 +139,10 @@ class BF16Optimizer:
 
     def step(self):
         grad_norm, clip_coefficient = self._grad_norm_and_clip_coefficient()
+        if not torch.isfinite(grad_norm):
+            raise FloatingPointError(
+                "EAGLE3 optimizer received a non-finite gradient norm"
+            )
         cpu_clip_coefficient = (
             float(clip_coefficient.item()) if self.offload_master else None
         )
