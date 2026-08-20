@@ -13,6 +13,7 @@ from src.analyze.Validate_Sparrow_hypothesises.calibrate import (
     adaptive_candidate_grid,
     audit_calibration,
     select_paired_cohort,
+    select_homogeneous_paired_cohort,
 )
 from src.analyze.Validate_Sparrow_hypothesises.metrics import (
     common_prefix_length,
@@ -28,6 +29,12 @@ from src.analyze.Validate_Sparrow_hypothesises.model_analysis import (
 )
 from src.analyze.Validate_Sparrow_hypothesises.paper_statistics import build_paper_statistics, summarize
 from src.analyze.Validate_Sparrow_hypothesises.paper_contract import DEFAULT_CONTRACT, validate_contract
+from src.analyze.Validate_Sparrow_hypothesises.plots import (
+    _cohort_modality_ranges,
+    _contiguous_ranges,
+    _figure2_region_statistics,
+)
+from src.analyze.Validate_Sparrow_hypothesises.run_draft_attention import _strict_preceding_attention
 from src.analyze.Validate_Sparrow_hypothesises.runtime import (
     PreparedPrefill,
     compact_qwen2vl_prefill,
@@ -40,6 +47,74 @@ def test_default_contract_matches_paper_milestones():
     assert validate_contract(DEFAULT_CONTRACT) == []
     assert DEFAULT_CONTRACT.visual_token_milestones == (400, 3000, 13000, 25000)
     assert DEFAULT_CONTRACT.layer_cut_points[5] == 20
+
+
+def test_plot_modality_positions_are_split_into_contiguous_ranges():
+    assert _contiguous_ranges([0, 1, 2, 5, 7, 8, 8]) == [(0, 2), (5, 5), (7, 8)]
+
+
+def test_plot_cohort_modality_ranges_follow_all_sample_boundaries():
+    rows = [
+        {"sample_id": "a", "modality": "text", "token_position": 0},
+        {"sample_id": "a", "modality": "visual", "token_position": 1},
+        {"sample_id": "a", "modality": "visual", "token_position": 2},
+        {"sample_id": "a", "modality": "instruction", "token_position": 3},
+        {"sample_id": "b", "modality": "text", "token_position": 0},
+        {"sample_id": "b", "modality": "visual", "token_position": 1},
+        {"sample_id": "b", "modality": "visual", "token_position": 2},
+        {"sample_id": "b", "modality": "visual", "token_position": 3},
+        {"sample_id": "b", "modality": "instruction", "token_position": 4},
+        {"sample_id": "c", "modality": "text", "token_position": 0},
+        {"sample_id": "c", "modality": "visual", "token_position": 1},
+        {"sample_id": "c", "modality": "visual", "token_position": 2},
+        {"sample_id": "c", "modality": "visual", "token_position": 3},
+        {"sample_id": "c", "modality": "instruction", "token_position": 4},
+    ]
+    assert _cohort_modality_ranges(rows) == [
+        ("text", 0, 0),
+        ("visual", 1, 3),
+        ("instruction", 4, 4),
+    ]
+
+
+def test_figure2_region_statistics_report_mass_and_mean_weight_per_token():
+    rows = [
+        {
+            "row_id": "a",
+            "attention_weights": [0.2, 0.3, 0.5],
+            "instruction_positions": [0],
+            "visual_positions": [1],
+            "text_positions": [2],
+            "instruction_mass": 0.2,
+            "visual_mass": 0.3,
+            "text_mass": 0.5,
+        },
+        {
+            "row_id": "b",
+            "attention_weights": [0.4, 0.2, 0.4],
+            "instruction_positions": [0],
+            "visual_positions": [1],
+            "text_positions": [2],
+            "instruction_mass": 0.4,
+            "visual_mass": 0.2,
+            "text_mass": 0.4,
+        },
+    ]
+    stats = _figure2_region_statistics(rows)
+    assert abs(stats["instruction"]["mass_mean"] - 0.3) < 1e-9
+    assert abs(stats["visual"]["mass_mean"] - 0.25) < 1e-9
+    assert abs(stats["text"]["mean_weight_per_token"] - 0.45) < 1e-9
+
+
+def test_draft_attention_keeps_only_strictly_preceding_keys():
+    captured = torch.tensor([
+        [[0.1, 0.2, 0.3, 0.4, 0.0],
+         [0.05, 0.05, 0.1, 0.2, 0.6]],
+    ])
+    result = _strict_preceding_attention(captured, [2, 4])
+    assert torch.allclose(result[0, 0], torch.tensor([1 / 3, 2 / 3, 0.0, 0.0, 0.0]))
+    assert torch.allclose(result[0, 1], torch.tensor([1 / 8, 1 / 8, 1 / 4, 1 / 2, 0.0]))
+    assert torch.allclose(result.sum(dim=-1), torch.ones(1, 2))
 
 
 def test_last_position_lm_head_patches_accelerate_saved_forward():
@@ -96,6 +171,27 @@ def test_paired_cohort_requires_ok_at_every_target_and_minimum():
     assert cohort.sample_ids == ("a", "b")
     assert cohort.valid
     assert "c" in cohort.invalid_by_target[3000]
+
+
+def test_homogeneous_paired_cohort_prefers_exact_visual_length_signature():
+    rows = []
+    for sample_id, actual_by_target in {
+        "a": (560, 2912),
+        "b": (560, 2912),
+        "c": (560, 2912),
+        "d": (572, 2992),
+    }.items():
+        for target, actual in zip((400, 3000), actual_by_target):
+            rows.append({
+                "sample_id": sample_id,
+                "calibration_target_visual_tokens": target,
+                "actual_visual_tokens": actual,
+                "calibration_status": "ok",
+            })
+    cohort = select_homogeneous_paired_cohort(rows, (400, 3000), minimum_samples=3)
+    assert cohort.valid
+    assert cohort.sample_ids == ("a", "b", "c")
+    assert cohort.actual_visual_tokens == (560, 2912)
 
 
 def test_calibration_audit_reports_paired_coverage_without_promoting_outliers():
@@ -261,6 +357,20 @@ def test_analysis_rows_require_their_provenance_and_use_contract_models():
     assert report.valid
 
 
+def test_audit_accepts_strict_preceding_attention_without_query_in_mask():
+    row = _valid_row(
+        row_id="strict-attention",
+        paper_figure="Figure 2",
+        attention_query="last_instruction",
+        attention_key_scope="strict_preceding",
+        query_position=3,
+        instruction_positions=[2],
+        visual_positions=[1],
+        text_positions=[0],
+    )
+    assert audit_rows([row], DEFAULT_CONTRACT).valid
+
+
 def test_paper_audit_rejects_wrong_attention_query_and_missing_layer_mask():
     attention_row = _valid_row(
         row_id="sample:attention",
@@ -365,3 +475,15 @@ def test_losslessness_audit_allows_longer_speculative_tail():
     rows = [{"row_id": "tail", "target_output_ids": [1, 2, 3],
              "speculative_output_ids": [1, 2, 3, 4]}]
     assert audit_losslessness(rows).valid
+
+
+def test_audit_allows_zero_draft_tokens_for_remove_all_series():
+    row = _valid_row(
+        row_id="remove-all",
+        paper_figure="Figure 1(a)",
+        series_id="msd_remove_all",
+        actual_visual_tokens=0,
+        condition="retention",
+        retention_percentage=0.0,
+    )
+    assert audit_rows([row], DEFAULT_CONTRACT).valid

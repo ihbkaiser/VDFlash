@@ -36,6 +36,19 @@ def test_evidence_last_retry_wins_and_old_row_is_diagnostic():
     assert result.diagnostic_rows[0]["diagnostic_reason"] == "duplicate_row_id_superseded"
 
 
+def test_evidence_uses_runner_lossless_prefix_with_post_eos_tail():
+    result = select_evidence([
+        _row(
+            "prefix-lossless",
+            paper_figure="Figure 1(a)",
+            lossless=True,
+            target_output_ids=[1, 2],
+            speculative_output_ids=[1, 2, 3],
+        )
+    ])
+    assert [row["row_id"] for row in result.evidence_rows] == ["prefix-lossless"]
+
+
 def test_malformed_jsonl_is_rejected_and_excluded(tmp_path: Path):
     path = tmp_path / "truncated.jsonl"
     path.write_text('{"row_id": "ok"}\n{"row_id":', encoding="utf-8")

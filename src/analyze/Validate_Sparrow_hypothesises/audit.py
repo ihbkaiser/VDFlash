@@ -62,7 +62,16 @@ def audit_rows(rows: Iterable[Mapping[str, Any]], contract: PaperContract) -> Au
             _add(issues, "error", "model_mismatch", f"target model is not the contract model for {figure}", row_id)
         for field in ("target_visual_tokens", "actual_visual_tokens"):
             value = row.get(field)
-            allow_zero = field == "actual_visual_tokens" and figure == "Figure 1(b)"
+            allow_zero = (
+                field == "actual_visual_tokens"
+                and (
+                    figure == "Figure 1(b)"
+                    or (
+                        figure == "Figure 1(a)"
+                        and str(row.get("series_id") or "") == "msd_remove_all"
+                    )
+                )
+            )
             if value is not None and (not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value < 0 or (value == 0 and not allow_zero)):
                 _add(issues, "error", "invalid_token_count", f"invalid {field}", row_id)
         if row.get("target_input_fingerprint") != row.get("target_input_fingerprint_reference", row.get("target_input_fingerprint")):
@@ -100,11 +109,26 @@ def audit_rows(rows: Iterable[Mapping[str, Any]], contract: PaperContract) -> Au
             if instruction & visual or instruction & text or visual & text:
                 _add(issues, "error", "overlapping_modality_masks", "attention modality masks overlap", row_id)
             if row.get("attention_query") == "last_instruction":
-                if row.get("query_position") not in instruction:
+                query_position = row.get("query_position")
+                if row.get("attention_key_scope") == "strict_preceding":
+                    try:
+                        query_position = int(query_position)
+                    except (TypeError, ValueError):
+                        query_position = None
+                    key_positions = instruction | visual | text
+                    if query_position is None or query_position in key_positions:
+                        _add(issues, "error", "query_in_strict_key_mask", "strict-preceding query is included in a key mask", row_id)
+                    elif any(position >= query_position for position in key_positions):
+                        _add(issues, "error", "future_key_in_strict_mask", "strict-preceding key mask contains a non-preceding position", row_id)
+                elif query_position not in instruction:
                     _add(issues, "error", "query_not_in_instruction_mask", "query position is not in instruction mask", row_id)
             elif row.get("attention_query") == "all_text":
                 query_positions = set(int(value) for value in row.get("query_positions", []))
-                if not query_positions or not query_positions.issubset(instruction | text):
+                if row.get("attention_key_scope") == "strict_preceding":
+                    key_length = len(row.get("attention_weights", []))
+                    if not query_positions or any(position < 0 or position >= key_length for position in query_positions):
+                        _add(issues, "error", "invalid_strict_query_positions", "strict-preceding query positions are invalid", row_id)
+                elif not query_positions or not query_positions.issubset(instruction | text):
                     _add(issues, "error", "query_not_in_text_mask", "all-text query positions are outside text masks", row_id)
         if figure == "Figure 6 / Appendix D":
             for field in ("layer", "visual_cosine", "text_cosine"):

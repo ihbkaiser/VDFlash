@@ -217,6 +217,112 @@ def select_paired_cohort(
     )
 
 
+@dataclass(frozen=True)
+class HomogeneousCohort:
+    """A paired cohort sharing one measured visual-token count per target."""
+
+    target_visual_tokens: tuple[int, ...]
+    actual_visual_tokens: tuple[int, ...]
+    sample_ids: tuple[str, ...]
+    rows: tuple[dict[str, Any], ...]
+    minimum_samples: int
+
+    @property
+    def valid(self) -> bool:
+        return len(self.sample_ids) >= self.minimum_samples
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "valid": self.valid,
+            "target_visual_tokens": list(self.target_visual_tokens),
+            "actual_visual_tokens": list(self.actual_visual_tokens),
+            "sample_ids": list(self.sample_ids),
+            "sample_count": len(self.sample_ids),
+            "minimum_samples": self.minimum_samples,
+            "selection": "largest_exact_actual_visual_token_signature",
+        }
+
+
+def select_homogeneous_paired_cohort(
+    rows: Iterable[Mapping[str, Any]],
+    targets: Sequence[int],
+    minimum_samples: int = 10,
+) -> HomogeneousCohort:
+    """Select the largest paired group with identical measured counts per target.
+
+    This is intended for attention plots whose x-axis is an absolute token
+    position.  Samples with different measured visual lengths otherwise have
+    different modality boundaries at the same x coordinate.  Rows must be
+    unique, calibrated ``ok`` records for each sample/target pair; invalid or
+    duplicate pairs cannot enter a homogeneous signature.
+    """
+    target_values = tuple(int(value) for value in targets)
+    if not target_values or minimum_samples <= 0:
+        raise ValueError("targets must be non-empty and minimum_samples must be positive")
+    grouped: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for raw in rows:
+        row = dict(raw)
+        sample_id = row.get("sample_id")
+        target = row.get("calibration_target_visual_tokens", row.get("target_visual_tokens"))
+        if sample_id is None or target is None:
+            continue
+        try:
+            key = (str(sample_id), int(target))
+        except (TypeError, ValueError):
+            continue
+        if key[1] in target_values:
+            grouped.setdefault(key, []).append(row)
+
+    signatures: dict[tuple[int, ...], list[tuple[str, dict[int, dict[str, Any]]]]] = {}
+    sample_ids = sorted({sample_id for sample_id, _target in grouped})
+    for sample_id in sample_ids:
+        selected: dict[int, dict[str, Any]] = {}
+        actual: list[int] = []
+        valid = True
+        for target in target_values:
+            values = grouped.get((sample_id, target), [])
+            if len(values) != 1:
+                valid = False
+                break
+            row = values[0]
+            if row.get("calibration_status", row.get("status")) != "ok":
+                valid = False
+                break
+            try:
+                count = int(row["actual_visual_tokens"])
+            except (KeyError, TypeError, ValueError):
+                valid = False
+                break
+            if count <= 0:
+                valid = False
+                break
+            selected[target] = row
+            actual.append(count)
+        if valid:
+            signatures.setdefault(tuple(actual), []).append((sample_id, selected))
+
+    if not signatures:
+        return HomogeneousCohort(target_values, (), (), (), int(minimum_samples))
+    signature, members = sorted(
+        signatures.items(),
+        key=lambda item: (-len(item[1]), tuple(item[0])),
+    )[0]
+    selected_ids = tuple(sorted(sample_id for sample_id, _rows in members))
+    selected_by_id = {sample_id: selected_rows for sample_id, selected_rows in members}
+    result_rows = tuple(
+        selected_by_id[sample_id][target]
+        for sample_id in selected_ids
+        for target in target_values
+    )
+    return HomogeneousCohort(
+        target_visual_tokens=target_values,
+        actual_visual_tokens=tuple(signature),
+        sample_ids=selected_ids,
+        rows=result_rows,
+        minimum_samples=int(minimum_samples),
+    )
+
+
 def write_calibration(path: str | Path, rows: Iterable[dict[str, Any]]) -> None:
     write_jsonl(path, rows)
 

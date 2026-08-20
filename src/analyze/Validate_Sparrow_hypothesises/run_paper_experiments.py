@@ -168,6 +168,10 @@ def run(args: argparse.Namespace) -> int:
                     "--output", str(destination), "--strict-losslessness", *calibration_arg, *common, *msd_flags,
                 ], root)
                 produced.append(destination)
+    else:
+        for existing in (msd_full, msd_remove_all, msd_retention_last, msd_retention_all):
+            if existing.exists():
+                produced.append(existing)
     if not args.skip_layers:
         _run(base + global_flags + [
             "layers",
@@ -178,6 +182,8 @@ def run(args: argparse.Namespace) -> int:
             *model_flags,
             *common,
         ], root)
+        produced.append(layers)
+    elif layers.exists():
         produced.append(layers)
     _merge(produced, combined, diagnostics)
     audit_rc = _run(base + global_flags + [

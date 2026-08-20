@@ -195,7 +195,7 @@ def run(args: argparse.Namespace) -> int:
     worklist = _load_worklist(args.worklist)
     if args.calibration and not calibration:
         raise SystemExit("Calibration file contains no requested visual-token targets")
-    existing = _load_existing_rows(args.output)
+    existing = {} if args.fresh else _load_existing_rows(args.output)
     processor = build_qwen2vl_video_processor(args.base_model, args.min_pixels, args.max_pixels)
     model = load_msd_qwen2vl(
         args.base_model,
@@ -239,9 +239,20 @@ def run(args: argparse.Namespace) -> int:
         for condition in conditions:
             percentages = [100.0] if condition == "full" else list(args.retention_percentages)
             for percentage in percentages:
+                is_remove_all = (
+                    condition == "retention"
+                    and args.length_series == "remove_all"
+                    and percentage == 0.0
+                )
+                suffix = (
+                    f"retention-{percentage:g}"
+                    if is_remove_all
+                    else f"{args.selection}:retention-{percentage:g}"
+                    if condition == "retention"
+                    else "full"
+                )
                 row_ids.add(
-                    f"{sample.sample_id}:{target}:"
-                    f"{'full' if condition == 'full' else f'retention-{percentage:g}'}"
+                    f"{sample.sample_id}:{target}:{suffix}"
                 )
         return row_ids
 
@@ -427,6 +438,14 @@ def _run_job(
                 paper_figure = "Figure 1(a)"
             elif condition == "retention":
                 paper_figure = "Figure 1(b)"
+                # Both Figure 1(b) policies are run as separate stage files,
+                # so the policy is part of the logical row identity.  Without
+                # it, merged evidence silently deduplicates all rows from one
+                # policy against the other.
+                row_id = (
+                    f"{sample.sample_id}:{_job_target(point)}:"
+                    f"{args.selection}:retention-{percentage:g}"
+                )
             row = {
                 "row_id": row_id,
                 "paper_figure": paper_figure,
@@ -558,6 +577,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fail hard (exit 1) when the target output is not a strict prefix "
         "of the speculative output. Off by default so a near-tie divergence at "
         "one token records lossless_prefix_length instead of aborting.",
+    )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="ignore an existing output JSONL and regenerate the requested stage",
     )
     return parser
 

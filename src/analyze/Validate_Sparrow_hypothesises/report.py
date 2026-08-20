@@ -63,9 +63,21 @@ def write_report(output_dir: str | Path, report: dict[str, Any]) -> None:
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     rows = report.pop("_rows", [])
+    # A previous incomplete run may have left paper-shaped plots under the
+    # diagnostic directory.  They carry the incomplete watermark and must
+    # not remain discoverable beside a later valid report.  Keep the ordinary
+    # exploratory PNG diagnostics; only remove stale composite paper plots
+    # before regenerating the current diagnostic set.
+    diagnostic_root = output / "diagnostic"
+    if diagnostic_root.exists():
+        for stale in diagnostic_root.glob("figure*_insight_*.*"):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
     # Legacy exploratory plots are always useful for debugging, but the
     # paper-shaped figures are emitted only for a complete enforced cohort.
-    plot_files = write_plots(rows, output / "diagnostic")
+    plot_files = write_plots(rows, diagnostic_root)
     paper_root = output if report.get("valid", False) else output / "diagnostic"
     watermark = None if report.get("valid", False) else "INCOMPLETE DIAGNOSTIC — NOT PAPER EVIDENCE"
     paper_plot_files = write_paper_style_plots(
@@ -116,6 +128,19 @@ def write_report(output_dir: str | Path, report: dict[str, Any]) -> None:
     ))
     lines.extend(["", "## Paper-style figures", ""])
     if report.get("plots"):
+        embedded_pngs = {
+            name for name in report["plots"]
+            if name in {
+                "figure1_insight_summary.png",
+                "figure2_insight_attention.png",
+                "figure3_insight_layer_analysis.png",
+                "figure6_insight_retention.png",
+            }
+        }
+        for name in sorted(embedded_pngs):
+            title = Path(name).stem.replace("_", " ").title()
+            lines.extend([f"### {title}", "", f"![{title}](./{name})", ""])
+        lines.append("Download links for all generated formats:")
         for name in report["plots"]:
             lines.append(f"- [{name}]({name})")
     else:

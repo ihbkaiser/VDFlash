@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
+import math
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -54,6 +55,102 @@ def _token_axis_label(value: float) -> str:
     return f"{value:g}"
 
 
+def _contiguous_ranges(positions: Iterable[int]) -> list[tuple[int, int]]:
+    """Return inclusive contiguous ranges without bridging token gaps."""
+    values = sorted({int(position) for position in positions})
+    if not values:
+        return []
+    ranges: list[tuple[int, int]] = []
+    start = previous = values[0]
+    for value in values[1:]:
+        if value != previous + 1:
+            ranges.append((start, previous))
+            start = value
+        previous = value
+    ranges.append((start, previous))
+    return ranges
+
+
+def _cohort_modality_ranges(rows: Iterable[dict[str, Any]]) -> list[tuple[str, int, int]]:
+    """Return consensus modality spans for absolute positions across rows.
+
+    Figure 2 averages token weights from samples whose actual prompt lengths
+    differ.  A single representative row therefore cannot describe the
+    modality boundary of the averaged curve.  Assign each plotted position to
+    the modality observed most often at that position, then split the result
+    into contiguous spans for shading.
+    """
+    support: dict[int, Counter[str]] = defaultdict(Counter)
+    for row in rows:
+        modality = str(row.get("modality") or "")
+        if modality not in {"instruction", "visual", "text"}:
+            continue
+        try:
+            position = int(row["token_position"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        support[position][modality] += 1
+    if not support:
+        return []
+
+    # Stable tie-breaking keeps the rendering deterministic at cohort
+    # boundaries where two modalities occur equally often.
+    tie_order = {"instruction": 0, "visual": 1, "text": 2}
+    labels = [
+        (position, max(counts, key=lambda modality: (counts[modality], -tie_order[modality])))
+        for position, counts in sorted(support.items())
+    ]
+    ranges: list[tuple[str, int, int]] = []
+    start_position, previous_position = labels[0][0], labels[0][0]
+    current_modality = labels[0][1]
+    for position, modality in labels[1:]:
+        if position != previous_position + 1 or modality != current_modality:
+            ranges.append((current_modality, start_position, previous_position))
+            start_position = position
+            current_modality = modality
+        previous_position = position
+    ranges.append((current_modality, start_position, previous_position))
+    return ranges
+
+
+def _figure2_region_statistics(rows: Iterable[dict[str, Any]]) -> dict[str, dict[str, float | int]]:
+    """Summarize regional mass and per-token weight for Figure 2 labels."""
+    unique_rows: dict[str, dict[str, Any]] = {}
+    for index, row in enumerate(rows):
+        weights = row.get("attention_weights")
+        if not isinstance(weights, list):
+            continue
+        row_id = str(row.get("row_id") or f"row-{index}")
+        unique_rows[row_id] = row
+    result: dict[str, dict[str, float | int]] = {}
+    for modality in ("instruction", "visual", "text"):
+        masses: list[float] = []
+        per_token_means: list[float] = []
+        for row in unique_rows.values():
+            try:
+                positions = [int(value) for value in row.get(f"{modality}_positions", [])]
+                values = [float(row["attention_weights"][position]) for position in positions]
+            except (KeyError, TypeError, ValueError, IndexError):
+                continue
+            values = [value for value in values if math.isfinite(value)]
+            if not values:
+                continue
+            mass = row.get(f"{modality}_mass")
+            try:
+                mass_value = float(mass) if mass is not None else sum(values)
+            except (TypeError, ValueError):
+                mass_value = sum(values)
+            if math.isfinite(mass_value):
+                masses.append(mass_value)
+            per_token_means.append(sum(values) / len(values))
+        result[modality] = {
+            "mass_mean": sum(masses) / len(masses) if masses else 0.0,
+            "mean_weight_per_token": sum(per_token_means) / len(per_token_means) if per_token_means else 0.0,
+            "sample_count": len(per_token_means),
+        }
+    return result
+
+
 def _empty_panel(axis: Any, message: str) -> None:
     axis.text(0.5, 0.5, message, ha="center", va="center", wrap=True, transform=axis.transAxes, color="#666")
     axis.set_axis_off()
@@ -92,13 +189,16 @@ def _write_paper_figure1(rows: list[dict[str, Any]], output: Path, plt: Any, for
         x = list(sorted(length_groups))
         keep_groups = series_groups.get("msd_keep_visual", {})
         accepted = [summarize([row.get("accepted_prefix_tokens") for row in keep_groups.get(value, [])]) for value in x]
+        # Figure 1(a) compares the user-visible MSD latency.  Draft-tree
+        # prefill is an internal component and is not sufficient to describe
+        # the cost of a condition, so use the measured end-to-end duration.
         latency = [summarize([
-            row.get("draft_tree_prefill_seconds") if row.get("draft_tree_prefill_seconds") is not None else row.get("prefill_seconds")
+            row.get("end_to_end_seconds")
             for row in keep_groups.get(value, [])
         ]) for value in x]
         remove_groups = series_groups.get("msd_remove_all", {})
         remove_latency = [summarize([
-            row.get("draft_tree_prefill_seconds") if row.get("draft_tree_prefill_seconds") is not None else row.get("prefill_seconds")
+            row.get("end_to_end_seconds")
             for row in remove_groups.get(value, [])
         ]) for value in x]
         axis = axes[0]
@@ -106,21 +206,21 @@ def _write_paper_figure1(rows: list[dict[str, Any]], output: Path, plt: Any, for
         positions = list(range(len(x)))
         keep_bars = twin.bar(
             [position - 0.16 for position in positions],
-            [float(stat["mean"] or 0.0) * 1000 for stat in latency],
+            [float(stat["mean"] or 0.0) for stat in latency],
             width=0.30,
             color="#f4a582",
             alpha=0.80,
-            label="Keep Visual draft prefill",
+            label="Keep Visual end-to-end",
         )
         remove_bars = None
         if remove_groups:
             remove_bars = twin.bar(
                 [position + 0.16 for position in positions],
-                [float(stat["mean"] or 0.0) * 1000 for stat in remove_latency],
+                [float(stat["mean"] or 0.0) for stat in remove_latency],
                 width=0.30,
                 color="#d6604d",
                 alpha=0.80,
-                label="Remove All draft prefill",
+                label="Remove All end-to-end",
             )
         line = axis.plot(
             positions,
@@ -140,14 +240,14 @@ def _write_paper_figure1(rows: list[dict[str, Any]], output: Path, plt: Any, for
         axis.set_xticks(positions, [_token_axis_label(value) for value in x])
         axis.set_xlabel("Visual token length")
         axis.set_ylabel("Average accepted length")
-        twin.set_ylabel("Draft tree prefill (ms)", color="#b2182b")
+        twin.set_ylabel("MSD end-to-end latency (s)", color="#b2182b")
         axis.set_title("(a) MSD visual-length sweep (VDC-50 local)")
         axis.grid(axis="y", alpha=0.22)
         handles = [line[0], remove_line[0], keep_bars]
-        labels = ["MSD keep visual", "MSD remove all visual", "Keep Visual draft prefill"]
+        labels = ["MSD keep visual", "MSD remove all visual", "Keep Visual end-to-end"]
         if remove_bars is not None:
             handles.append(remove_bars)
-            labels.append("Remove All draft prefill")
+            labels.append("Remove All end-to-end")
         axis.legend(handles, labels, loc="best", fontsize=8)
     else:
         _empty_panel(axes[0], "No measured Figure 1(a) rows")
@@ -230,10 +330,14 @@ def _figure2_for_source(
     if not groups:
         return []
     targets = sorted(groups)
-    if len(targets) >= 2:
-        selected = [targets[0], targets[-1]]
-    else:
-        selected = targets[:1]
+    # The 25K draft-attention run is also used as the selector source for
+    # Figure 1(b), but the paper-shaped Figure 2 panel is the short/long
+    # diagnostic pair at 0.4K and 3K.  Do not accidentally replace 3K with
+    # the auxiliary 25K selector run just because it is the largest target.
+    preferred_targets = [400, 3000]
+    selected = [target for target in preferred_targets if target in targets]
+    if len(selected) < 2:
+        selected = targets[:2]
     fig, axes = plt.subplots(1, len(selected), figsize=(5.8 * len(selected), 4.2), squeeze=False)
     axes = axes[0]
     if len(selected) == 1:
@@ -243,6 +347,7 @@ def _figure2_for_source(
         subset = groups[target]
         policies = ["last_instruction"]
         # Figure 2 uses the final instruction query only.
+        plot_positions: list[int] = []
         for policy in policies:
             policy_rows = [row for row in subset if str(row.get("attention_policy") or "last_instruction") == policy]
             by_position: dict[int, list[float]] = defaultdict(list)
@@ -254,22 +359,53 @@ def _figure2_for_source(
             points = sorted((position, sum(values) / len(values)) for position, values in by_position.items())
             if not points:
                 continue
+            plot_positions = [position for position, _ in points]
             axis.plot(
                 [position for position, _ in points], [value for _, value in points],
                 linewidth=1.0, color="#2166ac", alpha=0.9, label="Last instruction",
             )
-        representative = next((row for row in subset if row.get("modality") == "visual"), None)
-        if representative:
-            spans = [
-                ("Instruction", representative.get("instruction_positions", []), "#d9eaf7"),
-                ("Visual", representative.get("visual_positions", []), "#d9f0d3"),
-                ("Text", representative.get("text_positions", []), "#fce4c4"),
+        modality_colors = {
+            "instruction": ("Instruction", "#d9eaf7"),
+            "visual": ("Visual", "#d9f0d3"),
+            "text": ("Text", "#f4d35e"),
+        }
+        consensus_ranges = _cohort_modality_ranges(policy_rows)
+        for modality, left, right in consensus_ranges:
+            _, color = modality_colors[modality]
+            axis.axvspan(left, right, color=color, alpha=0.55, zorder=-5)
+        for modality, (label, _) in modality_colors.items():
+            modality_ranges = [
+                (left, right)
+                for range_modality, left, right in consensus_ranges
+                if range_modality == modality
             ]
-            for label, positions, color in spans:
-                if positions:
-                    left, right = min(positions), max(positions)
-                    axis.axvspan(left, right, color=color, alpha=0.55, zorder=-5)
-                    axis.text((left + right) / 2, 0.98, label, ha="center", va="top", fontsize=8, transform=axis.get_xaxis_transform())
+            if modality_ranges:
+                # Put one label in the widest consensus span; a modality can
+                # occur in multiple disjoint spans in the original prompt.
+                left, right = max(modality_ranges, key=lambda span: span[1] - span[0])
+                label_position = (left + right) / 2
+                axis.text(label_position, 0.98, label, ha="center", va="top", fontsize=8, transform=axis.get_xaxis_transform())
+        if plot_positions:
+            axis.set_xlim(min(plot_positions), max(plot_positions))
+        region_stats = _figure2_region_statistics(policy_rows)
+        if any(int(values["sample_count"]) > 0 for values in region_stats.values()):
+            axis.text(
+                0.02,
+                0.80,
+                "Average mass\n"
+                f"Instruction {region_stats['instruction']['mass_mean']:.3f} · "
+                f"Visual {region_stats['visual']['mass_mean']:.3f} · "
+                f"Text {region_stats['text']['mass_mean']:.3f}\n"
+                "Mean weight/token\n"
+                f"Instruction {region_stats['instruction']['mean_weight_per_token']:.2e} · "
+                f"Visual {region_stats['visual']['mean_weight_per_token']:.2e} · "
+                f"Text {region_stats['text']['mean_weight_per_token']:.2e}",
+                transform=axis.transAxes,
+                ha="left",
+                va="top",
+                fontsize=7,
+                bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "alpha": 0.82, "edgecolor": "#aaaaaa"},
+            )
         axis.set_xlabel("Token position")
         axis.set_ylabel("Average attention weight")
         axis.set_title(f"{_token_axis_label(target)} visual tokens")

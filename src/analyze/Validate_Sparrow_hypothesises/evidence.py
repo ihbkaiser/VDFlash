@@ -78,6 +78,12 @@ def _has_lossless_mismatch(row: Mapping[str, Any]) -> bool:
     figure = str(row.get("paper_figure") or "")
     if figure in {"Figure 3", "Figure 3(b)", "Figure 6 / Appendix D"}:
         return False
+    # MSD records the verified target prefix explicitly.  A speculative
+    # decoder may keep a few post-EOS/generated tail IDs, so comparing the
+    # two serialized lists byte-for-byte would reject rows that the runner
+    # and audit have already established as lossless.
+    if row.get("lossless") is not None:
+        return row.get("lossless") is False
     target = row.get("target_output_ids")
     speculative = row.get("speculative_output_ids")
     if target is None and speculative is None:

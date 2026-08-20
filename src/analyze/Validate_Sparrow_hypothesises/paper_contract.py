@@ -149,7 +149,7 @@ def paper_contract_rows(contract: PaperContract) -> list[dict[str, Any]]:
             "claim": "MSD acceptance and latency degrade as visual length grows",
             "model": contract.msd_target_model,
             "visual_tokens": list(contract.visual_token_milestones),
-            "metric": "accepted_length, draft_tree_prefill/verification/end_to_end_seconds",
+        "metric": "accepted_length, end_to_end_seconds",
         },
         {
             "figure": "Figure 1(b)",

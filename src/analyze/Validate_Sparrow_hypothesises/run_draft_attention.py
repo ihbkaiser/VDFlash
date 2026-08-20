@@ -105,6 +105,37 @@ def _query_attention_weights(
     return torch.softmax(scores.float(), dim=-1)[0].detach().to("cpu")
 
 
+def _strict_preceding_attention(
+    captured: torch.Tensor,
+    query_positions: Sequence[int],
+) -> torch.Tensor:
+    """Keep and renormalize only keys strictly preceding each query."""
+    if captured.ndim != 3:
+        raise ValueError("captured attention must have shape [heads, queries, keys]")
+    if captured.shape[1] != len(query_positions):
+        raise ValueError("query_positions must match the captured query dimension")
+    result = torch.zeros_like(captured)
+    key_length = int(captured.shape[-1])
+    for query_slot, query_position in enumerate(query_positions):
+        key_end = min(max(int(query_position), 0), key_length)
+        if key_end == 0:
+            continue
+        preceding = torch.nan_to_num(
+            captured[:, query_slot, :key_end],
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        normalizer = preceding.sum(dim=-1, keepdim=True)
+        normalized = torch.where(
+            normalizer > 0,
+            preceding / normalizer.clamp_min(torch.finfo(preceding.dtype).tiny),
+            torch.zeros_like(preceding),
+        )
+        result[:, query_slot, :key_end] = normalized
+    return result
+
+
 @contextmanager
 def capture_draft_query_attention(
     model: Any,
@@ -206,12 +237,24 @@ def _rows_for_policy(
 ) -> list[dict[str, Any]]:
     if not captured:
         raise RuntimeError(f"draft attention capture returned no layers for {sample.sample_id}")
-    visual = torch.as_tensor(masks["visual_positions"], dtype=torch.long)
-    instruction = torch.as_tensor(masks["instruction_positions"], dtype=torch.long)
-    text = torch.as_tensor(masks["text_positions"], dtype=torch.long)
+    visual_positions = [int(value) for value in masks["visual_positions"]]
+    instruction_positions = [int(value) for value in masks["instruction_positions"]]
+    text_positions = [int(value) for value in masks["text_positions"]]
+    if policy == "last_instruction":
+        query_position = int(query_positions[0])
+        visual_positions = [value for value in visual_positions if value < query_position]
+        instruction_positions = [value for value in instruction_positions if value < query_position]
+        text_positions = [value for value in text_positions if value < query_position]
+    visual = torch.as_tensor(visual_positions, dtype=torch.long)
+    instruction = torch.as_tensor(instruction_positions, dtype=torch.long)
+    text = torch.as_tensor(text_positions, dtype=torch.long)
+    strict_captured = {
+        layer: _strict_preceding_attention(values, query_positions)
+        for layer, values in captured.items()
+    }
     # Per layer: average over query rows (all_text) -> [heads, key].
-    per_layer = [captured[layer].mean(dim=1) if captured[layer].shape[1] > 1 else captured[layer][:, 0, :]
-                 for layer in sorted(captured)]
+    per_layer = [strict_captured[layer].mean(dim=1) if strict_captured[layer].shape[1] > 1 else strict_captured[layer][:, 0, :]
+                 for layer in sorted(strict_captured)]
     layer_values = torch.stack(per_layer)  # [layers, heads, key]
     attention = layer_values.mean(dim=(0, 1))  # mean over layers and heads -> [key]
     visual_mass = float(attention[visual].sum().item())
@@ -235,11 +278,12 @@ def _rows_for_policy(
         "attention_source": "msd_draft",
         "attention_query": policy,
         "attention_policy": policy,
+        "attention_key_scope": "strict_preceding",
         "query_position": int(masks["query_index"]) if policy == "last_instruction" else None,
         "query_positions": query_positions,
-        "instruction_positions": masks["instruction_positions"],
-        "visual_positions": masks["visual_positions"],
-        "text_positions": masks["text_positions"],
+        "instruction_positions": instruction_positions,
+        "visual_positions": visual_positions,
+        "text_positions": text_positions,
         "visual_token_count": int(visual.numel()),
         "target_visual_tokens": point.get("target_visual_tokens") if point else int(visual.numel()),
         "actual_visual_tokens": int(visual.numel()),
