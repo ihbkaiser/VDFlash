@@ -4,7 +4,11 @@ from types import SimpleNamespace
 
 import torch
 
-from src.analyze.Validate_Sparrow_hypothesises.audit import audit_losslessness, audit_rows
+from src.analyze.Validate_Sparrow_hypothesises.audit import (
+    audit_figure2_homogeneous,
+    audit_losslessness,
+    audit_rows,
+)
 from src.analyze.Validate_Sparrow_hypothesises.dataset import (
     choose_nearest_calibration,
     qwen2vl_video_token_count,
@@ -29,6 +33,7 @@ from src.analyze.Validate_Sparrow_hypothesises.model_analysis import (
 )
 from src.analyze.Validate_Sparrow_hypothesises.paper_statistics import build_paper_statistics, summarize
 from src.analyze.Validate_Sparrow_hypothesises.paper_contract import DEFAULT_CONTRACT, validate_contract
+from src.analyze.Validate_Sparrow_hypothesises.report import build_report
 from src.analyze.Validate_Sparrow_hypothesises.plots import (
     _cohort_modality_ranges,
     _contiguous_ranges,
@@ -104,6 +109,20 @@ def test_figure2_region_statistics_report_mass_and_mean_weight_per_token():
     assert abs(stats["instruction"]["mass_mean"] - 0.3) < 1e-9
     assert abs(stats["visual"]["mass_mean"] - 0.25) < 1e-9
     assert abs(stats["text"]["mean_weight_per_token"] - 0.45) < 1e-9
+
+
+def test_report_uses_homogeneous_figure2_source_without_dropping_full_audit_rows():
+    full = [
+        {"row_id": "f2-a", "paper_figure": "Figure 2"},
+        {"row_id": "f2-b", "paper_figure": "Figure 2"},
+        {"row_id": "f3", "paper_figure": "Figure 3"},
+    ]
+    selected = [{"row_id": "f2-selected", "paper_figure": "Figure 2"}]
+
+    report = build_report(full, DEFAULT_CONTRACT, figure2_rows=selected)
+
+    assert report["diagnostic_counts"]["Figure 2"] == 2
+    assert [row["row_id"] for row in report["_rows"] if row["paper_figure"] == "Figure 2"] == ["f2-selected"]
 
 
 def test_draft_attention_keeps_only_strictly_preceding_keys():
@@ -192,6 +211,42 @@ def test_homogeneous_paired_cohort_prefers_exact_visual_length_signature():
     assert cohort.valid
     assert cohort.sample_ids == ("a", "b", "c")
     assert cohort.actual_visual_tokens == (560, 2912)
+
+
+def test_figure2_homogeneous_audit_reports_exact_target_coverage():
+    rows = []
+    for sample_id in ("a", "b"):
+        for target, actual in ((400, 572), (3000, 2912)):
+            rows.append({
+                "row_id": f"{sample_id}:{target}",
+                "paper_figure": "Figure 2",
+                "sample_id": sample_id,
+                "target_model": DEFAULT_CONTRACT.msd_target_model,
+                "temperature": 0.0,
+                "target_visual_tokens": target,
+                "calibration_target_visual_tokens": target,
+                "actual_visual_tokens": actual,
+                "calibration_status": "ok",
+                "target_input_fingerprint": "same",
+                "draft_input_fingerprint": "same",
+                "attention_query": "last_instruction",
+                "attention_key_scope": "strict_preceding",
+                "query_position": 3,
+                "instruction_positions": [0],
+                "visual_positions": [1],
+                "text_positions": [2],
+                "modality": "summary",
+                "attention_source": "msd_draft",
+                "attention_policy": "last_instruction",
+                "attention_weights": [0.2, 0.3, 0.5, 0.0],
+            })
+
+    report = audit_figure2_homogeneous(rows, DEFAULT_CONTRACT, (400, 3000), minimum_samples=2)
+
+    assert report["valid"]
+    assert report["checked_rows"] == 4
+    assert report["coverage"]["paired_samples"] == 2
+    assert report["coverage"]["targets"]["400"]["actual_visual_tokens"] == 572
 
 
 def test_calibration_audit_reports_paired_coverage_without_promoting_outliers():

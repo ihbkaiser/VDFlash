@@ -25,8 +25,12 @@ class TargetHead(nn.Module):
             trust_remote_code=trust_remote_code,
             cache_dir=cache_dir,
         )
-        self.hidden_size = self.config.hidden_size
-        self.vocab_size = self.config.vocab_size
+        self.text_config = getattr(self.config, "text_config", self.config)
+        self.hidden_size = self.text_config.hidden_size
+        self.vocab_size = (
+            getattr(self.text_config, "padded_vocab_size", None)
+            or self.text_config.vocab_size
+        )
 
         self.fc = nn.Linear(self.hidden_size, self.vocab_size, bias=False)
 

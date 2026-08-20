@@ -208,7 +208,20 @@ def _cmd_audit(args: argparse.Namespace) -> int:
 
 def _cmd_report(args: argparse.Namespace) -> int:
     contract = _contract(args)
-    report = build_report(read_jsonl(args.input), contract)
+    figure2_rows = read_jsonl(args.figure2_input) if args.figure2_input else None
+    figure2_selection = None
+    if args.figure2_selection:
+        figure2_selection = json.loads(Path(args.figure2_selection).read_text(encoding="utf-8"))
+    figure2_audit = None
+    if args.figure2_audit:
+        figure2_audit = json.loads(Path(args.figure2_audit).read_text(encoding="utf-8"))
+    report = build_report(
+        read_jsonl(args.input),
+        contract,
+        figure2_rows=figure2_rows,
+        figure2_selection=figure2_selection,
+        figure2_audit=figure2_audit,
+    )
     write_report(args.output_dir, report)
     print(f"Wrote report to {args.output_dir}")
     return 0 if report["valid"] else 2
@@ -284,6 +297,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     report = sub.add_parser("report")
     report.add_argument("--input", required=True)
+    report.add_argument("--figure2-input", help="Homogeneous Figure 2 summary JSONL used only for Figure 2 plots/statistics.")
+    report.add_argument("--figure2-selection", help="JSON metadata emitted by the homogeneous Figure 2 selector.")
+    report.add_argument("--figure2-audit", help="Audit JSON emitted for the homogeneous Figure 2 selector.")
     report.add_argument("--output-dir", default="results/sparrow_validation/report")
     report.set_defaults(function=_cmd_report)
     return parser

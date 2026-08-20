@@ -24,8 +24,19 @@ def read_jsonl(path: str | Path) -> list[dict[str, Any]]:
     return rows
 
 
-def build_report(rows: Iterable[dict[str, Any]], contract: PaperContract) -> dict[str, Any]:
+def build_report(
+    rows: Iterable[dict[str, Any]],
+    contract: PaperContract,
+    *,
+    figure2_rows: Iterable[dict[str, Any]] | None = None,
+    figure2_selection: dict[str, Any] | None = None,
+    figure2_audit: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     rows = list(rows)
+    report_rows = rows
+    if figure2_rows is not None:
+        report_rows = [row for row in rows if row.get("paper_figure") != "Figure 2"]
+        report_rows.extend(dict(row) for row in figure2_rows)
     conformance = audit_rows(rows, contract)
     coverage = build_coverage(rows, contract)
     lossless = audit_losslessness(rows) if any(
@@ -33,7 +44,7 @@ def build_report(rows: Iterable[dict[str, Any]], contract: PaperContract) -> dic
     ) else None
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     summary_rows = [
-        row for row in rows
+        row for row in report_rows
         if row.get("accepted_prefix_tokens") is not None or row.get("rouge_l") is not None
     ]
     for row in summary_rows:
@@ -43,8 +54,9 @@ def build_report(rows: Iterable[dict[str, Any]], contract: PaperContract) -> dic
         )
         groups[key].append(row)
     summaries = {key: acceptance_summary(group) for key, group in sorted(groups.items())}
+    figure2_valid = figure2_audit is None or bool(figure2_audit.get("valid", False))
     return {
-        "valid": conformance.valid and coverage.valid and (lossless is None or lossless.valid),
+        "valid": conformance.valid and coverage.valid and (lossless is None or lossless.valid) and figure2_valid,
         "contract": contract.to_dict(),
         "traceability": paper_contract_rows(contract),
         "conformance": conformance.to_dict(),
@@ -55,7 +67,9 @@ def build_report(rows: Iterable[dict[str, Any]], contract: PaperContract) -> dic
             figure: sum(1 for row in rows if row.get("paper_figure") == figure)
             for figure in sorted({str(row.get("paper_figure")) for row in rows})
         },
-        "_rows": rows,
+        "figure2_homogeneous_cohort": figure2_selection,
+        "figure2_homogeneous_audit": figure2_audit,
+        "_rows": report_rows,
     }
 
 

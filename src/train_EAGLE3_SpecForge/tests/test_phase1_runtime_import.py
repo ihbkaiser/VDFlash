@@ -4,12 +4,15 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from safetensors.torch import save_file
 
 
 PACKAGE = Path(__file__).resolve().parents[1]
+if str(PACKAGE) not in sys.path:
+    sys.path.insert(0, str(PACKAGE))
 
 
 def test_eagle3_runtime_imports_with_the_installed_torch():
@@ -67,6 +70,24 @@ def test_qwen25vl_tied_embedding_can_supply_target_lm_head(tmp_path):
         dtype=torch.float16,
     )
     assert typed_head.fc.weight.dtype == torch.float16
+
+
+def test_qwen25vl_nested_text_config_builds_target_head():
+    from specforge.modeling.target.target_head import TargetHead
+
+    config = SimpleNamespace(
+        text_config=SimpleNamespace(hidden_size=4, vocab_size=6),
+        tie_word_embeddings=True,
+    )
+    with patch(
+        "specforge.modeling.target.target_head.AutoConfig.from_pretrained",
+        return_value=config,
+    ):
+        head = TargetHead("unused-model-path")
+
+    assert head.hidden_size == 4
+    assert head.vocab_size == 6
+    assert head.fc.weight.shape == (6, 4)
 
 
 def test_qwen25vl_text_defaults_to_three_axis_mrope_positions():

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from .calibrate import select_homogeneous_paired_cohort
 from .dataset import write_jsonl
 
 
@@ -29,6 +30,66 @@ class EvidenceResult:
     @property
     def valid(self) -> bool:
         return bool(self.evidence_rows) and not self.malformed_files
+
+
+@dataclass(frozen=True)
+class FinalEvidenceResult:
+    """Homogeneous Figure 2 evidence selected from a strict stage merge."""
+
+    figure2_rows: tuple[dict[str, Any], ...]
+    diagnostic_rows: tuple[dict[str, Any], ...]
+    cohort: dict[str, Any]
+
+
+def build_final_evidence(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    figure2_targets: tuple[int, ...] = (400, 3000),
+    minimum_samples: int = 10,
+) -> FinalEvidenceResult:
+    """Select the final Figure 2 summary stream from a strict stage merge.
+
+    The full stage evidence remains untouched.  Only the Figure 2 report
+    source is narrowed to the summary rows from the largest exact actual-token
+    signature shared by the requested targets.  This prevents absolute
+    token-position plots from mixing different visual/text boundaries while
+    keeping every measured row available for the full audit.
+    """
+
+    materialized = [dict(row) for row in rows]
+    summaries = [
+        row for row in materialized
+        if row.get("paper_figure") == "Figure 2"
+        and row.get("modality") == "summary"
+        and row.get("attention_source") == "msd_draft"
+        and row.get("attention_policy") == "last_instruction"
+    ]
+    cohort = select_homogeneous_paired_cohort(
+        summaries,
+        tuple(int(value) for value in figure2_targets),
+        minimum_samples=minimum_samples,
+    )
+    if not cohort.valid:
+        raise ValueError(
+            "Figure 2 homogeneous cohort is incomplete: "
+            f"selected {len(cohort.sample_ids)} samples, requires {minimum_samples}"
+        )
+    selected_rows = [dict(row) for row in cohort.rows]
+    selected_ids = [row.get("row_id") for row in selected_rows]
+    if any(row_id is None for row_id in selected_ids) or len(set(selected_ids)) != len(selected_ids):
+        raise ValueError("Figure 2 homogeneous rows must have unique row_id values")
+    selected_id_set = set(selected_ids)
+
+    diagnostics = [
+        _diagnostic(row, "figure2_nonhomogeneous_cohort", "full_stage_merge")
+        for row in materialized
+        if row.get("paper_figure") == "Figure 2" and row.get("row_id") not in selected_id_set
+    ]
+    return FinalEvidenceResult(
+        figure2_rows=tuple(selected_rows),
+        diagnostic_rows=tuple(diagnostics),
+        cohort=cohort.to_dict(),
+    )
 
 
 def read_jsonl_strict(path: str | Path) -> list[dict[str, Any]]:

@@ -311,6 +311,15 @@ python -m src.analyze.Validate_Sparrow_hypothesises all \
   --quantized
 ```
 
+By default `all` selects a shared `status=ok` paired cohort after calibration
+and applies the audited Figure 2 homogeneous policy. The complete measured
+matrix is kept in `results.jsonl` (and `full_results.jsonl`); Figure 2 plots
+and statistics use `figure2_homogeneous_results.jsonl`, whose exact visual
+token signature is recorded in `figure2_homogeneous_cohort.json`. The two
+audits are written to `audit.json`/`audit_full.json` and
+`audit_figure2_homogeneous.json`. Use `--report-output-dir results/report_MSD`
+to keep the canonical report separate from raw stage files.
+
 A single-script wrapper for a GPU host (T4-class) is also provided; it runs
 calibration when missing, then `all` with `--quantized`. It excludes
 out-of-tolerance points by default. Set `ALLOW_OUT_OF_TOLERANCE=1` only for a

@@ -65,8 +65,16 @@ if [[ -n "$MSD_MAX_MEMORY" ]]; then
     MSD_FLAGS+=(--msd-max-memory "$MSD_MAX_MEMORY")
 fi
 
+# This wrapper creates `gpu_run.log` before invoking the process-isolated
+# orchestrator, so its output directory is intentionally non-empty even when
+# an external calibration is supplied.  The wrapper is the explicit resume
+# entrypoint; the Python orchestrator still keeps its fresh-directory guard
+# when invoked directly.
+RESUME_FLAGS=(--resume)
+
 python -u -m src.analyze.Validate_Sparrow_hypothesises all \
     --output-dir "$OUTPUT_DIR" \
+    "${RESUME_FLAGS[@]}" \
     --quantized \
     "${MSD_FLAGS[@]}" \
     "${ALLOW_FLAG[@]}" \

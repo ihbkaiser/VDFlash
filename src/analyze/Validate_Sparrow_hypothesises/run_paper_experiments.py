@@ -9,11 +9,14 @@ commands.
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
 
-from .evidence import collect_evidence, write_evidence
+from .audit import audit_figure2_homogeneous
+from .evidence import build_final_evidence, collect_evidence, write_evidence
+from .dataset import write_jsonl
 from .paper_contract import load_contract
 
 
@@ -45,6 +48,57 @@ def _merge(paths: list[Path], output: Path, diagnostic: Path):
     return result
 
 
+def _finalize_evidence(
+    full_result,
+    output: Path,
+    diagnostic: Path,
+    selection_path: Path,
+    figure2_audit_path: Path,
+    contract,
+    *,
+    enabled: bool = True,
+):
+    """Create final report evidence from the strict full stage merge."""
+
+    if not enabled:
+        write_evidence(full_result, output, diagnostic)
+        return None
+
+    selected = build_final_evidence(
+        full_result.evidence_rows,
+        figure2_targets=(contract.attention_short_tokens, contract.attention_long_tokens),
+        minimum_samples=contract.minimum_paired_samples,
+    )
+    write_evidence(full_result, output, diagnostic)
+    figure2_rows_path = output.parent / "figure2_homogeneous_results.jsonl"
+    figure2_diagnostic_path = output.parent / "figure2_diagnostic_rows.jsonl"
+    write_jsonl(figure2_rows_path, selected.figure2_rows)
+    write_jsonl(figure2_diagnostic_path, selected.diagnostic_rows)
+    cohort = dict(selected.cohort)
+    cohort.update({
+        "source_results": str(output),
+        "selected_results": str(figure2_rows_path),
+        "selection_reason": "Exact actual visual-token signature per target; removes absolute-position boundary mixing.",
+    })
+    selection_path.parent.mkdir(parents=True, exist_ok=True)
+    selection_path.write_text(
+        json.dumps(cohort, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    figure2_audit = audit_figure2_homogeneous(
+        selected.figure2_rows,
+        contract,
+        (contract.attention_short_tokens, contract.attention_long_tokens),
+        minimum_samples=contract.minimum_paired_samples,
+    )
+    figure2_audit["cohort"] = cohort
+    figure2_audit_path.write_text(
+        json.dumps(figure2_audit, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return selected
+
+
 def run(args: argparse.Namespace) -> int:
     root = Path(args.repo_root).resolve()
     output_dir = root / args.output_dir
@@ -57,6 +111,20 @@ def run(args: argparse.Namespace) -> int:
     python = sys.executable
     contract_path = root / args.contract
     contract = load_contract(contract_path)
+    figure2_enabled = args.figure2_homogeneous
+    if args.limit is not None and args.limit < contract.minimum_paired_samples:
+        if args.auto_cohort:
+            print(
+                f"Skipping automatic paired cohort for smoke limit={args.limit}; "
+                f"at least {contract.minimum_paired_samples} samples are required.",
+                flush=True,
+            )
+        if args.figure2_homogeneous:
+            print(
+                "Skipping homogeneous Figure 2 report source for an undersized smoke run.",
+                flush=True,
+            )
+        figure2_enabled = False
     preflight = output_dir / "preflight.json"
     calibration = root / args.calibration_input if args.calibration_input else output_dir / "calibration.jsonl"
     msd_full = output_dir / "msd_full.jsonl"
@@ -66,10 +134,15 @@ def run(args: argparse.Namespace) -> int:
     attention = output_dir / "figure2_attention.jsonl"
     draft_attention = output_dir / "figure2_draft_attention.jsonl"
     layers = output_dir / "layer_analysis.jsonl"
+    full_combined = output_dir / "full_results.jsonl"
+    full_diagnostics = output_dir / "full_diagnostic_rows.jsonl"
     combined = output_dir / "results.jsonl"
     diagnostics = output_dir / "diagnostic_rows.jsonl"
+    figure2_selection = output_dir / "figure2_homogeneous_cohort.json"
+    figure2_audit = output_dir / "audit_figure2_homogeneous.json"
+    full_audit = output_dir / "audit_full.json"
     audit = output_dir / "audit.json"
-    report = output_dir / "report"
+    report = root / args.report_output_dir if args.report_output_dir else output_dir / "report"
 
     base = [python, "-m", PACKAGE]
     global_flags = ["--contract", str(contract_path)]
@@ -100,7 +173,22 @@ def run(args: argparse.Namespace) -> int:
         calibration_arg = ["--calibration", str(calibration)]
     if args.allow_out_of_tolerance:
         calibration_arg.append("--allow-out-of-tolerance")
-    stage_manifest = root / args.cohort_manifest if args.cohort_manifest else root / "dataset/VideoDetailCaption/subset_manifest.jsonl"
+    if args.cohort_manifest:
+        stage_manifest = root / args.cohort_manifest
+    elif args.auto_cohort and (args.limit is None or args.limit >= contract.minimum_paired_samples):
+        auto_manifest = output_dir / "cohort_manifest.jsonl"
+        auto_selection = output_dir / "cohort_selection.json"
+        if not (args.resume and auto_manifest.is_file() and auto_manifest.stat().st_size):
+            _run(base + global_flags + [
+                "cohort",
+                "--input", str(calibration),
+                "--output-manifest", str(auto_manifest),
+                "--output-selection", str(auto_selection),
+                "--targets", *[str(value) for value in contract.visual_token_milestones],
+            ], root)
+        stage_manifest = auto_manifest
+    else:
+        stage_manifest = root / "dataset/VideoDetailCaption/subset_manifest.jsonl"
     common = ["--manifest", str(stage_manifest)]
     if args.limit is not None:
         common += ["--limit", str(args.limit)]
@@ -185,13 +273,39 @@ def run(args: argparse.Namespace) -> int:
         produced.append(layers)
     elif layers.exists():
         produced.append(layers)
-    _merge(produced, combined, diagnostics)
+    full_result = _merge(produced, full_combined, full_diagnostics)
+    _finalize_evidence(
+        full_result,
+        combined,
+        diagnostics,
+        figure2_selection,
+        figure2_audit,
+        contract,
+        enabled=figure2_enabled,
+    )
+    # Keep a separate audit of the complete stage evidence.  The final audit
+    # below runs on the public full-evidence `results.jsonl`; the report-only
+    # Figure 2 source is audited separately above.
+    _run(base + global_flags + [
+        "audit", "--input", str(full_combined), "--output", str(full_audit),
+        "--calibration", str(calibration),
+        "--calibration-targets", *[str(value) for value in contract.visual_token_milestones],
+    ], root, allow_failure=True)
     audit_rc = _run(base + global_flags + [
         "audit", "--input", str(combined), "--output", str(audit),
         "--calibration", str(calibration),
         "--calibration-targets", *[str(value) for value in contract.visual_token_milestones],
     ], root, allow_failure=True)
-    report_rc = _run(base + global_flags + ["report", "--input", str(combined), "--output-dir", str(report)], root, allow_failure=True)
+    report_command = base + global_flags + [
+        "report", "--input", str(combined), "--output-dir", str(report),
+    ]
+    if figure2_enabled:
+        report_command.extend([
+            "--figure2-input", str(output_dir / "figure2_homogeneous_results.jsonl"),
+            "--figure2-selection", str(figure2_selection),
+            "--figure2-audit", str(figure2_audit),
+        ])
+    report_rc = _run(report_command, root, allow_failure=True)
     print(f"Complete report: {report / 'REPORT.md'}")
     return report_rc or audit_rc
 
@@ -201,6 +315,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--contract", default="src/analyze/Validate_Sparrow_hypothesises/configs/local_insight_vdc50.yaml")
     parser.add_argument("--repo-root", default=".")
     parser.add_argument("--output-dir", default="results/sparrow_validation")
+    parser.add_argument(
+        "--report-output-dir",
+        help="Optional separate canonical report directory; defaults to <output-dir>/report.",
+    )
     parser.add_argument(
         "--resume",
         action="store_true",
@@ -223,6 +341,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--msd-condition", choices=("full", "retention", "both"), default="both", help="Legacy compatibility; the local profile runs the required series explicitly.")
     parser.add_argument("--layer-experiments", choices=("figure3", "figure6", "both"), default="both")
     parser.add_argument("--layer-visual-targets", type=int, nargs="+", default=[3000])
+    parser.add_argument(
+        "--auto-cohort",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Select a status=ok paired cohort after calibration when no manifest is supplied.",
+    )
+    parser.add_argument(
+        "--figure2-homogeneous",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use the exact homogeneous summary cohort as the Figure 2 report/statistics source.",
+    )
     parser.add_argument("--device-map", default="auto")
     parser.add_argument(
         "--msd-device-map",

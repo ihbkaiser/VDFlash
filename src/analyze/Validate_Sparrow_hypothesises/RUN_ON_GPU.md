@@ -82,11 +82,15 @@ audit → report), với `--quantized` (4-bit cho T4). Chỉ điểm calibration
 `ok` được đưa vào cohort paper-shaped; đặt `ALLOW_OUT_OF_TOLERANCE=1` nếu cần
 diagnostic riêng. Kết quả nằm ở `results/sparrow_validation/`:
 
+- `cohort_manifest.jsonl`, `cohort_selection.json` (the shared strict cohort)
 - `msd_full.jsonl`, `msd_remove_all.jsonl`,
   `msd_retention_last_instruction.jsonl`,
   `msd_retention_all_text.jsonl`, `figure2_attention.jsonl`, `figure2_draft_attention.jsonl`,
-  `layer_analysis.jsonl` → merge thành `results.jsonl`
-- `audit.json` (fail-closed: leak target/draft, masks chồng nhau, model sai contract…)
+  `layer_analysis.jsonl` → merge thành `results.jsonl` và `full_results.jsonl`
+- `figure2_homogeneous_results.jsonl`, `figure2_homogeneous_cohort.json`,
+  `figure2_diagnostic_rows.jsonl` (report-only Figure 2 source and audit trail)
+- `audit.json`/`audit_full.json` (full matrix; fail-closed: leak target/draft,
+  masks chồng nhau, model sai contract…) và `audit_figure2_homogeneous.json`
 - `report/REPORT.md`, `report/figure*_insight_*.{png,pdf,svg}` (only when
   coverage passes; otherwise `report/diagnostic/` is watermarked),
   `report/paper_statistics.json`
@@ -97,6 +101,7 @@ Tham số hữu ích:
 ./run_sparrow_validation_gpu.sh --limit 5        # smoke 5 samples
 ./run_sparrow_validation_gpu.sh --skip-msd       # bỏ qua stage nào đó
 ./run_sparrow_validation_gpu.sh --layer-visual-targets 3000 13000
+./run_sparrow_validation_gpu.sh --report-output-dir results/report_MSD
 ```
 
 ### Cách 2 — Chạy từng bước (trên GPU host)

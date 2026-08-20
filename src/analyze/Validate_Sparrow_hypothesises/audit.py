@@ -6,6 +6,7 @@ import math
 from dataclasses import asdict, dataclass
 from typing import Any, Iterable, Mapping
 
+from .calibrate import select_homogeneous_paired_cohort
 from .paper_contract import PaperContract, validate_contract
 from .coverage import build_coverage
 
@@ -143,6 +144,65 @@ def audit_coverage(rows: Iterable[Mapping[str, Any]], contract: PaperContract):
     """Audit the experiment matrix, in addition to individual row schema."""
 
     return build_coverage(rows, contract)
+
+
+def audit_figure2_homogeneous(
+    rows: Iterable[Mapping[str, Any]],
+    contract: PaperContract,
+    targets: Iterable[int] = (400, 3000),
+    *,
+    minimum_samples: int | None = None,
+) -> dict[str, Any]:
+    """Audit the standalone homogeneous Figure 2 evidence stream."""
+
+    target_values = tuple(int(value) for value in targets)
+    minimum = int(minimum_samples or contract.minimum_paired_samples)
+    selected = [
+        dict(row) for row in rows
+        if row.get("paper_figure") == "Figure 2"
+        and row.get("modality") == "summary"
+        and row.get("attention_source") == "msd_draft"
+        and row.get("attention_policy") == "last_instruction"
+    ]
+    conformance = audit_rows(selected, contract)
+    by_target: dict[int, dict[str, Any]] = {}
+    for target in target_values:
+        target_rows = []
+        for row in selected:
+            try:
+                row_target = int(row.get("calibration_target_visual_tokens", row.get("target_visual_tokens", -1)))
+            except (TypeError, ValueError):
+                continue
+            if row_target == target:
+                target_rows.append(row)
+        sample_ids = {str(row.get("sample_id")) for row in target_rows if row.get("sample_id") is not None}
+        actual_values: set[int] = set()
+        for row in target_rows:
+            try:
+                if row.get("actual_visual_tokens") is not None:
+                    actual_values.add(int(row["actual_visual_tokens"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        by_target[target] = {
+            "sample_count": len(sample_ids),
+            "actual_visual_tokens": next(iter(actual_values)) if len(actual_values) == 1 else None,
+        }
+    cohort = select_homogeneous_paired_cohort(selected, target_values, minimum)
+    coverage = {
+        "valid": cohort.valid,
+        "paired_samples": len(cohort.sample_ids),
+        "minimum_samples": minimum,
+        "targets": {str(target): by_target[target] for target in target_values},
+    }
+    return {
+        "valid": conformance.valid and coverage["valid"],
+        "checked_rows": len(selected),
+        "valid_rows": conformance.valid_rows,
+        "issues": [asdict(issue) for issue in conformance.issues],
+        "coverage": coverage,
+        "cohort": cohort.to_dict(),
+        "scope": "Figure 2 MSD draft last_instruction homogeneous cohort",
+    }
 
 
 def audit_losslessness(rows: Iterable[Mapping[str, Any]]) -> AuditReport:
