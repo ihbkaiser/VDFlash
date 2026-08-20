@@ -347,12 +347,51 @@ def add_index(row: Mapping[str, Any], index: int) -> dict[str, Any]:
 
 
 def load_dataset_from_path(data_path: Path) -> Any:
+    """Load a local ShareGPT file without contacting the Hugging Face Hub.
+
+    ``datasets.load_dataset("json", ...)`` may perform a Hub HEAD request for
+    telemetry/metadata even when ``data_files`` points to a local file.  That
+    makes the offline EAGLE3 pipeline appear to hang on machines without
+    external network access.  Parse the local JSON/JSONL directly and build an
+    in-memory Dataset instead.
+    """
+
+    from datasets import Dataset
+
     suffix = data_path.suffix.lower()
     if suffix not in SUPPORTED_DATA_PATH_SUFFIXES:
         raise ValueError(
             f"Unsupported ShareGPT data file {data_path}; expected .json or .jsonl"
         )
-    return _load_hf_dataset("json", data_files=str(data_path), split="train")
+
+    if suffix == ".jsonl":
+        records = []
+        with data_path.open("r", encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"Invalid JSONL at line {line_number} in {data_path}: {exc}"
+                    ) from exc
+    else:
+        with data_path.open("r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+
+        if isinstance(payload, list):
+            records = payload
+        elif isinstance(payload, dict) and isinstance(payload.get("data"), list):
+            records = payload["data"]
+        else:
+            records = [payload]
+
+    if not records:
+        raise ValueError(f"Dataset is empty: {data_path}")
+
+    return Dataset.from_list(records)
 
 
 def _train_split(*args: Any, **kwargs: Any) -> Any:

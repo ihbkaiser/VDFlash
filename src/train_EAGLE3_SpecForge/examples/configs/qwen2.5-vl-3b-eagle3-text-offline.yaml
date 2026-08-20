@@ -1,5 +1,5 @@
 model:
-  target_model_path: Qwen/Qwen2.5-VL-3B-Instruct
+  target_model_path: /workspace/storage-shared/nlp/tungdd11/tungdecoder/models/qwen25-vl-3b
   draft_model_config: configs/qwen2.5-vl-3b-eagle3.json
   target_backend: sglang
   input_modality: text
@@ -23,8 +23,8 @@ data:
 training:
   strategy: eagle3
   num_epochs: 10
-  batch_size: 1
-  accumulation_steps: 2
+  batch_size: 16
+  accumulation_steps: 1
   fsdp_sharding: NO_SHARD
   learning_rate: 5.0e-5
   lr_scheduler: cosine
@@ -34,12 +34,12 @@ training:
   ttt_length: 7
   attention_backend: flex_attention
   save_interval: 1000
-  log_interval: 50
+  log_interval: 1
   dist_timeout: 20
   seed: 0
 
 tracking:
-  report_to: none
+  report_to: tensorboard
 
 run_id: qwen25vl-3b-eagle3-text-offline
 output_dir: artifacts/qwen25vl_eagle3_text/outputs/qwen25vl-3b-eagle3-text-offline
