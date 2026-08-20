@@ -178,7 +178,7 @@ def algorithm_spec() -> AlgorithmSpec:
             ),
         ),
         capabilities=AlgorithmCapabilities(
-            attention_backends={"sdpa", "flex_attention", "fa", "usp"},
+            attention_backends={"eager", "sdpa", "flex_attention", "fa", "usp"},
             supports_compact_teacher=True,
             supports_vocab_mapping=True,
             allows_aux_layer_override=True,

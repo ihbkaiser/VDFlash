@@ -349,7 +349,7 @@ class OnlineEagle3Model(Eagle3Model):
                 dtype=torch.bool,
                 device=hidden_states.device,
             )
-        if self.attention_backend == "sdpa":
+        if self.attention_backend in ["eager", "sdpa"]:
             attention_mask = self.draft_model.prepare_decoder_attention_mask(
                 attention_mask=attention_mask,
                 hidden_states=hidden_states,
@@ -369,7 +369,7 @@ class OnlineEagle3Model(Eagle3Model):
         adapter = self._make_adapter()
         # for sequence paralle, position mask and input ids will split by sequence dim, need to keep origin for ttt shift
         global_input_ids = input_ids
-        if self.attention_backend in ["sdpa", "fa", "usp"]:
+        if self.attention_backend in ["eager", "sdpa", "fa", "usp"]:
             cache_hidden = [[], []]
             past_key_values = None
         elif self.attention_backend == "flex_attention":
