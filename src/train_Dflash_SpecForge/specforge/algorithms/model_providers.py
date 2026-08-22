@@ -70,6 +70,9 @@ def _warm_start(
 ) -> None:
     if not cfg.model.draft_checkpoint_path:
         return
+    warm_start_mode = cfg.model.draft_warm_start_mode
+    if warm_start_mode == "none":
+        return
     from specforge.training.model_loading import warm_start_draft_model
 
     warm_start_draft_model(
@@ -78,6 +81,7 @@ def _warm_start(
         draft_config=draft_config,
         strategy=cfg.training.strategy,
         allow_missing_embedding=allow_missing_embedding,
+        warm_start_mode=warm_start_mode,
         cache_dir=cfg.model.cache_dir,
         trust_remote_code=cfg.model.trust_remote_code,
     )
@@ -482,7 +486,10 @@ def apply_dflash_overrides(cfg: Config, draft_config: Any) -> None:
 
     requested_layers = cfg.model.draft_num_hidden_layers
     if requested_layers is not None:
-        layer_types = draft_config.layer_types
+        layer_types = getattr(draft_config, "layer_types", None)
+        if not layer_types:
+            layer_types = ["full_attention"] * int(draft_config.num_hidden_layers)
+            draft_config.layer_types = layer_types
         if len(layer_types) != requested_layers:
             if len(set(layer_types)) > 1:
                 raise ValueError(

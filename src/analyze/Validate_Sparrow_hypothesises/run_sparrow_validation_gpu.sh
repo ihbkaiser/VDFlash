@@ -9,8 +9,9 @@
 #   - Hugging Face models cached (see RUN_ON_GPU.md).
 #
 # It reproduces Figure 1(a)/1(b) with MSD, Figure 2 on both the target model
-# and the MSD draft model, Figure 3/6 layer analyses on the cached Qwen2-VL-7B, then
-# audits everything and renders REPORT.md + figures + statistics.
+# and the MSD draft model, and Figure 6 on the cached Qwen2-VL-7B. Set
+# INCLUDE_CURRENT_FIGURE3=1 to add complete Qwen2.5-VL-3B MVBench Figure 3(a)/(b)
+# outputs to the canonical report.
 #
 # Usage:
 #   ./run_sparrow_validation_gpu.sh [--limit N] [--skip-calibration] [--skip-msd] ...
@@ -27,6 +28,10 @@ LOG_PATH="${LOG_PATH:-$OUTPUT_DIR/gpu_run.log}"
 ALLOW_OUT_OF_TOLERANCE="${ALLOW_OUT_OF_TOLERANCE:-0}"
 MSD_DEVICE_MAP="${MSD_DEVICE_MAP:-}"
 MSD_MAX_MEMORY="${MSD_MAX_MEMORY:-}"
+INCLUDE_CURRENT_FIGURE3="${INCLUDE_CURRENT_FIGURE3:-0}"
+FIGURE3_MODEL="${FIGURE3_MODEL:-Qwen/Qwen2.5-VL-3B-Instruct}"
+FIGURE3_MANIFEST="${FIGURE3_MANIFEST:-dataset/MVBench/classified/selected.jsonl}"
+FIGURE3_OUTPUT_DIR="${FIGURE3_OUTPUT_DIR:-}"
 EXTRA_ARGS=("$@")
 
 mkdir -p "$OUTPUT_DIR"
@@ -64,6 +69,17 @@ fi
 if [[ -n "$MSD_MAX_MEMORY" ]]; then
     MSD_FLAGS+=(--msd-max-memory "$MSD_MAX_MEMORY")
 fi
+FIGURE3_FLAGS=()
+if [[ "$INCLUDE_CURRENT_FIGURE3" == "1" ]]; then
+    FIGURE3_FLAGS+=(
+        --include-current-figure3
+        --figure3-model "$FIGURE3_MODEL"
+        --figure3-manifest "$FIGURE3_MANIFEST"
+    )
+    if [[ -n "$FIGURE3_OUTPUT_DIR" ]]; then
+        FIGURE3_FLAGS+=(--figure3-output-dir "$FIGURE3_OUTPUT_DIR")
+    fi
+fi
 
 # This wrapper creates `gpu_run.log` before invoking the process-isolated
 # orchestrator, so its output directory is intentionally non-empty even when
@@ -77,6 +93,7 @@ python -u -m src.analyze.Validate_Sparrow_hypothesises all \
     "${RESUME_FLAGS[@]}" \
     --quantized \
     "${MSD_FLAGS[@]}" \
+    "${FIGURE3_FLAGS[@]}" \
     "${ALLOW_FLAG[@]}" \
     "${EXTRA_ARGS[@]}"
 

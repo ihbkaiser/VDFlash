@@ -630,6 +630,7 @@ def build_training_run(
     try:
         trainer = build_offline_runtime(
             hidden_states_path=cfg.data.hidden_states_path,
+            hidden_state_phase=cfg.data.hidden_state_phase,
             eval_hidden_states_path=cfg.data.eval_hidden_states_path or None,
             draft_model=bundle.model,
             target_head=bundle.target_head,

@@ -13,8 +13,8 @@ Speculative Decoding in Video LLMs* (ACL 2026) bằng **MSD**
 | I1 | Fig 1(a): accepted length suy giảm khi visual tokens tăng (0.4k→25k) | `msd --condition full` | MSD-Qwen2VL-7B (4-bit) | accepted length, decode/e2e speedup |
 | I2 | Fig 1(b): negative visual gain — prune draft visual input (100→0%) làm accepted length tăng | `msd --condition retention` | MSD-Qwen2VL-7B | accepted length, lossless rate |
 | I3 | Fig 2: attention dilution trong draft model | `attention` (target proxy) + **`draft_attention`** (MSD draft thật) | Qwen2-VL-7B / MSD draft | instruction/visual/text attention mass, visual entropy |
-| I4 | Fig 3(a): visual KV indispensable ở layer đầu, robust sau layer ~20 | `layers` figure3 | Qwen2-VL-7B (local substitution) | prefix agreement, output ROUGE-L, VDC answer-quality delta theo layer cut |
-| I5 | Fig 3(b): middle layers là arena chính của visual-text interaction | `layers` figure3_attention | Qwen2-VL-7B (local substitution) | per-layer/per-head visual mass |
+| I4 | Fig 3(a): visual KV indispensable ở layer đầu, robust sau layer ~20 | current Figure 3 runner | Qwen2.5-VL-3B trên MVBench | accuracy/prefix agreement theo layer cut |
+| I5 | Fig 3(b): visual attention thay đổi theo toàn bộ decoder depth | current Figure 3 runner | Qwen2.5-VL-3B trên MVBench | per-layer/per-head visual mass |
 | I6 | Fig 6/App D: visual semantics internalize — visual cosine < 0.25 gần layer 20 | `layers` figure6 | Qwen2-VL-7B (local substitution) | layerwise visual/text cosine |
 
 Lưu ý kiểm chứng trung thực: paper đo attention dilution của **draft model**.
@@ -49,11 +49,13 @@ Model cần có trong HF cache (hoặc `hf auth login` để tải khi chạy):
 - `Qwen/Qwen2-VL-7B-Instruct` (target của MSD, dùng cho Fig 1/2)
 - `lucylyn/MSD-Qwen2VL-7B-Instruct` (draft MSD chính thức)
 - `Qwen/Qwen2-VL-7B-Instruct` (dùng cho Fig 3/6 trong local profile)
+- `Qwen/Qwen2.5-VL-3B-Instruct` (dùng cho current Figure 3 trên MVBench)
 
 ```bash
 hf download Qwen/Qwen2-VL-7B-Instruct --local-dir ~/.cache/...  # hoặc để AutoModel tự tải
 hf download lucylyn/MSD-Qwen2VL-7B-Instruct
-# Qwen2-VL đã được dùng cho target/MSD và được tái sử dụng cho Fig 3/6
+hf download Qwen/Qwen2.5-VL-3B-Instruct
+# Qwen2-VL dùng cho target/MSD + Figure 6; Qwen2.5-VL-3B dùng riêng cho Figure 3
 ```
 
 Dataset: `dataset/VideoDetailCaption/` (50 videos + `subset_manifest.jsonl`)
@@ -76,6 +78,37 @@ MSD_MAX_MEMORY=0:22GiB,1:14GiB \
 src/analyze/Validate_Sparrow_hypothesises/run_sparrow_validation_gpu.sh
 ```
 
+Để chạy pipeline canonical hiện tại (Figures 1/2/6 theo local VDC contract và
+Figure 3(a)/(b) đầy đủ 36 layer của Qwen2.5-VL-3B trên MVBench), bật cờ
+Figure 3 một cách tường minh:
+
+```bash
+INCLUDE_CURRENT_FIGURE3=1 \
+FIGURE3_MODEL=Qwen/Qwen2.5-VL-3B-Instruct \
+FIGURE3_MANIFEST=dataset/MVBench/classified/selected.jsonl \
+MSD_DEVICE_MAP=model_parallel \
+MSD_MAX_MEMORY=0:22GiB,1:14GiB \
+src/analyze/Validate_Sparrow_hypothesises/run_sparrow_validation_gpu.sh
+```
+
+Mặc định không bật cờ này để giữ tương thích với các run legacy. Hai panel
+Figure 3 chạy trong hai process tuần tự để giải phóng model giữa các panel.
+Bundle được tạo tại `report/figure3/` và chỉ được chấp nhận nếu hai summary có
+cùng model, manifest SHA256, preprocessing, cohort và coverage đầy đủ:
+
+```text
+report/figure3/
+├── figure3a.jsonl              # native + layer cuts 0,4,...,32
+├── figure3b.jsonl              # all native layers 0..35
+├── figure3a.summary.json
+├── figure3b.summary.json
+├── figure3_insight_layer_analysis.{png,pdf,svg}
+├── figure3a_statistics.csv
+├── figure3b_statistics.csv
+├── figure3_metadata.json
+└── figure3_audit.json
+```
+
 Script tự chạy: calibration (nếu chưa có) → `all` (preflight → target/draft
 attention → MSD full + remove-all + attention-guided retention → layers →
 audit → report), với `--quantized` (4-bit cho T4). Chỉ điểm calibration
@@ -93,7 +126,8 @@ diagnostic riêng. Kết quả nằm ở `results/sparrow_validation/`:
   masks chồng nhau, model sai contract…) và `audit_figure2_homogeneous.json`
 - `report/REPORT.md`, `report/figure*_insight_*.{png,pdf,svg}` (only when
   coverage passes; otherwise `report/diagnostic/` is watermarked),
-  `report/paper_statistics.json`
+  `report/paper_statistics.json`; khi bật current Figure 3, report liên kết
+  thêm các file trong `report/figure3/` và ghi rõ provenance trong `summary.json`.
 
 Tham số hữu ích:
 
@@ -102,6 +136,15 @@ Tham số hữu ích:
 ./run_sparrow_validation_gpu.sh --skip-msd       # bỏ qua stage nào đó
 ./run_sparrow_validation_gpu.sh --layer-visual-targets 3000 13000
 ./run_sparrow_validation_gpu.sh --report-output-dir results/report_MSD
+```
+
+Chạy riêng current Figure 3 (không chạy Figures 1/2/6):
+
+```bash
+python -m src.analyze.Validate_Sparrow_hypothesises figure3 \
+  --model Qwen/Qwen2.5-VL-3B-Instruct \
+  --manifest dataset/MVBench/classified/selected.jsonl \
+  --output-dir results/figure3_qwen25vl3b
 ```
 
 ### Cách 2 — Chạy từng bước (trên GPU host)
@@ -138,6 +181,7 @@ python -m src.analyze.Validate_Sparrow_hypothesises audit \
   --output results/sparrow_validation/audit.json
 python -m src.analyze.Validate_Sparrow_hypothesises report \
   --input results/sparrow_validation/results.jsonl \
+  --current-figure3-dir results/sparrow_validation/report/figure3 \
   --output-dir results/sparrow_validation/report
 ```
 

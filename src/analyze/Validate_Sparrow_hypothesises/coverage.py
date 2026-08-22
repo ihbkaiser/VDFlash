@@ -78,10 +78,16 @@ def _group_name(figure: str, target: int | None = None, extra: str = "") -> str:
     return ":".join(pieces)
 
 
-def build_coverage(rows: Iterable[Mapping[str, Any]], contract: PaperContract) -> CoverageReport:
+def build_coverage(
+    rows: Iterable[Mapping[str, Any]],
+    contract: PaperContract,
+    *,
+    excluded_figures: Iterable[str] = (),
+) -> CoverageReport:
     """Build the profile coverage matrix and paired-cohort gate."""
 
     rows = list(rows)
+    excluded = {str(figure) for figure in excluded_figures}
     issues: list[CoverageIssue] = []
     milestones = tuple(int(value) for value in contract.visual_token_milestones)
     retentions = tuple(float(value) for value in contract.retention_percentages)
@@ -97,6 +103,7 @@ def build_coverage(rows: Iterable[Mapping[str, Any]], contract: PaperContract) -
         "layer_cut_points": list(cuts),
         "layers": list(layer_range),
         "minimum_paired_samples": contract.minimum_paired_samples,
+        "excluded_figures": sorted(excluded),
     }
     observed: dict[str, Any] = {"groups": {}, "missing": []}
     group_sets: list[set[str]] = []
@@ -175,31 +182,34 @@ def build_coverage(rows: Iterable[Mapping[str, Any]], contract: PaperContract) -
     # cohort.  Figure 3(a) is deliberately called prefix agreement in the
     # renderer; it is not mislabeled as MVBench accuracy.
     layer_target = int(contract.attention_long_tokens)
-    for cut in cuts:
-        require_group(
-            _group_name("Figure 3", layer_target, f"cut:{cut}"),
-            lambda row, cut=cut: (
-                row.get("paper_figure") == "Figure 3"
-                and _target(row) == layer_target
-                and row.get("layer_cut") is not None
-                and int(row.get("layer_cut")) == cut
-                and row.get("prefix_agreement") is not None
-                and row.get("answer_quality_delta") is not None
-            ),
-            figure="Figure 3",
-        )
+    if "Figure 3" not in excluded:
+        for cut in cuts:
+            require_group(
+                _group_name("Figure 3", layer_target, f"cut:{cut}"),
+                lambda row, cut=cut: (
+                    row.get("paper_figure") == "Figure 3"
+                    and _target(row) == layer_target
+                    and row.get("layer_cut") is not None
+                    and int(row.get("layer_cut")) == cut
+                    and row.get("prefix_agreement") is not None
+                    and row.get("answer_quality_delta") is not None
+                ),
+                figure="Figure 3",
+            )
+    if "Figure 3(b)" not in excluded:
+        for layer in layer_range:
+            require_group(
+                _group_name("Figure 3(b)", layer_target, f"layer:{layer}"),
+                lambda row, layer=layer: (
+                    row.get("paper_figure") == "Figure 3(b)"
+                    and _target(row) == layer_target
+                    and row.get("layer") is not None
+                    and int(row.get("layer")) == layer
+                    and row.get("per_head_visual_mass") is not None
+                ),
+                figure="Figure 3(b)",
+            )
     for layer in layer_range:
-        require_group(
-            _group_name("Figure 3(b)", layer_target, f"layer:{layer}"),
-            lambda row, layer=layer: (
-                row.get("paper_figure") == "Figure 3(b)"
-                and _target(row) == layer_target
-                and row.get("layer") is not None
-                and int(row.get("layer")) == layer
-                and row.get("per_head_visual_mass") is not None
-            ),
-            figure="Figure 3(b)",
-        )
         require_group(
             _group_name("Figure 6 / Appendix D", layer_target, f"layer:{layer}"),
             lambda row, layer=layer: (

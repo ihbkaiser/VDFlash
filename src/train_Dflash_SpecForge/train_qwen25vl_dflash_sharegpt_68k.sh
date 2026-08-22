@@ -34,6 +34,7 @@ SAVE_INTERVAL=${SPECFORGE_SAVE_INTERVAL:-1000}
 LOG_INTERVAL=${SPECFORGE_LOG_INTERVAL:-100}
 USE_LIGER=${SPECFORGE_USE_LIGER:-auto}
 CAPTURE_TORCH_COMPILE=${SPECFORGE_CAPTURE_TORCH_COMPILE:-0}
+PHASE1_TARGET_LAYER_IDS=${SPECFORGE_PHASE1_TARGET_LAYER_IDS:-}
 
 usage() {
   printf '%s\n' \
@@ -62,7 +63,8 @@ usage() {
     '  SPECFORGE_DATALOADER_WORKERS, SPECFORGE_SAVE_INTERVAL' \
     '  SPECFORGE_LOG_INTERVAL, SPECFORGE_USE_LIGER=auto|0|1' \
     '  SPECFORGE_CAPTURE_TORCH_COMPILE=0|1, SPECFORGE_EMBEDDING_KEY' \
-    '  SPECFORGE_COMPRESS=1'
+    '  SPECFORGE_COMPRESS=1' \
+    '  SPECFORGE_PHASE1_TARGET_LAYER_IDS=comma-separated five layer IDs'
 }
 
 while (($#)); do
@@ -232,20 +234,41 @@ feature_count() {
   find "$feature_dir" -type f \( -name '*.ckpt' -o -name '*.ckpt.gz' \) -print | wc -l
 }
 
+resolve_phase_config() {
+  local source=$1 destination=$2 phase=$3 layer_ids=${4:-}
+  local args=(
+    --input "$source"
+    --output "$destination"
+    --phase "$phase"
+  )
+  if [[ -n "$layer_ids" ]]; then
+    args+=(--target-layer-ids "$layer_ids")
+  fi
+  "$PYTHON_BIN" "$SPECFORGE_DIR/scripts/resolve_dflash_config.py" "${args[@]}"
+}
+
+validate_feature_cache() {
+  local feature_dir=$1 draft_config=$2 phase=$3
+  "$PYTHON_BIN" "$SPECFORGE_DIR/scripts/validate_hidden_state_cache.py" \
+    --feature-root "$feature_dir" \
+    --draft-model-config "$draft_config" \
+    --phase "$phase"
+}
+
 run_model() {
   local size=$1
-  local target_model draft_config run_config slug run_id
+  local target_model base_draft_config draft_config run_config slug run_id
   case "$size" in
     3b)
       target_model=$MODEL_3B
-      draft_config="$SPECFORGE_DIR/configs/qwen2.5-vl-3b-dflash.json"
+      base_draft_config="$SPECFORGE_DIR/configs/qwen2.5-vl-3b-dflash.json"
       run_config="$SPECFORGE_DIR/examples/configs/qwen2.5-vl-3b-dflash-offline-b200.yaml"
       slug=qwen25vl_3b
       run_id=qwen25vl-3b-dflash-sharegpt68k
       ;;
     7b)
       target_model=$MODEL_7B
-      draft_config="$SPECFORGE_DIR/configs/qwen2.5-vl-7b-dflash.json"
+      base_draft_config="$SPECFORGE_DIR/configs/qwen2.5-vl-7b-dflash.json"
       run_config="$SPECFORGE_DIR/examples/configs/qwen2.5-vl-7b-dflash-offline-b200.yaml"
       slug=qwen25vl_7b
       run_id=qwen25vl-7b-dflash-sharegpt68k
@@ -253,6 +276,9 @@ run_model() {
   esac
   local feature_dir="$ARTIFACT_ROOT/$slug/hidden_states"
   local output_dir="$OUTPUT_ROOT/$run_id"
+  draft_config="$ARTIFACT_ROOT/$slug/draft_config_phase1.json"
+  resolve_phase_config \
+    "$base_draft_config" "$draft_config" phase1 "$PHASE1_TARGET_LAYER_IDS"
 
   if [[ ! -e "$target_model" && ( "$target_model" == /* || "$target_model" == ./* || "$target_model" == ../* ) ]]; then
     echo "Target model path not found: $target_model" >&2
@@ -262,6 +288,9 @@ run_model() {
   if [[ "$PHASE" == capture || "$PHASE" == all ]]; then
     local existing_features
     existing_features=$(feature_count "$feature_dir")
+    if ((existing_features > 0)); then
+      validate_feature_cache "$feature_dir" "$draft_config" phase1
+    fi
     if ((existing_features > 0 && !RESUME)); then
       echo "Offline features already exist at $feature_dir; pass --resume or use a new ARTIFACT_ROOT" >&2
       exit 1
@@ -283,6 +312,7 @@ run_model() {
         --nproc_per_node="$GPU_COUNT" \
         scripts/prepare_hidden_states.py \
         --strategy dflash \
+        --phase phase1 \
         --target-model-path "$target_model" \
         --draft-model-config "$draft_config" \
         --data-path "$SPECFORGE_DATA" \
@@ -314,6 +344,7 @@ run_model() {
       echo "No offline features found at $feature_dir; run --phase capture first" >&2
       exit 1
     fi
+    validate_feature_cache "$feature_dir" "$draft_config" phase1
     per_rank_samples=$(((count + GPU_COUNT - 1) / GPU_COUNT))
     micro_batches_per_epoch=$((per_rank_samples / MICRO_BATCH_SIZE))
     max_steps=$((micro_batches_per_epoch * NUM_EPOCHS / ACCUMULATION_STEPS))
@@ -347,6 +378,7 @@ run_model() {
         "model.embedding_key=$EMBEDDING_KEY" \
         "model.use_liger_kernel=$USE_LIGER" \
         "data.hidden_states_path=$feature_dir" \
+        "data.hidden_state_phase=phase1" \
         "data.cache_dir=$ARTIFACT_ROOT/cache" \
         "data.max_length=$MAX_LENGTH" \
         "data.dataloader_num_workers=$DATALOADER_WORKERS" \

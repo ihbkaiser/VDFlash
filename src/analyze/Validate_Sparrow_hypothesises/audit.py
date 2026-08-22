@@ -140,10 +140,15 @@ def audit_rows(rows: Iterable[Mapping[str, Any]], contract: PaperContract) -> Au
     return AuditReport(not any(issue.severity == "error" for issue in issues) and bool(rows), len(rows), valid_rows, issues)
 
 
-def audit_coverage(rows: Iterable[Mapping[str, Any]], contract: PaperContract):
+def audit_coverage(
+    rows: Iterable[Mapping[str, Any]],
+    contract: PaperContract,
+    *,
+    excluded_figures: Iterable[str] = (),
+):
     """Audit the experiment matrix, in addition to individual row schema."""
 
-    return build_coverage(rows, contract)
+    return build_coverage(rows, contract, excluded_figures=excluded_figures)
 
 
 def audit_figure2_homogeneous(

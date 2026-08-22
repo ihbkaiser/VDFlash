@@ -9,6 +9,7 @@ commands.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -17,6 +18,14 @@ from pathlib import Path
 from .audit import audit_figure2_homogeneous
 from .evidence import build_final_evidence, collect_evidence, write_evidence
 from .dataset import write_jsonl
+from .figure3_pipeline import (
+    DEFAULT_MODEL as DEFAULT_FIGURE3_MODEL,
+    DEFAULT_TASKS as DEFAULT_FIGURE3_TASKS,
+    build_panel_commands,
+    compose_figure3_plot,
+    validate_figure3_summaries,
+    write_figure3_metadata,
+)
 from .paper_contract import load_contract
 
 
@@ -99,6 +108,110 @@ def _finalize_evidence(
     return selected
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_jsonl(path: Path) -> list[dict]:
+    with path.open(encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+def _run_current_figure3(
+    *,
+    root: Path,
+    output_dir: Path,
+    report_dir: Path,
+    args: argparse.Namespace,
+    python: str,
+) -> Path:
+    """Run both current Qwen2.5-VL-3B Figure 3 panels and compose their bundle."""
+
+    figure3_dir = (
+        root / args.figure3_output_dir
+        if args.figure3_output_dir
+        else report_dir / "figure3"
+    )
+    figure3_dir = figure3_dir.resolve()
+    manifest = (root / args.figure3_manifest).resolve()
+    if not manifest.is_file():
+        raise SystemExit(f"Figure 3 manifest does not exist: {manifest}")
+    if figure3_dir.exists() and any(figure3_dir.iterdir()) and not args.resume:
+        raise SystemExit(
+            f"Current Figure 3 directory is not empty: {figure3_dir}. "
+            "Choose a fresh --figure3-output-dir or pass --resume explicitly."
+        )
+    if args.resume and figure3_dir.exists() and any(figure3_dir.iterdir()):
+        metadata_path = figure3_dir / "figure3_metadata.json"
+        if not metadata_path.is_file():
+            raise SystemExit(
+                f"Cannot resume current Figure 3 without metadata: {metadata_path}"
+            )
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        expected_hash = _sha256_file(manifest)
+        if metadata.get("model") != args.figure3_model:
+            raise SystemExit(
+                "Current Figure 3 resume model mismatch: "
+                f"{metadata.get('model')!r} != {args.figure3_model!r}"
+            )
+        if metadata.get("manifest_sha256") != expected_hash:
+            raise SystemExit(
+                "Current Figure 3 resume manifest mismatch: "
+                f"{metadata.get('manifest_sha256')!r} != {expected_hash!r}"
+            )
+    figure3_dir.mkdir(parents=True, exist_ok=True)
+    commands = build_panel_commands(
+        python=python,
+        model=args.figure3_model,
+        manifest=manifest,
+        output_dir=figure3_dir,
+        tasks=args.figure3_tasks,
+        limit_per_task=args.figure3_limit_per_task,
+        fps=args.figure3_fps,
+        max_frames=args.figure3_max_frames,
+        min_pixels=args.figure3_min_pixels,
+        max_pixels=args.figure3_max_pixels,
+        max_new_tokens=args.figure3_max_new_tokens,
+        dtype=args.figure3_dtype,
+        device_map=args.figure3_device_map,
+        quantized=args.figure3_quantized,
+    )
+    _run(commands["a"], root)
+    _run(commands["b"], root)
+    a_summary_path = figure3_dir / "figure3a.summary.json"
+    b_summary_path = figure3_dir / "figure3b.summary.json"
+    a_summary = json.loads(a_summary_path.read_text(encoding="utf-8"))
+    b_summary = json.loads(b_summary_path.read_text(encoding="utf-8"))
+    validation = validate_figure3_summaries(
+        a_summary,
+        b_summary,
+        expected_model=args.figure3_model,
+    )
+    a_rows = _read_jsonl(figure3_dir / "figure3a.jsonl")
+    b_rows = _read_jsonl(figure3_dir / "figure3b.jsonl")
+    compose_figure3_plot(figure3_dir, a_summary, b_summary)
+    write_figure3_metadata(
+        figure3_dir,
+        a_summary,
+        b_summary,
+        a_rows,
+        b_rows,
+        audit=validation,
+        expected_model=args.figure3_model,
+    )
+    if not validation["valid"]:
+        raise SystemExit(
+            "Current Figure 3 bundle failed validation: "
+            + "; ".join(issue["message"] for issue in validation["issues"])
+        )
+    print(f"Composed current Figure 3 bundle: {figure3_dir}", flush=True)
+    return figure3_dir
+
+
 def run(args: argparse.Namespace) -> int:
     root = Path(args.repo_root).resolve()
     output_dir = root / args.output_dir
@@ -143,6 +256,7 @@ def run(args: argparse.Namespace) -> int:
     full_audit = output_dir / "audit_full.json"
     audit = output_dir / "audit.json"
     report = root / args.report_output_dir if args.report_output_dir else output_dir / "report"
+    current_figure3_dir: Path | None = None
 
     base = [python, "-m", PACKAGE]
     global_flags = ["--contract", str(contract_path)]
@@ -261,10 +375,11 @@ def run(args: argparse.Namespace) -> int:
             if existing.exists():
                 produced.append(existing)
     if not args.skip_layers:
+        layer_experiments = "figure6" if args.include_current_figure3 else args.layer_experiments
         _run(base + global_flags + [
             "layers",
             "--output", str(layers),
-            "--experiments", args.layer_experiments,
+            "--experiments", layer_experiments,
             *calibration_arg,
             "--visual-targets", *[str(value) for value in args.layer_visual_targets],
             *model_flags,
@@ -283,22 +398,37 @@ def run(args: argparse.Namespace) -> int:
         contract,
         enabled=figure2_enabled,
     )
+    if args.include_current_figure3:
+        current_figure3_dir = _run_current_figure3(
+            root=root,
+            output_dir=output_dir,
+            report_dir=report,
+            args=args,
+            python=python,
+        )
     # Keep a separate audit of the complete stage evidence.  The final audit
     # below runs on the public full-evidence `results.jsonl`; the report-only
     # Figure 2 source is audited separately above.
-    _run(base + global_flags + [
+    full_audit_command = base + global_flags + [
         "audit", "--input", str(full_combined), "--output", str(full_audit),
         "--calibration", str(calibration),
         "--calibration-targets", *[str(value) for value in contract.visual_token_milestones],
-    ], root, allow_failure=True)
-    audit_rc = _run(base + global_flags + [
+    ]
+    audit_command = base + global_flags + [
         "audit", "--input", str(combined), "--output", str(audit),
         "--calibration", str(calibration),
         "--calibration-targets", *[str(value) for value in contract.visual_token_milestones],
-    ], root, allow_failure=True)
+    ]
+    if current_figure3_dir is not None:
+        full_audit_command.extend(["--current-figure3-dir", str(current_figure3_dir)])
+        audit_command.extend(["--current-figure3-dir", str(current_figure3_dir)])
+    _run(full_audit_command, root, allow_failure=True)
+    audit_rc = _run(audit_command, root, allow_failure=True)
     report_command = base + global_flags + [
         "report", "--input", str(combined), "--output-dir", str(report),
     ]
+    if current_figure3_dir is not None:
+        report_command.extend(["--current-figure3-dir", str(current_figure3_dir)])
     if figure2_enabled:
         report_command.extend([
             "--figure2-input", str(output_dir / "figure2_homogeneous_results.jsonl"),
@@ -378,6 +508,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-attention", action="store_true")
     parser.add_argument("--skip-draft-attention", action="store_true")
     parser.add_argument("--skip-layers", action="store_true")
+    parser.add_argument(
+        "--include-current-figure3",
+        action="store_true",
+        help="Run the Qwen2.5-VL-3B MVBench Figure 3(a)/(b) panels and use them in the canonical report.",
+    )
+    parser.add_argument("--figure3-model", default=DEFAULT_FIGURE3_MODEL)
+    parser.add_argument("--figure3-manifest", default="dataset/MVBench/classified/selected.jsonl")
+    parser.add_argument("--figure3-output-dir", default=None)
+    parser.add_argument("--figure3-tasks", nargs="+", default=list(DEFAULT_FIGURE3_TASKS))
+    parser.add_argument("--figure3-limit-per-task", type=int, default=None)
+    parser.add_argument("--figure3-fps", type=float, default=8.0)
+    parser.add_argument("--figure3-max-frames", type=int, default=8)
+    parser.add_argument("--figure3-min-pixels", type=int, default=256 * 28 * 28)
+    parser.add_argument("--figure3-max-pixels", type=int, default=360 * 420)
+    parser.add_argument("--figure3-max-new-tokens", type=int, default=16)
+    parser.add_argument("--figure3-device-map", default="auto")
+    parser.add_argument("--figure3-dtype", choices=("float16", "bfloat16", "float32"), default="bfloat16")
+    parser.add_argument("--figure3-quantized", action="store_true")
     return parser
 
 

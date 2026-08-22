@@ -186,6 +186,12 @@ def parse_args():
         default=6,
         help="Gzip compression level (1-9).",
     )
+    others_group.add_argument(
+        "--phase",
+        choices=("phase1", "phase2", "unspecified"),
+        default="unspecified",
+        help="Phase provenance recorded in hidden-state metadata.",
+    )
 
     sglang_group = parser.add_argument_group("sglang")
     sglang_group.add_argument(
@@ -963,6 +969,37 @@ def main():
                 start_idx=start_idx,
                 samples_per_dp=samples_per_dp,
             )
+        if args.strategy == "dflash" and dist.get_rank() == 0:
+            from specforge.hidden_state import (
+                build_hidden_state_metadata,
+                write_hidden_state_metadata,
+            )
+
+            target_text_config = getattr(
+                target_model_config, "text_config", target_model_config
+            )
+            write_hidden_state_metadata(
+                args.output_path,
+                build_hidden_state_metadata(
+                    target_layer_ids=capture_plan.capture_layers,
+                    hidden_size=int(target_text_config.hidden_size),
+                    phase=args.phase,
+                    target_model=args.target_model_path,
+                    target_model_revision=getattr(
+                        target_model_config, "_commit_hash", None
+                    ),
+                    dtype=str(
+                        getattr(
+                            target_text_config,
+                            "torch_dtype",
+                            getattr(target_text_config, "dtype", None),
+                        )
+                    ),
+                    layer_indexing="qwen25vl_hf_decoder_zero_based",
+                    expected_count=5,
+                ),
+            )
+            print(f"Hidden-state metadata written to {args.output_path}")
 
     finally:
         # The finally block ensures destroy_distributed is always called

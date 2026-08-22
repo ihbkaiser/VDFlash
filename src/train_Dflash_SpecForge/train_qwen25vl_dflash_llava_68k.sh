@@ -71,6 +71,7 @@ RESUME=0
 COMPRESS=${SPECFORGE_COMPRESS:-0}
 SKIP_PREFLIGHT=${SKIP_PREFLIGHT:-0}
 SGLANG_MEM_FRACTION_STATIC=${SPECFORGE_SGLANG_MEM_FRACTION_STATIC:-0.4}
+PHASE2_TARGET_LAYER_IDS=${SPECFORGE_PHASE2_TARGET_LAYER_IDS:-}
 
 usage() {
   cat <<'EOF'
@@ -99,6 +100,7 @@ Optional environment:
   SPECFORGE_ATTENTION_BACKEND=flex_attention|sdpa|eager
   SPECFORGE_USE_LIGER=auto|0|1, SPECFORGE_SAVE_INTERVAL,
   SPECFORGE_LOG_INTERVAL
+  SPECFORGE_PHASE2_TARGET_LAYER_IDS=comma-separated five layer IDs
 
 Options:
   --env-file FILE
@@ -175,12 +177,12 @@ esac
 
 case "$MODEL_SIZE" in
   3b)
-    DRAFT_CONFIG="$ROOT_DIR/configs/qwen2.5-vl-3b-dflash.json"
+    BASE_DRAFT_CONFIG="$ROOT_DIR/configs/qwen2.5-vl-3b-dflash.json"
     CONFIG="$ROOT_DIR/examples/configs/qwen2.5-vl-3b-dflash-llava68k-offline.yaml"
     RUN_ID=qwen25vl-3b-dflash-llava68k
     ;;
   7b)
-    DRAFT_CONFIG="$ROOT_DIR/configs/qwen2.5-vl-7b-dflash.json"
+    BASE_DRAFT_CONFIG="$ROOT_DIR/configs/qwen2.5-vl-7b-dflash.json"
     CONFIG="$ROOT_DIR/examples/configs/qwen2.5-vl-7b-dflash-offline-b200.yaml"
     RUN_ID=qwen25vl-7b-dflash-llava68k
     ;;
@@ -193,10 +195,41 @@ if [[ -z "$ARTIFACT_ROOT" ]]; then
   ARTIFACT_ROOT="$ROOT_DIR/artifacts/qwen25vl_${MODEL_SIZE}_dflash_llava68k"
 fi
 
+DRAFT_CONFIG="$ARTIFACT_ROOT/draft_config_phase2.json"
+resolve_phase_config() {
+  local source=$1 destination=$2 phase=$3 layer_ids=${4:-}
+  local args=(
+    --input "$source"
+    --output "$destination"
+    --phase "$phase"
+  )
+  if [[ -n "$layer_ids" ]]; then
+    args+=(--target-layer-ids "$layer_ids")
+  fi
+  "$PYTHON_BIN" "$ROOT_DIR/scripts/resolve_dflash_config.py" "${args[@]}"
+}
+resolve_phase_config \
+  "$BASE_DRAFT_CONFIG" "$DRAFT_CONFIG" phase2 "$PHASE2_TARGET_LAYER_IDS"
+
 MANIFEST="$ARTIFACT_ROOT/manifest.jsonl"
 FEATURE_ROOT="$ARTIFACT_ROOT/hidden_states"
 IMAGE_STAGE_ROOT="$ARTIFACT_ROOT/images"
 RUN_OUTPUT="$OUTPUT_ROOT/$RUN_ID"
+
+feature_count() {
+  if [[ ! -d "$FEATURE_ROOT" ]]; then
+    echo 0
+    return
+  fi
+  find "$FEATURE_ROOT" -type f \( -name '*.ckpt' -o -name '*.ckpt.gz' \) -print 2>/dev/null | wc -l
+}
+
+validate_feature_cache() {
+  "$PYTHON_BIN" "$ROOT_DIR/scripts/validate_hidden_state_cache.py" \
+    --feature-root "$FEATURE_ROOT" \
+    --draft-model-config "$DRAFT_CONFIG" \
+    --phase phase2
+}
 
 require_value() {
   local name=$1 value=${!1:-}
@@ -241,6 +274,14 @@ if [[ "$PHASE" == capture || "$PHASE" == all ]]; then
     IMAGE_ROOT="$IMAGE_STAGE_ROOT"
   fi
   require_value IMAGE_ROOT
+  existing_features=$(feature_count)
+  if ((existing_features > 0)); then
+    validate_feature_cache
+  fi
+  if ((existing_features > 0 && !RESUME)); then
+    echo "Offline features already exist at $FEATURE_ROOT; pass --resume or use a new ARTIFACT_ROOT" >&2
+    exit 1
+  fi
   mkdir -p "$FEATURE_ROOT"
   if [[ "$SKIP_PREFLIGHT" == 1 ]]; then
     echo "Skipping LLaVA preflight (SKIP_PREFLIGHT=1)"
@@ -261,6 +302,7 @@ if [[ "$PHASE" == capture || "$PHASE" == all ]]; then
     "$CAPTURE_PREPROCESS_WORKERS" "$CAPTURE_IO_THREADS"
   "$PYTHON_BIN" -m torch.distributed.run --standalone --nproc_per_node="$GPU_COUNT" \
     "$ROOT_DIR/scripts/prepare_llava_caption_hidden_states.py" \
+    --phase phase2 \
     --target-model-path "$TARGET_MODEL_PATH" \
     --draft-model-config "$DRAFT_CONFIG" \
     --manifest "$MANIFEST" --image-root "$IMAGE_ROOT" \
@@ -278,12 +320,14 @@ fi
 if [[ "$PHASE" == train || "$PHASE" == all ]]; then
   require_value TARGET_MODEL_PATH
   [[ -d "$FEATURE_ROOT" ]] || { echo "feature directory missing: $FEATURE_ROOT" >&2; exit 1; }
+  validate_feature_cache
   train_args=(
     "model.target_model_path=$TARGET_MODEL_PATH"
     "model.draft_model_config=$DRAFT_CONFIG"
     "model.input_modality=qwen2_5_vl"
     "model.use_liger_kernel=$USE_LIGER"
     "data.hidden_states_path=$FEATURE_ROOT"
+    "data.hidden_state_phase=phase2"
     "data.max_length=$MAX_LENGTH"
     "data.dataloader_num_workers=$DATALOADER_WORKERS"
     "training.num_epochs=$NUM_EPOCHS"
@@ -298,6 +342,7 @@ if [[ "$PHASE" == train || "$PHASE" == all ]]; then
     "deployment.trainer.nproc_per_node=$GPU_COUNT"
     "output_dir=$RUN_OUTPUT"
     "run_id=$RUN_ID"
+    "model.draft_warm_start_mode=auto"
   )
   latest="$RUN_OUTPUT/$RUN_ID-latest"
   if (( RESUME == 1 )) && [[ -e "$latest" ]]; then

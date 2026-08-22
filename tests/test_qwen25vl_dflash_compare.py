@@ -16,14 +16,136 @@ from src.infer.qwen25vl_dflash_compare import (
     _print_report,
     _target_greedy,
     build_parser,
+    build_mvbench_prompt,
+    build_visual_hidden_ablation,
     capture_dflash_attention,
     run_comparison,
     load_manifest_sample,
     resolve_video_path,
     score_caption,
+    score_mvbench_prediction,
     summarize_dflash_attention,
     validate_report_success,
 )
+
+
+def test_visual_hidden_ablation_masks_only_selected_layers_and_visual_positions():
+    target = SimpleNamespace(
+        config=SimpleNamespace(
+            video_token_id=99,
+            image_token_id=None,
+            video_token_index=None,
+            image_token_index=None,
+        )
+    )
+    input_ids = torch.tensor([[10, 99, 20, 99, 30]])
+    hidden = torch.arange(30, dtype=torch.float32).reshape(1, 5, 6)
+
+    transform, metadata = build_visual_hidden_ablation(
+        input_ids,
+        target,
+        selected_layer_ids=[1, 9, 17],
+        removed_layer_ids=[1, 17],
+    )
+    transformed = transform(hidden)
+
+    assert metadata["visual_position_count"] == 2
+    assert metadata["removed_layer_ids"] == [1, 17]
+    assert torch.equal(transformed[:, [0, 2, 4]], hidden[:, [0, 2, 4]])
+    assert torch.equal(transformed[:, [1, 3], 2:4], hidden[:, [1, 3], 2:4])
+    assert torch.equal(transformed[:, [1, 3], 0:2], torch.zeros(1, 2, 2))
+    assert torch.equal(transformed[:, [1, 3], 4:6], torch.zeros(1, 2, 2))
+
+
+def test_visual_hidden_ablation_cut_removes_visual_positions_from_context():
+    target = SimpleNamespace(
+        config=SimpleNamespace(
+            video_token_id=99,
+            image_token_id=None,
+            video_token_index=None,
+            image_token_index=None,
+        )
+    )
+    input_ids = torch.tensor([[10, 99, 20, 99, 30]])
+    hidden = torch.arange(30, dtype=torch.float32).reshape(1, 5, 6)
+
+    transform, metadata = build_visual_hidden_ablation(
+        input_ids,
+        target,
+        selected_layer_ids=[1, 9, 17],
+        removed_layer_ids=[1, 9, 17],
+        mode="cut",
+    )
+    transformed = transform(hidden)
+
+    assert transformed.shape == (1, 3, 6)
+    assert torch.equal(transformed, hidden[:, [0, 2, 4]])
+    assert metadata["mode"] == "cut"
+    assert metadata["visual_position_count"] == 2
+    assert metadata["result_sequence_length"] == 3
+
+
+def test_visual_hidden_ablation_cut_requires_all_selected_layers():
+    target = SimpleNamespace(config=SimpleNamespace(video_token_id=99))
+
+    with pytest.raises(ValueError, match="all selected layer IDs"):
+        build_visual_hidden_ablation(
+            torch.tensor([[10, 99, 20]]),
+            target,
+            selected_layer_ids=[1, 9, 17],
+            removed_layer_ids=[9],
+            mode="cut",
+        )
+
+
+def test_parser_accepts_visual_ablation_layer_ids():
+    args = build_parser().parse_args(
+        ["--visual-ablation-layers", "1", "17"]
+    )
+
+    assert args.visual_ablation_layers == [1, 17]
+
+
+def test_parser_accepts_visual_ablation_mode():
+    args = build_parser().parse_args(
+        ["--visual-ablation-layers", "1", "9", "17", "--visual-ablation-mode", "cut"]
+    )
+
+    assert args.visual_ablation_mode == "cut"
+
+
+def test_build_mvbench_prompt_includes_ordered_option_letters():
+    record = {
+        "question": "What color is the object?",
+        "candidates": ["red", "blue", "green"],
+    }
+
+    assert build_mvbench_prompt(record) == (
+        "Question:What color is the object?\n"
+        "Option:\n"
+        "(A) red\n"
+        "(B) blue\n"
+        "(C) green\n"
+        "Only give the best option.\n"
+    )
+
+
+def test_score_mvbench_prediction_requires_the_correct_option_letter():
+    record = {
+        "candidates": ["red", "blue", "green"],
+        "answer": "blue",
+    }
+
+    assert score_mvbench_prediction(record, "(B)") == {
+        "correct": True,
+        "target_option": "B",
+        "predicted_option": "B",
+    }
+    assert score_mvbench_prediction(record, "green") == {
+        "correct": False,
+        "target_option": "B",
+        "predicted_option": None,
+    }
 
 
 def _text_metrics():
@@ -516,6 +638,70 @@ def test_instrumented_decoder_applies_prefill_hidden_transform_only_to_dflash_co
     assert draft.seen[0][0, 1, 1].item() == 0
 
 
+def test_instrumented_decoder_accepts_shorter_prefill_hidden_context():
+    target = _Target()
+
+    class RecordingDraft(_Draft):
+        def __init__(self):
+            self.seen_lengths = []
+
+        def __call__(self, *args, **kwargs):
+            self.seen_lengths.append(int(kwargs["target_hidden"].shape[1]))
+            return super().__call__(*args, **kwargs)
+
+    draft = RecordingDraft()
+    decoder = InstrumentedDFlashDecoder(target, draft, device=torch.device("cpu"))
+
+    result = decoder.decode(
+        input_ids=torch.tensor([[1, 2, 3]]),
+        position_ids=torch.arange(3).view(1, -1),
+        target_kwargs=None,
+        max_new_tokens=1,
+        stop_token_ids=[],
+        prefill_target_hidden_transform=lambda hidden: hidden[:, 1:, :],
+    )
+
+    assert result.num_output_tokens == 1
+    assert draft.seen_lengths == [2]
+
+
+def test_instrumented_decoder_rebuilds_positions_for_cut_context():
+    target = _Target()
+
+    class RecordingDraft(_Draft):
+        def __init__(self):
+            self.seen = []
+
+        def __call__(self, *args, **kwargs):
+            self.seen.append(
+                (
+                    int(kwargs["target_hidden"].shape[1]),
+                    int(kwargs["position_ids"].shape[-1]),
+                    kwargs["past_key_values"],
+                )
+            )
+            return super().__call__(*args, **kwargs)
+
+    draft = RecordingDraft()
+    decoder = InstrumentedDFlashDecoder(target, draft, device=torch.device("cpu"))
+
+    result = decoder.decode(
+        input_ids=torch.tensor([[1, 2, 3]]),
+        position_ids=torch.arange(3).view(1, -1),
+        target_kwargs=None,
+        max_new_tokens=5,
+        stop_token_ids=[],
+        prefill_target_hidden_transform=lambda hidden: hidden[:, [0, 2], :],
+        prefill_target_context_keep_mask=torch.tensor([True, False, True]),
+    )
+
+    assert result.num_output_tokens == 5
+    assert draft.seen
+    assert draft.seen[0][0] == 2
+    assert draft.seen[0][1] == 2 + draft.block_size
+    assert draft.seen[0][2] is None
+
+
 def test_instrumented_decoder_trims_at_stop_token_after_full_budget():
     target = _Target()
     draft = _Draft()
@@ -662,6 +848,7 @@ def test_run_comparison_builds_two_checkpoint_report(monkeypatch, tmp_path, caps
         encoding="utf-8",
     )
     target = _Target()
+    target.config = SimpleNamespace(video_token_id=2)
     prompt = PreparedVideoPrompt(
         record={"video_name": "sample"},
         video_path=tmp_path / "sample.mp4",
@@ -687,6 +874,7 @@ def test_run_comparison_builds_two_checkpoint_report(monkeypatch, tmp_path, caps
             "--device", "cpu",
             "--dtype", "no",
             "--max-new-tokens", "5",
+            "--visual-ablation-layers", "0",
         ]
     )
     report = run_comparison(args)
@@ -695,6 +883,12 @@ def test_run_comparison_builds_two_checkpoint_report(monkeypatch, tmp_path, caps
     assert len(report["checkpoints"]) == 2
     assert all(item["outputs_match"] for item in report["checkpoints"])
     assert all(item["prediction"] == "4 5 6 7 8" for item in report["checkpoints"])
+    assert report["visual_ablation"]["enabled"] is True
+    assert report["visual_ablation"]["requested_layer_ids"] == [0]
+    assert all(
+        item["visual_ablation"]["visual_position_count"] == 1
+        for item in report["checkpoints"]
+    )
 
     _print_report(report)
     printed = capsys.readouterr().out

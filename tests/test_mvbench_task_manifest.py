@@ -62,3 +62,33 @@ def test_write_task_manifests_creates_per_task_and_combined_outputs(tmp_path: Pa
     assert action_rows[0]["video_root"] == "star/Charades_segment"
     assert direction_rows[0]["video_root"] == "clevrer/video_validation"
     assert [row["task"] for row in combined_rows] == ["action_prediction", "moving_direction"]
+
+
+def test_write_task_manifests_limits_each_task_equally(tmp_path: Path):
+    annotation_dir = tmp_path / "json"
+    output_dir = tmp_path / "classified"
+    annotation_dir.mkdir()
+    rows = [
+        {"video": f"clip-{index}.mp4", "question": "q", "candidates": ["x"], "answer": "x"}
+        for index in range(3)
+    ]
+    (annotation_dir / "action_prediction.json").write_text(json.dumps(rows))
+    (annotation_dir / "moving_direction.json").write_text(json.dumps(rows))
+
+    result = write_task_manifests(
+        annotation_dir=annotation_dir,
+        output_dir=output_dir,
+        dataset_root=tmp_path,
+        tasks=("action_prediction", "moving_direction"),
+        limit_per_task=2,
+    )
+
+    assert result == {"action_prediction": 2, "moving_direction": 2}
+    combined_rows = [json.loads(line) for line in (output_dir / "selected.jsonl").read_text().splitlines()]
+    assert len(combined_rows) == 4
+    assert [row["task"] for row in combined_rows] == [
+        "action_prediction",
+        "action_prediction",
+        "moving_direction",
+        "moving_direction",
+    ]

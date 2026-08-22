@@ -326,7 +326,11 @@ class Trainer:
                             "not expose a recoverable horizon; the restored "
                             "optimizer schedule cannot be proven to match this run"
                         )
-                if key in custom_checkpoint_extra and key not in state:
+                if (
+                    key in custom_checkpoint_extra
+                    and key not in state
+                    and key != "dflash_hidden_state_metadata"
+                ):
                     raise ValueError(
                         f"checkpoint {resume_from} does not record required "
                         f"algorithm resume semantic {key}; start a fresh run "

@@ -9,7 +9,6 @@ from concurrent.futures import Future, ThreadPoolExecutor
 import gzip
 import json
 import os
-import tempfile
 import threading
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -77,6 +76,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--compress", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--phase",
+        choices=("phase1", "phase2"),
+        default="phase2",
+        help="Phase provenance recorded in hidden-state metadata.",
+    )
     parser.add_argument("--dist-timeout", type=int, default=2000)
     parser.add_argument(
         "--sglang-mem-fraction-static",
@@ -384,6 +389,33 @@ def main() -> int:
                 f"capture produced {int(counts[1])} skipped records; "
                 "the strict 68k pipeline refuses a partial feature set"
             )
+        if rank == 0:
+            from specforge.hidden_state import (
+                build_hidden_state_metadata,
+                write_hidden_state_metadata,
+            )
+
+            text_config = getattr(target_config, "text_config", target_config)
+            write_hidden_state_metadata(
+                output_root,
+                build_hidden_state_metadata(
+                    target_layer_ids=layer_ids,
+                    hidden_size=int(text_config.hidden_size),
+                    phase=args.phase,
+                    target_model=args.target_model_path,
+                    target_model_revision=getattr(target_config, "_commit_hash", None),
+                    dtype=str(
+                        getattr(
+                            text_config,
+                            "torch_dtype",
+                            getattr(text_config, "dtype", None),
+                        )
+                    ),
+                    layer_indexing="qwen25vl_hf_decoder_zero_based",
+                    expected_count=5,
+                ),
+            )
+            print(f"Hidden-state metadata written to {output_root}")
     finally:
         destroy_distributed()
     return 0

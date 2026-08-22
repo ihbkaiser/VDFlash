@@ -43,6 +43,11 @@ class ModelConfig(StrictConfigModel):
     #: Load draft weights only. Unlike training.resume_from, this never restores
     #: optimizer/scheduler state, counters, data position, or RNG state.
     draft_checkpoint_path: Optional[str] = None
+    #: How a DFlash weights-only warm start handles a different hidden-state
+    #: layer list. ``auto`` resets only the context projection when needed.
+    draft_warm_start_mode: Literal[
+        "auto", "strict", "reset_projection", "none"
+    ] = "auto"
     #: Optional architecture override. Auto-generated defaults preserve the
     #: former trainers: EAGLE3=1, P-EAGLE=4, DFlash=1.
     draft_num_hidden_layers: Optional[int] = Field(default=None, gt=0)
@@ -140,6 +145,8 @@ class DataConfig(StrictConfigModel):
     eval_data_path: str = ""
     #: offline evaluation — directory of precomputed hidden-state .ckpt files.
     eval_hidden_states_path: str = ""
+    #: Phase provenance stored in generated hidden-state metadata/checkpoints.
+    hidden_state_phase: Optional[Literal["phase1", "phase2"]] = None
     max_length: int = Field(default=2048, gt=0)
     chat_template: str = "llama3"
     is_preformatted: bool = False

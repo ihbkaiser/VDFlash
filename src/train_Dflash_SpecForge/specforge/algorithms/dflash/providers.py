@@ -8,15 +8,6 @@ from specforge.algorithms.common.defaults import (
     empty_options,
     no_missing_checkpoint_keys,
 )
-from specforge.algorithms.common.dflash_family_data import (
-    NORMALIZER_ID,
-    QWEN25VL_NORMALIZER_ID,
-    build_collator,
-    build_offline_normalizer,
-    build_offline_reader,
-    build_qwen25vl_offline_normalizer,
-    build_qwen25vl_collator,
-)
 from specforge.algorithms.common.providers import (
     AlgorithmProviders,
     DraftConfigProvider,
@@ -41,6 +32,44 @@ from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 ALGORITHM_NAME = "dflash"
 DRAFT_ARCHITECTURE = "DFlashDraftModel"
+NORMALIZER_ID = "dflash_family_offline_v1"
+QWEN25VL_NORMALIZER_ID = "dflash_qwen25vl_offline_v1"
+
+
+def build_collator(*args, **kwargs):
+    from specforge.algorithms.common.dflash_family_data import build_collator as impl
+
+    return impl(*args, **kwargs)
+
+
+def build_offline_normalizer(*args, **kwargs):
+    from specforge.algorithms.common.dflash_family_data import (
+        build_offline_normalizer as impl,
+    )
+
+    return impl(*args, **kwargs)
+
+
+def build_offline_reader(*args, **kwargs):
+    from specforge.algorithms.common.dflash_family_data import build_offline_reader as impl
+
+    return impl(*args, **kwargs)
+
+
+def build_qwen25vl_offline_normalizer(*args, **kwargs):
+    from specforge.algorithms.common.dflash_family_data import (
+        build_qwen25vl_offline_normalizer as impl,
+    )
+
+    return impl(*args, **kwargs)
+
+
+def build_qwen25vl_collator(*args, **kwargs):
+    from specforge.algorithms.common.dflash_family_data import (
+        build_qwen25vl_collator as impl,
+    )
+
+    return impl(*args, **kwargs)
 
 
 def build_step(wrapped_model, *, target_head=None, **_options):
@@ -50,14 +79,57 @@ def build_step(wrapped_model, *, target_head=None, **_options):
     return DFlashTrainStrategy(wrapped_model)
 
 
-def resume_contract(_config, draft_model, training_model):
+def resume_contract(config, draft_model, training_model):
     """Persist resolved DFlash architecture, sampling, and loss semantics."""
 
-    return {
-        "dflash_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
-        "dflash_target_layer_ids": tuple(
-            int(layer_id) for layer_id in draft_model.target_layer_ids
+    target_layer_ids = tuple(
+        int(layer_id) for layer_id in draft_model.target_layer_ids
+    )
+    raw_hidden_size = getattr(draft_model.config, "hidden_size", None)
+    hidden_size = (
+        int(raw_hidden_size)
+        if isinstance(raw_hidden_size, int) and raw_hidden_size > 0
+        else None
+    )
+    input_modality = getattr(getattr(config, "model", None), "input_modality", "")
+    dflash_config = getattr(draft_model.config, "dflash_config", None) or {}
+    is_qwen25vl = input_modality == "qwen2_5_vl" or (
+        isinstance(dflash_config, dict) and "mrope_section" in dflash_config
+    )
+    layer_indexing = (
+        "qwen25vl_hf_decoder_zero_based"
+        if is_qwen25vl
+        else "target_decoder_zero_based"
+    )
+    phase_value = getattr(
+        getattr(config, "data", None), "hidden_state_phase", None
+    )
+    phase = phase_value.strip() if isinstance(phase_value, str) else ""
+    dtype = getattr(draft_model.config, "dtype", None)
+    hidden_state_metadata = {
+        "target_layer_ids": target_layer_ids,
+        "layer_indexing": layer_indexing,
+        "num_layers": len(target_layer_ids),
+        "hidden_size": hidden_size,
+        "feature_dim": (
+            len(target_layer_ids) * hidden_size if hidden_size is not None else None
         ),
+        "phase": phase or "unspecified",
+        "capture_method": "dflash",
+        "target_model": getattr(
+            getattr(config, "model", None), "target_model_path", None
+        ),
+        "target_model_revision": None,
+        "dtype": str(dtype) if dtype is not None else None,
+        "schema_version": 1,
+    }
+
+    return {
+        "dflash_draft_num_hidden_layers": int(
+            getattr(draft_model.config, "num_hidden_layers", len(target_layer_ids))
+        ),
+        "dflash_target_layer_ids": target_layer_ids,
+        "dflash_hidden_state_metadata": hidden_state_metadata,
         "dflash_block_size": int(training_model.block_size),
         "dflash_mask_token_id": int(training_model.mask_token_id),
         "dflash_attention_backend": str(training_model.attention_backend),

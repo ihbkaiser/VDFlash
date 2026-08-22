@@ -18,6 +18,7 @@ from .calibrate import (
     write_calibration,
 )
 from .dataset import load_vdc_manifest, planned_calibration, write_jsonl
+from .figure3_pipeline import load_figure3_bundle
 from .paper_contract import load_contract, validate_contract
 from .preflight import run_preflight, write_preflight
 from .report import build_report, read_jsonl, write_report
@@ -178,8 +179,11 @@ def _cmd_cohort(args: argparse.Namespace) -> int:
 def _cmd_audit(args: argparse.Namespace) -> int:
     contract = _contract(args)
     rows = read_jsonl(args.input)
-    report = audit_rows(rows, contract)
-    coverage = audit_coverage(rows, contract)
+    external_figure3 = load_figure3_bundle(args.current_figure3_dir) if args.current_figure3_dir else None
+    excluded_figures = {"Figure 3", "Figure 3(b)"} if external_figure3 else set()
+    audit_input = [row for row in rows if row.get("paper_figure") not in excluded_figures]
+    report = audit_rows(audit_input, contract)
+    coverage = audit_coverage(audit_input, contract, excluded_figures=excluded_figures)
     if any("target_output_ids" in row or "speculative_output_ids" in row for row in rows):
         lossless = audit_losslessness(rows)
         report.issues.extend(lossless.issues)
@@ -188,6 +192,12 @@ def _cmd_audit(args: argparse.Namespace) -> int:
     payload["coverage"] = coverage.to_dict()
     report.valid = report.valid and coverage.valid
     payload["valid"] = report.valid
+    if external_figure3 is not None:
+        payload["current_figure3"] = {
+            "metadata": external_figure3["metadata"],
+            "audit": external_figure3["audit"],
+        }
+        payload["valid"] = payload["valid"] and bool(external_figure3["audit"].get("valid", False))
     if args.calibration:
         try:
             calibration_rows = read_calibration(args.calibration)
@@ -203,7 +213,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     Path(args.output).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(payload, ensure_ascii=False, indent=2))
-    return 0 if report.valid else 2
+    return 0 if payload["valid"] else 2
 
 
 def _cmd_report(args: argparse.Namespace) -> int:
@@ -215,12 +225,14 @@ def _cmd_report(args: argparse.Namespace) -> int:
     figure2_audit = None
     if args.figure2_audit:
         figure2_audit = json.loads(Path(args.figure2_audit).read_text(encoding="utf-8"))
+    current_figure3 = load_figure3_bundle(args.current_figure3_dir) if args.current_figure3_dir else None
     report = build_report(
         read_jsonl(args.input),
         contract,
         figure2_rows=figure2_rows,
         figure2_selection=figure2_selection,
         figure2_audit=figure2_audit,
+        current_figure3=current_figure3,
     )
     write_report(args.output_dir, report)
     print(f"Wrote report to {args.output_dir}")
@@ -292,6 +304,7 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--calibration")
     audit.add_argument("--calibration-targets", type=int, nargs="+", default=None)
     audit.add_argument("--minimum-samples", type=int, default=10)
+    audit.add_argument("--current-figure3-dir", help="Composed Qwen2.5-VL-3B Figure 3 bundle directory.")
     audit.add_argument("--output", default="results/sparrow_validation/audit.json")
     audit.set_defaults(function=_cmd_audit)
 
@@ -300,14 +313,34 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--figure2-input", help="Homogeneous Figure 2 summary JSONL used only for Figure 2 plots/statistics.")
     report.add_argument("--figure2-selection", help="JSON metadata emitted by the homogeneous Figure 2 selector.")
     report.add_argument("--figure2-audit", help="Audit JSON emitted for the homogeneous Figure 2 selector.")
+    report.add_argument("--current-figure3-dir", help="Composed Qwen2.5-VL-3B Figure 3 bundle directory.")
     report.add_argument("--output-dir", default="results/sparrow_validation/report")
     report.set_defaults(function=_cmd_report)
+
+    figure3 = sub.add_parser("figure3", help="Run current Qwen2.5-VL-3B Figure 3(a)/(b) and compose a bundle.")
+    figure3.add_argument("--repo-root", default=".")
+    figure3.add_argument("--model", default="Qwen/Qwen2.5-VL-3B-Instruct")
+    figure3.add_argument("--manifest", default="dataset/MVBench/classified/selected.jsonl")
+    figure3.add_argument("--output-dir", default="results/figure3_qwen25vl3b")
+    figure3.add_argument("--tasks", nargs="+", default=[
+        "action_prediction", "action_sequence", "moving_attribute", "moving_direction", "object_interaction",
+    ])
+    figure3.add_argument("--limit-per-task", type=int, default=None)
+    figure3.add_argument("--fps", type=float, default=8.0)
+    figure3.add_argument("--max-frames", type=int, default=8)
+    figure3.add_argument("--min-pixels", type=int, default=256 * 28 * 28)
+    figure3.add_argument("--max-pixels", type=int, default=360 * 420)
+    figure3.add_argument("--max-new-tokens", type=int, default=16)
+    figure3.add_argument("--device-map", default="auto")
+    figure3.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="bfloat16")
+    figure3.add_argument("--quantized", action="store_true")
+    figure3.add_argument("--resume", action="store_true")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     values = list(sys.argv[1:] if argv is None else argv)
-    delegated_commands = {"msd", "attention", "layers", "draft_attention", "all"}
+    delegated_commands = {"msd", "attention", "layers", "draft_attention", "all", "figure3"}
     command_index = None
     if values and values[0] in delegated_commands:
         command_index = 0
@@ -326,6 +359,8 @@ def main(argv: list[str] | None = None) -> int:
             from .run_draft_attention import build_parser as delegated_parser, run as delegated_run
         elif command == "layers":
             from .run_layer_analysis import build_parser as delegated_parser, run as delegated_run
+        elif command == "figure3":
+            from .run_figure3 import build_parser as delegated_parser, run as delegated_run
         else:
             from .run_paper_experiments import build_parser as delegated_parser, run as delegated_run
         return delegated_run(delegated_parser().parse_args(values))

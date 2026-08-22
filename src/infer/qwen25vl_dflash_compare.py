@@ -9,6 +9,8 @@ import hashlib
 import json
 import math
 import random
+import re
+import string
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -39,6 +41,137 @@ def _extract_context_feature(hidden_states: Any, layer_ids: list[int]) -> torch.
             "target hidden_states do not contain the configured DFlash layers"
         ) from exc
     return torch.cat(selected, dim=-1)
+
+
+def _configured_token_ids(target: Any, names: tuple[str, ...]) -> set[int]:
+    config = getattr(target, "config", None)
+    token_ids: set[int] = set()
+    for name in names:
+        value = getattr(config, name, None)
+        if isinstance(value, (list, tuple, set)):
+            token_ids.update(int(item) for item in value)
+        elif value is not None:
+            token_ids.add(int(value))
+    return token_ids
+
+
+def _visual_token_mask(input_ids: torch.Tensor, target: Any) -> torch.Tensor:
+    visual_token_ids = _configured_token_ids(
+        target,
+        (
+            "video_token_id",
+            "video_token_index",
+            "image_token_id",
+            "image_token_index",
+        ),
+    )
+    visual_mask = torch.zeros(
+        input_ids.shape[1], dtype=torch.bool, device=input_ids.device
+    )
+    for token_id in visual_token_ids:
+        visual_mask |= input_ids[0].eq(token_id)
+    return visual_mask
+
+
+def build_visual_hidden_ablation(
+    input_ids: torch.Tensor,
+    target: Any,
+    *,
+    selected_layer_ids: list[int],
+    removed_layer_ids: list[int] | tuple[int, ...] | set[int],
+    mode: str = "zero",
+) -> tuple[Callable[[torch.Tensor], torch.Tensor], dict[str, Any]]:
+    """Build a transform that removes visual context from selected layer chunks.
+
+    The DFlash projector concatenates the selected target layers along the
+    hidden dimension. ``zero`` keeps sequence positions and tensor shape
+    unchanged, while ``cut`` removes visual-token positions from the complete
+    concatenated context. A sequence cut necessarily applies to every selected
+    layer chunk because all chunks share the same sequence axis.
+    """
+
+    if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+        raise ValueError("input_ids must have shape [1, sequence_length]")
+    if not selected_layer_ids:
+        raise ValueError("selected_layer_ids must not be empty")
+    if mode not in {"zero", "cut"}:
+        raise ValueError("mode must be either 'zero' or 'cut'")
+
+    selected_layer_ids = [int(layer_id) for layer_id in selected_layer_ids]
+    removed_set = {int(layer_id) for layer_id in removed_layer_ids}
+    unknown_layers = removed_set.difference(selected_layer_ids)
+    if unknown_layers:
+        raise ValueError(
+            "removed_layer_ids must be selected by the DFlash checkpoint: "
+            f"{sorted(unknown_layers)}"
+        )
+    removed_layer_ids = [
+        layer_id for layer_id in selected_layer_ids if layer_id in removed_set
+    ]
+    if mode == "cut" and removed_set != set(selected_layer_ids):
+        raise ValueError(
+            "cut mode removes sequence positions for all selected layer IDs; "
+            "removed_layer_ids must contain all selected layer IDs"
+        )
+
+    visual_token_ids = _configured_token_ids(
+        target,
+        (
+            "video_token_id",
+            "video_token_index",
+            "image_token_id",
+            "image_token_index",
+        ),
+    )
+    visual_mask = _visual_token_mask(input_ids, target)
+
+    def transform(hidden: torch.Tensor) -> torch.Tensor:
+        if hidden.ndim != 3:
+            raise ValueError(
+                "hidden must have shape [batch, sequence_length, features]"
+            )
+        if hidden.shape[1] != visual_mask.numel():
+            raise ValueError(
+                "hidden sequence length does not match the input visual mask"
+            )
+        if hidden.shape[-1] % len(selected_layer_ids) != 0:
+            raise ValueError(
+                "hidden feature size must be divisible by the selected layer count"
+            )
+
+        hidden_visual_mask = visual_mask.to(device=hidden.device)
+        if mode == "cut":
+            keep_mask = ~hidden_visual_mask
+            if not bool(keep_mask.any()):
+                raise ValueError("cut mode cannot remove every target context position")
+            return hidden[:, keep_mask, :]
+
+        output = hidden.clone()
+        if not removed_layer_ids or not bool(visual_mask.any()):
+            return output
+
+        hidden_size = hidden.shape[-1] // len(selected_layer_ids)
+        for layer_id in removed_layer_ids:
+            layer_index = selected_layer_ids.index(layer_id)
+            start = layer_index * hidden_size
+            end = start + hidden_size
+            output[:, hidden_visual_mask, start:end] = 0
+        return output
+
+    metadata = {
+        "enabled": bool(removed_layer_ids),
+        "mode": mode,
+        "selected_layer_ids": selected_layer_ids,
+        "removed_layer_ids": removed_layer_ids,
+        "visual_token_ids": sorted(visual_token_ids),
+        "visual_position_count": int(visual_mask.sum().item()),
+        "result_sequence_length": int(
+            input_ids.shape[1] - visual_mask.sum().item()
+            if mode == "cut"
+            else input_ids.shape[1]
+        ),
+    }
+    return transform, metadata
 
 
 def _cache_length(cache: Any) -> int:
@@ -246,6 +379,7 @@ class InstrumentedDFlashDecoder:
         max_new_tokens: int,
         stop_token_ids: list[int] | None,
         prefill_target_hidden_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        prefill_target_context_keep_mask: torch.Tensor | None = None,
     ) -> SpeculativeDecodeResult:
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
             raise ValueError("DFlash inference currently supports batch size one")
@@ -254,12 +388,29 @@ class InstrumentedDFlashDecoder:
 
         input_ids = input_ids.to(device=self.device, dtype=torch.long)
         prompt_length = int(input_ids.shape[1])
+        if prefill_target_context_keep_mask is not None:
+            if (
+                prefill_target_context_keep_mask.ndim != 1
+                or prefill_target_context_keep_mask.numel() != prompt_length
+            ):
+                raise ValueError(
+                    "prefill_target_context_keep_mask must have shape "
+                    f"[{prompt_length}]"
+                )
+            prefill_target_context_keep_mask = (
+                prefill_target_context_keep_mask.to(device=self.device, dtype=torch.bool)
+            )
+            if not bool(prefill_target_context_keep_mask.any()):
+                raise ValueError(
+                    "prefill_target_context_keep_mask must keep at least one position"
+                )
+        cut_context = prefill_target_context_keep_mask is not None
         max_length = prompt_length + int(max_new_tokens)
         block_size = int(self.draft.block_size)
         mask_token_id = int(self.draft.mask_token_id)
         all_positions = self._extend_positions(position_ids, max_length + block_size)
         target_cache = _new_cache()
-        draft_cache = _new_cache()
+        draft_cache = None if cut_context else _new_cache()
         stop_ids = _as_stop_set(stop_token_ids)
         target_kwargs = dict(target_kwargs or {})
         output_ids = torch.full(
@@ -299,11 +450,31 @@ class InstrumentedDFlashDecoder:
         )
         if prefill_target_hidden_transform is not None:
             transformed_hidden = prefill_target_hidden_transform(target_hidden)
-            if not torch.is_tensor(transformed_hidden) or transformed_hidden.shape != target_hidden.shape:
+            if (
+                not torch.is_tensor(transformed_hidden)
+                or transformed_hidden.ndim != 3
+                or transformed_hidden.shape[0] != target_hidden.shape[0]
+                or transformed_hidden.shape[-1] != target_hidden.shape[-1]
+                or transformed_hidden.shape[1] <= 0
+                or transformed_hidden.shape[1] > target_hidden.shape[1]
+            ):
                 raise ValueError(
-                    "prefill_target_hidden_transform must return a tensor with the same shape"
-                )
+                    "prefill_target_hidden_transform must return a non-empty tensor "
+                    "with the same batch/feature dimensions and no longer sequence "
+                    "dimension"
+            )
             target_hidden = transformed_hidden
+        if cut_context and target_hidden.shape[1] != int(
+            prefill_target_context_keep_mask.sum().item()
+        ):
+            raise ValueError(
+                "cut target hidden length must equal the number of kept context positions"
+            )
+        cut_prompt_positions = (
+            all_positions[..., :prompt_length][..., prefill_target_context_keep_mask]
+            if cut_context
+            else None
+        )
         pending_anchor = target_output.logits[:, -1:, :].argmax(dim=-1)
         output_ids[:, prompt_length : prompt_length + 1] = pending_anchor
         decode_started = _now(self.device)
@@ -330,18 +501,33 @@ class InstrumentedDFlashDecoder:
             block_position_ids = all_positions[..., start : start + block_size]
             draft_started = _now(self.device)
             noise_embedding = target_embed(block_output_ids)
+            if cut_context:
+                draft_position_ids = torch.cat(
+                    [
+                        cut_prompt_positions,
+                        all_positions[..., prompt_length : start + block_size],
+                    ],
+                    dim=-1,
+                )
+                draft_past_key_values = None
+                draft_use_cache = False
+            else:
+                draft_position_ids = all_positions[
+                    ...,
+                    _cache_length(draft_cache) : start + block_size,
+                ]
+                draft_past_key_values = draft_cache
+                draft_use_cache = True
             draft_hidden = self.draft(
                 target_hidden=target_hidden,
                 noise_embedding=noise_embedding,
-                position_ids=all_positions[
-                    ...,
-                    _cache_length(draft_cache) : start + block_size,
-                ],
-                past_key_values=draft_cache,
-                use_cache=True,
+                position_ids=draft_position_ids,
+                past_key_values=draft_past_key_values,
+                use_cache=draft_use_cache,
                 is_causal=False,
             )
-            _crop_cache(draft_cache, start)
+            if not cut_context:
+                _crop_cache(draft_cache, start)
             proposals = self.draft._sample_draft_tokens(
                 self.target,
                 draft_hidden,
@@ -379,10 +565,14 @@ class InstrumentedDFlashDecoder:
             next_anchor_token_id = int(posterior[0, accepted].item())
             start += emitted
             _crop_cache(target_cache, start)
-            target_hidden = _extract_context_feature(
+            new_target_hidden = _extract_context_feature(
                 target_output.hidden_states,
                 [int(value) for value in self.draft.target_layer_ids],
             )[:, :emitted, :]
+            if cut_context:
+                target_hidden = torch.cat([target_hidden, new_target_hidden], dim=1)
+            else:
+                target_hidden = new_target_hidden
             stop_hit = any(
                 int(token_id) in stop_ids
                 for token_id in output_ids[0, prompt_length : min(start + 1, max_length)].tolist()
@@ -526,6 +716,63 @@ def score_caption(prediction: str, reference: str) -> dict[str, float]:
     }
 
 
+def build_mvbench_prompt(record: dict[str, Any]) -> str:
+    """Build the canonical local MVBench multiple-choice prompt."""
+
+    question = str(record.get("question") or "").strip()
+    candidates = list(record.get("candidates") or [])
+    if not question:
+        raise ValueError("MVBench record must contain a question")
+    if not candidates:
+        raise ValueError("MVBench record must contain candidates")
+    if len(candidates) > len(string.ascii_uppercase):
+        raise ValueError("MVBench record has too many candidates")
+    options = "".join(
+        f"({string.ascii_uppercase[index]}) {candidate}\n"
+        for index, candidate in enumerate(candidates)
+    )
+    return f"Question:{question}\nOption:\n{options}Only give the best option.\n"
+
+
+def score_mvbench_prediction(
+    record: dict[str, Any], prediction: str
+) -> dict[str, Any]:
+    """Score an MVBench answer by its option letter."""
+
+    candidates = list(record.get("candidates") or [])
+    answer = record.get("answer")
+    target_option = next(
+        (
+            string.ascii_uppercase[index]
+            for index, candidate in enumerate(candidates)
+            if candidate == answer
+        ),
+        None,
+    )
+    text = str(prediction).strip()
+    match = re.match(r"^\s*([A-E])\.\s*.+$", text, re.IGNORECASE)
+    if match is None:
+        match = re.search(r"\b([A-E])\b", text, re.IGNORECASE)
+    predicted_option = match.group(1).upper() if match else None
+    return {
+        "correct": bool(target_option and target_option == predicted_option),
+        "target_option": target_option,
+        "predicted_option": predicted_option,
+    }
+
+
+def resolve_dataset_format(record: dict[str, Any], requested: str) -> str:
+    """Resolve an explicit or manifest-inferred dataset format."""
+
+    if requested not in {"auto", "vdc", "mvbench"}:
+        raise ValueError(f"unsupported dataset format: {requested}")
+    if requested != "auto":
+        return requested
+    if isinstance(record.get("candidates"), list) and "answer" in record:
+        return "mvbench"
+    return "vdc"
+
+
 _TIMING_KEYS = (
     "prefill_s",
     "draft_s",
@@ -615,15 +862,21 @@ __all__ = [
     "PreparedVideoPrompt",
     "SpeculativeDecodeResult",
     "build_batch_statistics",
+    "build_mvbench_prompt",
+    "build_mvbench_task_statistics",
+    "build_visual_hidden_ablation",
     "capture_dflash_attention",
     "load_manifest_records",
     "load_manifest_sample",
     "resolve_video_path",
     "run_all_comparisons",
     "score_caption",
+    "score_mvbench_prediction",
+    "resolve_dataset_format",
     "summarize_dflash_attention",
     "validate_report_success",
     "write_vdc50_report",
+    "write_mvbench_report",
 ]
 
 
@@ -766,17 +1019,22 @@ def prepare_video_prompt(
     video_min_pixels: int,
     video_max_pixels: int,
     video_reader: str,
+    dataset_format: str = "auto",
 ) -> PreparedVideoPrompt:
     from src.train_VLM.video import prepare_qwen_messages
 
     video_path = resolve_video_path(record, video_root)
-    question = str(
-        record.get("question")
-        or (
-            "Please provide a detailed description of the video, focusing on the "
-            "main subjects, their actions, and the background scenes."
-        )
-    ).strip()
+    resolved_format = resolve_dataset_format(record, dataset_format)
+    if resolved_format == "mvbench":
+        question = build_mvbench_prompt(record)
+    else:
+        question = str(
+            record.get("question")
+            or (
+                "Please provide a detailed description of the video, focusing on the "
+                "main subjects, their actions, and the background scenes."
+            )
+        ).strip()
     messages = [
         {
             "role": "user",
@@ -1011,6 +1269,7 @@ def _checkpoint_result(
     processor: Any,
     target_timing: dict[str, Any],
     load_s: float,
+    task_metrics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     prompt_length = speculative.num_input_tokens
     target_new = target_ids[:, prompt_length:]
@@ -1033,7 +1292,7 @@ def _checkpoint_result(
     )
     esr = target_timing["end_to_end_s"] / max(timing["end_to_end_s"], 1e-12)
     dsr = target_timing["decode_s"] / max(timing["decode_s"], 1e-12)
-    return {
+    result = {
         "label": label,
         "checkpoint": checkpoint,
         "status": "ok" if outputs_match and text else "mismatch",
@@ -1059,6 +1318,9 @@ def _checkpoint_result(
         "num_output_tokens": metrics.pop("num_output_tokens"),
         "peak_memory_bytes": metrics.pop("peak_memory_bytes"),
     }
+    if task_metrics is not None:
+        result["task_metrics"] = task_metrics
+    return result
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1066,6 +1328,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-model", default=DEFAULT_TARGET_MODEL)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--video-root", type=Path, default=DEFAULT_VIDEO_ROOT)
+    parser.add_argument(
+        "--dataset-format",
+        choices=("auto", "vdc", "mvbench"),
+        default="auto",
+        help="prompt/scoring contract; auto detects MVBench candidates",
+    )
     parser.add_argument("--sample-index", type=int, default=0)
     parser.add_argument(
         "--all-samples",
@@ -1094,6 +1362,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--video-max-pixels", type=int, default=50176)
     parser.add_argument("--video-reader", default="torchvision")
     parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument(
+        "--visual-ablation-layers",
+        nargs="+",
+        type=int,
+        default=None,
+        help=(
+            "target layer IDs whose visual-token hidden states are ablated "
+            "before DFlash drafting; cut mode requires all selected IDs"
+        ),
+    )
+    parser.add_argument(
+        "--visual-ablation-mode",
+        choices=("zero", "cut"),
+        default="zero",
+        help=(
+            "visual hidden ablation operation: zero keeps sequence length and "
+            "cuts values; cut removes visual positions from DFlash context"
+        ),
+    )
     return parser
 
 
@@ -1107,6 +1394,7 @@ def run_comparison(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("exactly two --checkpoint values are required")
 
     record = load_manifest_sample(args.manifest, args.sample_index)
+    dataset_format = resolve_dataset_format(record, args.dataset_format)
     processor, target, target_load_s = _load_target(
         args.target_model,
         device=device,
@@ -1124,6 +1412,7 @@ def run_comparison(args: argparse.Namespace) -> dict[str, Any]:
         video_min_pixels=args.video_min_pixels,
         video_max_pixels=args.video_max_pixels,
         video_reader=args.video_reader,
+        dataset_format=dataset_format,
     )
     prepare_s = _now(device) - prepare_started
     target_output, target_timing = _target_greedy(
@@ -1136,6 +1425,18 @@ def run_comparison(args: argparse.Namespace) -> dict[str, Any]:
     prompt_length = int(prompt.inputs["input_ids"].shape[1])
     target_prediction = _decode_text(processor, target_output[0, prompt_length:])
     reference = str(record.get("answer") or record.get("reference") or "")
+    target_task_metrics = (
+        score_mvbench_prediction(record, target_prediction)
+        if dataset_format == "mvbench"
+        else None
+    )
+    requested_ablation_layers = [
+        int(layer_id)
+        for layer_id in (getattr(args, "visual_ablation_layers", None) or [])
+    ]
+    requested_ablation_mode = str(
+        getattr(args, "visual_ablation_mode", "zero")
+    )
     report: dict[str, Any] = {
         "target_model": args.target_model,
         "draft_config": str(args.draft_config),
@@ -1143,11 +1444,21 @@ def run_comparison(args: argparse.Namespace) -> dict[str, Any]:
         "dtype": str(dtype),
         "sample_index": args.sample_index,
         "sample_id": str(
-            record.get("video_name") or record.get("id") or args.sample_index
+            record.get("sample_id")
+            or record.get("video_name")
+            or record.get("id")
+            or args.sample_index
         ),
+        "task": str(record.get("task") or ""),
+        "dataset_format": dataset_format,
         "video": str(prompt.video_path),
         "question": str(record.get("question") or ""),
         "reference": reference,
+        "visual_ablation": {
+            "enabled": bool(requested_ablation_layers),
+            "mode": requested_ablation_mode,
+            "requested_layer_ids": requested_ablation_layers,
+        },
         "preprocessing": {
             "num_frames": args.num_frames,
             "video_min_pixels": args.video_min_pixels,
@@ -1171,6 +1482,8 @@ def run_comparison(args: argparse.Namespace) -> dict[str, Any]:
         },
         "checkpoints": [],
     }
+    if target_task_metrics is not None:
+        report["target_baseline"]["task_metrics"] = target_task_metrics
 
     for checkpoint in checkpoints:
         checkpoint = Path(checkpoint)
@@ -1188,12 +1501,34 @@ def run_comparison(args: argparse.Namespace) -> dict[str, Any]:
                 device=device,
                 token_decoder=lambda token_ids: _decode_token_list(processor, token_ids),
             )
+            visual_ablation = None
+            visual_ablation_metadata = None
+            visual_context_keep_mask = None
+            if requested_ablation_layers:
+                (
+                    visual_ablation,
+                    visual_ablation_metadata,
+                ) = build_visual_hidden_ablation(
+                    prompt.inputs["input_ids"],
+                    target,
+                    selected_layer_ids=[
+                        int(value) for value in draft.target_layer_ids
+                    ],
+                    removed_layer_ids=requested_ablation_layers,
+                    mode=requested_ablation_mode,
+                )
+                if requested_ablation_mode == "cut":
+                    visual_context_keep_mask = ~_visual_token_mask(
+                        prompt.inputs["input_ids"], target
+                    )
             speculative = decoder.decode(
                 input_ids=prompt.inputs["input_ids"],
                 position_ids=prompt.position_ids,
                 target_kwargs=prompt.target_kwargs,
                 max_new_tokens=args.max_new_tokens,
                 stop_token_ids=_eos_token_ids(processor, target),
+                prefill_target_hidden_transform=visual_ablation,
+                prefill_target_context_keep_mask=visual_context_keep_mask,
             )
             result = _checkpoint_result(
                 label=label,
@@ -1204,7 +1539,14 @@ def run_comparison(args: argparse.Namespace) -> dict[str, Any]:
                 processor=processor,
                 target_timing=target_timing,
                 load_s=load_s,
+                task_metrics=None,
             )
+            if dataset_format == "mvbench":
+                result["task_metrics"] = score_mvbench_prediction(
+                    record, result["prediction"]
+                )
+            if visual_ablation_metadata is not None:
+                result["visual_ablation"] = visual_ablation_metadata
             report["checkpoints"].append(result)
             del decoder, draft, speculative
             gc.collect()
@@ -1309,7 +1651,9 @@ def build_batch_statistics(reports: list[dict[str, Any]]) -> dict[str, Any]:
         target = report.get("target_baseline")
         if isinstance(target, dict):
             target_rows.append(target)
-            _collect_scalar_metrics(target, ("text_metrics", "timing"), target_values)
+            _collect_scalar_metrics(
+                target, ("text_metrics", "timing", "task_metrics"), target_values
+            )
     groups["target_baseline"] = {
         "sample_count": len(target_rows),
         "metrics": {
@@ -1329,7 +1673,7 @@ def build_batch_statistics(reports: list[dict[str, Any]]) -> dict[str, Any]:
         for row in rows:
             _collect_scalar_metrics(
                 row,
-                ("text_metrics", "timing", "acceptance", "speedup"),
+                ("text_metrics", "timing", "acceptance", "speedup", "task_metrics"),
                 values,
             )
             if isinstance(row.get("outputs_match"), bool):
@@ -1351,6 +1695,54 @@ def build_batch_statistics(reports: list[dict[str, Any]]) -> dict[str, Any]:
         "completed_reports": len(completed),
         "groups": groups,
     }
+
+
+def build_mvbench_task_statistics(
+    reports: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Aggregate MVBench accuracy by task for paired reports."""
+
+    by_task: dict[str, dict[str, Any]] = {}
+    for report in reports:
+        if report.get("dataset_format") != "mvbench":
+            continue
+        task = str(report.get("task") or "unknown")
+        bucket = by_task.setdefault(
+            task,
+            {
+                "target": [],
+                "checkpoints": {},
+            },
+        )
+        target_metrics = report.get("target_baseline", {}).get("task_metrics", {})
+        if isinstance(target_metrics.get("correct"), bool):
+            bucket["target"].append(float(target_metrics["correct"]))
+        for checkpoint in report.get("checkpoints", []):
+            if not isinstance(checkpoint, dict):
+                continue
+            label = str(checkpoint.get("label") or "")
+            metrics = checkpoint.get("task_metrics", {})
+            if label and isinstance(metrics.get("correct"), bool):
+                bucket["checkpoints"].setdefault(label, []).append(
+                    float(metrics["correct"])
+                )
+
+    def summarize(values: list[float]) -> dict[str, Any]:
+        summary = _numeric_summary(values)
+        summary["correct_count"] = int(sum(values))
+        summary["sample_count"] = len(values)
+        return summary
+
+    result: dict[str, Any] = {}
+    for task, payload in sorted(by_task.items()):
+        result[task] = {
+            "target": summarize(payload["target"]),
+            "checkpoints": {
+                label: summarize(values)
+                for label, values in sorted(payload["checkpoints"].items())
+            },
+        }
+    return result
 
 
 def write_batch_statistics(output_dir: Path, statistics: dict[str, Any]) -> None:
@@ -1520,6 +1912,125 @@ def write_vdc50_report(
     return report_path
 
 
+def write_mvbench_report(
+    output_dir: Path,
+    summary: dict[str, Any],
+    reports: list[dict[str, Any]],
+) -> Path:
+    """Write a task-level MVBench accuracy and DFlash performance report."""
+
+    first = next(
+        (report for report in reports if report.get("run_status") == "completed"),
+        {},
+    )
+    checkpoints = [
+        str(item.get("label"))
+        for item in first.get("checkpoints", [])
+        if isinstance(item, dict) and item.get("label")
+    ]
+    task_statistics = summary.get("task_statistics", {})
+    lines = [
+        "# Qwen2.5-VL DFlash MVBench report",
+        "",
+        "This report uses the canonical MVBench multiple-choice prompt and "
+        "scores option-letter accuracy. All metrics are computed over completed "
+        "per-sample reports.",
+        "",
+        "## Run configuration",
+        "",
+        f"- Target model: `{first.get('target_model', 'n/a')}`",
+        f"- Device/dtype: `{first.get('device', 'n/a')}` / `{first.get('dtype', 'n/a')}`",
+        f"- Manifest: `{summary.get('manifest', 'n/a')}`",
+        f"- Samples: **{summary.get('total_samples', 0)}**",
+        f"- Checkpoints: {', '.join(f'`{item}`' for item in checkpoints) or 'n/a'}",
+        "- Prompt: `Question + Option (A/B/C/D) + Only give the best option.`",
+        "",
+        "## Coverage",
+        "",
+        f"- Completed: **{summary.get('completed_samples', 0)}**",
+        f"- Runtime errors: **{summary.get('runtime_errors', 0)}**",
+        "",
+        "## Accuracy by task",
+        "",
+        "| Task | N | Target | "
+        + " | ".join(checkpoints)
+        + " |",
+        "|---|---:|---:|"
+        + "---:|" * len(checkpoints),
+    ]
+    for task, payload in sorted(task_statistics.items()):
+        row = [
+            task,
+            str(payload.get("target", {}).get("sample_count", 0)),
+            f"{payload.get('target', {}).get('mean', 0.0):.4f}",
+        ]
+        row.extend(
+            f"{payload.get('checkpoints', {}).get(label, {}).get('mean', 0.0):.4f}"
+            for label in checkpoints
+        )
+        lines.append("| " + " | ".join(row) + " |")
+
+    lines.extend(
+        [
+            "",
+            "## Aggregate performance",
+            "",
+            "| Group | N | Lossless rate | Accuracy | tau | ESR | DSR | Tokens/s | End-to-end s |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    groups = summary.get("statistics", {}).get("groups", {})
+    for label, group in groups.items():
+        metrics = group.get("metrics", {})
+        accuracy = metrics.get("task_metrics.correct", {}).get("mean", "n/a")
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    label,
+                    str(group.get("sample_count", 0)),
+                    f"{group.get('lossless_rate', 0.0):.4f}"
+                    if "lossless_rate" in group
+                    else "n/a",
+                    f"{accuracy:.4f}" if isinstance(accuracy, (int, float)) else accuracy,
+                    f"{metrics.get('acceptance.tau', {}).get('mean', 0.0):.4f}"
+                    if "acceptance.tau" in metrics
+                    else "n/a",
+                    f"{metrics.get('speedup.esr', {}).get('mean', 0.0):.4f}"
+                    if "speedup.esr" in metrics
+                    else "n/a",
+                    f"{metrics.get('speedup.dsr', {}).get('mean', 0.0):.4f}"
+                    if "speedup.dsr" in metrics
+                    else "n/a",
+                    f"{metrics.get('timing.tokens_per_second', {}).get('mean', 0.0):.2f}"
+                    if "timing.tokens_per_second" in metrics
+                    else "n/a",
+                    f"{metrics.get('timing.end_to_end_s', {}).get('mean', 0.0):.3f}"
+                    if "timing.end_to_end_s" in metrics
+                    else "n/a",
+                ]
+            )
+            + " |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Artifacts",
+            "",
+            "- `summary.json`: coverage, task statistics, and aggregate metrics.",
+            "- `metrics.json`: aggregate metrics with bootstrap intervals.",
+            "- `metrics.csv`: flat metrics table.",
+            "- `sample_*.json`: target/checkpoint output and option-level scores.",
+            "",
+        ]
+    )
+    report_path = output_dir / "MVBENCH_REPORT.md"
+    temporary = report_path.with_suffix(report_path.suffix + ".tmp")
+    temporary.write_text("\n".join(lines), encoding="utf-8")
+    temporary.replace(report_path)
+    return report_path
+
+
 def run_all_comparisons(args: argparse.Namespace) -> dict[str, Any]:
     """Run and persist every manifest sample, keeping mismatch diagnostics."""
 
@@ -1531,7 +2042,10 @@ def run_all_comparisons(args: argparse.Namespace) -> dict[str, Any]:
 
     for sample_index, record in enumerate(records):
         sample_id = str(
-            record.get("video_name") or record.get("id") or sample_index
+            record.get("sample_id")
+            or record.get("video_name")
+            or record.get("id")
+            or sample_index
         )
         output_path = output_dir / f"sample_{sample_index:03d}.json"
         report: dict[str, Any] = {}
@@ -1598,6 +2112,7 @@ def run_all_comparisons(args: argparse.Namespace) -> dict[str, Any]:
     )
     runtime_errors = sum(item["run_status"] == "error" for item in entries)
     statistics = build_batch_statistics(completed_reports)
+    task_statistics = build_mvbench_task_statistics(completed_reports)
     write_batch_statistics(output_dir, statistics)
     summary = {
         "manifest": str(Path(args.manifest).expanduser().resolve()),
@@ -1611,9 +2126,14 @@ def run_all_comparisons(args: argparse.Namespace) -> dict[str, Any]:
         "metric_statistics": str(output_dir / "metrics.json"),
         "metric_csv": str(output_dir / "metrics.csv"),
         "statistics": statistics,
+        "task_statistics": task_statistics,
         "reports": entries,
     }
-    report_path = write_vdc50_report(output_dir, summary, completed_reports)
+    report_path = (
+        write_mvbench_report(output_dir, summary, completed_reports)
+        if getattr(args, "dataset_format", "auto") == "mvbench"
+        else write_vdc50_report(output_dir, summary, completed_reports)
+    )
     summary["report_markdown"] = str(report_path)
     _write_json_atomic(output_dir / "summary.json", summary)
     print(

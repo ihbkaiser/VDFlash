@@ -87,6 +87,7 @@ def write_task_manifests(
     dataset_root: str | Path,
     tasks: Sequence[str] = REQUESTED_TASKS,
     require_videos: bool = False,
+    limit_per_task: int | None = None,
 ) -> dict[str, int]:
     """Write one JSONL manifest per task and a deterministic combined manifest."""
 
@@ -97,6 +98,8 @@ def write_task_manifests(
     counts: dict[str, int] = {}
     combined: list[dict[str, object]] = []
     missing: list[str] = []
+    if limit_per_task is not None and limit_per_task <= 0:
+        raise ValueError("limit_per_task must be positive")
     for task in tasks:
         if task not in TASK_VIDEO_ROOTS:
             raise ValueError(f"unsupported MVBench task: {task}")
@@ -105,6 +108,8 @@ def write_task_manifests(
             _read_annotations(annotation_root / f"{task}.json"),
             dataset_root=dataset_root,
         )
+        if limit_per_task is not None:
+            records = records[:limit_per_task]
         counts[task] = len(records)
         _write_jsonl(output_root / f"{task}.jsonl", records)
         combined.extend(records)
@@ -144,6 +149,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-root", default="dataset/MVBench")
     parser.add_argument("--output-dir", default="dataset/MVBench/classified")
     parser.add_argument("--require-videos", action="store_true")
+    parser.add_argument("--limit-per-task", type=int, default=None)
     parser.add_argument("--tasks", nargs="+", choices=REQUESTED_TASKS, default=REQUESTED_TASKS)
     return parser.parse_args()
 
@@ -156,6 +162,7 @@ def main() -> int:
         dataset_root=args.dataset_root,
         tasks=args.tasks,
         require_videos=args.require_videos,
+        limit_per_task=args.limit_per_task,
     )
     for task, count in counts.items():
         print(f"{task}: {count}")

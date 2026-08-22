@@ -77,6 +77,7 @@ class WarmStartReport:
     loaded_keys: int
     missing_keys: Tuple[str, ...]
     loaded_embedding: bool
+    reset_keys: Tuple[str, ...] = ()
 
 
 def _without_file_uri(source: str) -> str:
@@ -344,7 +345,7 @@ def _runtime_state_file(source: str) -> Optional[str]:
 
 def _load_specforge_draft_state(
     state_path: str, *, expected_strategy: str
-) -> Dict[str, Any]:
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
     import torch
 
     try:
@@ -367,7 +368,20 @@ def _load_specforge_draft_state(
             f"warm-start checkpoint {state_path} was written by strategy "
             f"{saved_strategy!r}; this run trains {expected_strategy!r}"
         )
-    return state["draft_state_dict"]
+    metadata = state.get("dflash_hidden_state_metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        raise ValueError(
+            "SpecForge warm-start checkpoint has invalid hidden-state metadata: "
+            f"{type(metadata).__name__}"
+        )
+    if metadata is None and state.get("dflash_target_layer_ids") is not None:
+        # Checkpoints created before nested hidden-state metadata was added
+        # still carry the original DFlash layer contract.
+        metadata = {
+            "target_layer_ids": state["dflash_target_layer_ids"],
+            "schema_version": 0,
+        }
+    return state["draft_state_dict"], metadata
 
 
 def _load_pretrained_draft_state(
@@ -376,7 +390,7 @@ def _load_pretrained_draft_state(
     draft_config: "PretrainedConfig",
     cache_dir: Optional[str],
     trust_remote_code: bool,
-) -> Dict[str, Any]:
+) -> Tuple[Dict[str, Any], None]:
     from specforge.modeling.auto import AutoDraftModel
 
     loaded, loading_info = AutoDraftModel.from_pretrained(
@@ -393,7 +407,39 @@ def _load_pretrained_draft_state(
         if key not in missing_from_source
     }
     del loaded
-    return state
+    return state, None
+
+
+def _draft_target_layer_ids(draft_config: Any) -> Optional[Tuple[int, ...]]:
+    method_config = getattr(draft_config, "dflash_config", None)
+    if not isinstance(method_config, dict):
+        return None
+    values = method_config.get("target_layer_ids")
+    if values is None:
+        return None
+    from specforge.hidden_state import parse_target_layer_ids
+
+    return parse_target_layer_ids(values, expected_count=None)
+
+
+def _projection_keys(model: Any, state: Dict[str, Any]) -> Tuple[str, ...]:
+    keys = tuple(
+        key
+        for key in state
+        if key == "fc.weight" or key == "fc.bias" or key.startswith("fc.")
+    )
+    if not keys:
+        raise ValueError(
+            "DFlash warm-start cannot reset the context projection: "
+            "checkpoint has no fc.* weights"
+        )
+    projection = getattr(model, "fc", None)
+    if not callable(getattr(projection, "reset_parameters", None)):
+        raise ValueError(
+            "DFlash warm-start cannot reset the context projection: "
+            "draft model has no resettable fc module"
+        )
+    return keys
 
 
 def warm_start_draft_model(
@@ -403,23 +449,75 @@ def warm_start_draft_model(
     draft_config: "PretrainedConfig",
     strategy: str,
     allow_missing_embedding: bool = False,
+    warm_start_mode: Literal["auto", "strict", "reset_projection", "none"] = "auto",
     cache_dir: Optional[str] = None,
     trust_remote_code: bool = False,
 ) -> WarmStartReport:
     """Load only draft weights, never optimizer/counters/RNG training state."""
 
+    if warm_start_mode not in {"auto", "strict", "reset_projection", "none"}:
+        raise ValueError(f"unsupported warm_start_mode={warm_start_mode!r}")
+    if warm_start_mode == "none":
+        return WarmStartReport(
+            source=str(source),
+            checkpoint_format="pretrained",
+            loaded_keys=0,
+            missing_keys=(),
+            loaded_embedding=False,
+        )
+
     runtime_state = _runtime_state_file(source)
     if runtime_state is not None:
         checkpoint_format: Literal["specforge", "pretrained"] = "specforge"
-        state = _load_specforge_draft_state(runtime_state, expected_strategy=strategy)
+        state, source_metadata = _load_specforge_draft_state(
+            runtime_state,
+            expected_strategy=strategy,
+        )
     else:
         checkpoint_format = "pretrained"
-        state = _load_pretrained_draft_state(
+        state, source_metadata = _load_pretrained_draft_state(
             source,
             draft_config=draft_config,
             cache_dir=cache_dir,
             trust_remote_code=trust_remote_code,
         )
+
+    reset_keys: Tuple[str, ...] = ()
+    current_layer_ids = _draft_target_layer_ids(draft_config)
+    if (
+        strategy == "dflash"
+        and current_layer_ids
+        and checkpoint_format == "specforge"
+    ):
+        if source_metadata is None:
+            raise ValueError(
+                f"warm-start checkpoint {source!r} does not record hidden-state "
+                "layer metadata; start a fresh capture/training run"
+            )
+        from specforge.hidden_state import parse_target_layer_ids
+
+        source_layer_ids = parse_target_layer_ids(
+            source_metadata.get("target_layer_ids", []),
+            expected_count=None,
+        )
+        if source_layer_ids != current_layer_ids:
+            if warm_start_mode == "strict":
+                raise ValueError(
+                    "DFlash warm-start hidden-state layer mismatch: "
+                    f"checkpoint={list(source_layer_ids)!r}, "
+                    f"requested={list(current_layer_ids)!r}"
+                )
+            reset_keys = _projection_keys(model, state)
+            state = {
+                key: value for key, value in state.items() if key not in reset_keys
+            }
+            logger.info(
+                "DFlash warm-start layer list changed from %s to %s; "
+                "resetting projection keys=%s",
+                list(source_layer_ids),
+                list(current_layer_ids),
+                list(reset_keys),
+            )
 
     if not state:
         raise ValueError(f"warm-start checkpoint {source!r} contains no draft weights")
@@ -437,9 +535,11 @@ def warm_start_draft_model(
             f"loaded={loaded_keys}/{len(state)}, "
             f"unexpected={sorted(result.unexpected_keys)}"
         )
-    allowed_missing = set()
+    allowed_missing = set(reset_keys)
     if allow_missing_embedding:
-        allowed_missing = {key for key in result.missing_keys if "embed" in key.lower()}
+        allowed_missing.update(
+            key for key in result.missing_keys if "embed" in key.lower()
+        )
     required_missing = sorted(set(result.missing_keys) - allowed_missing)
     if required_missing:
         raise ValueError(
@@ -447,12 +547,16 @@ def warm_start_draft_model(
             f"by this architecture: {required_missing}"
         )
 
+    if reset_keys:
+        model.fc.reset_parameters()
+
     report = WarmStartReport(
         source=str(source),
         checkpoint_format=checkpoint_format,
         loaded_keys=loaded_keys,
         missing_keys=tuple(sorted(result.missing_keys)),
         loaded_embedding=any("embed" in key.lower() for key in state),
+        reset_keys=tuple(sorted(reset_keys)),
     )
     logger.info(
         "Warm-started %d draft tensors from %s (%s); missing=%s",
