@@ -10,6 +10,7 @@ import json
 import math
 import random
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 import sys
@@ -55,6 +56,66 @@ def _crop_cache(cache: Any, length: int) -> None:
 
 def _as_stop_set(stop_token_ids: list[int] | None) -> set[int]:
     return {int(token_id) for token_id in (stop_token_ids or [])}
+
+
+def summarize_dflash_attention(
+    attention_weights: torch.Tensor,
+    *,
+    context_length: int,
+) -> dict[str, Any]:
+    """Summarize DFlash attention over target context versus draft noise.
+
+    DFlash concatenates target-hidden context keys before the current draft
+    block's noise keys.  This helper preserves that distinction and deliberately
+    uses a DFlash-specific attention label rather than the MSD vocabulary.
+    """
+
+    if not torch.is_tensor(attention_weights) or attention_weights.ndim != 4:
+        raise ValueError("attention_weights must have shape [batch, heads, query, key]")
+    if context_length < 0 or context_length > attention_weights.shape[-1]:
+        raise ValueError("context_length must be within the attention key length")
+    context_mass = attention_weights[..., :context_length].sum(dim=-1).mean()
+    noise_mass = attention_weights[..., context_length:].sum(dim=-1).mean()
+    return {
+        "attention_source": "dflash_context",
+        "context_length": int(context_length),
+        "query_length": int(attention_weights.shape[-2]),
+        "key_length": int(attention_weights.shape[-1]),
+        "context_attention_mass": float(context_mass.detach().cpu().item()),
+        "noise_attention_mass": float(noise_mass.detach().cpu().item()),
+    }
+
+
+@contextmanager
+def capture_dflash_attention(draft: Any):
+    """Capture eager DFlash self-attention weights without changing outputs."""
+
+    records: list[dict[str, Any]] = []
+    handles = []
+    for layer_index, layer in enumerate(getattr(draft, "layers", ())):
+        attention = getattr(layer, "self_attn", None)
+        if attention is None or not hasattr(attention, "register_forward_hook"):
+            continue
+
+        def hook(_module, _inputs, output, *, _layer_index=layer_index):
+            if not isinstance(output, (tuple, list)) or len(output) < 2:
+                return
+            weights = output[1]
+            if torch.is_tensor(weights):
+                records.append(
+                    {
+                        "layer_index": int(_layer_index),
+                        "context_length": int(weights.shape[-1] - weights.shape[-2]),
+                        "weights": weights.detach().cpu(),
+                    }
+                )
+
+        handles.append(attention.register_forward_hook(hook))
+    try:
+        yield records
+    finally:
+        for handle in handles:
+            handle.remove()
 
 
 @dataclass
@@ -184,6 +245,7 @@ class InstrumentedDFlashDecoder:
         target_kwargs: dict[str, Any] | None,
         max_new_tokens: int,
         stop_token_ids: list[int] | None,
+        prefill_target_hidden_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> SpeculativeDecodeResult:
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
             raise ValueError("DFlash inference currently supports batch size one")
@@ -235,6 +297,13 @@ class InstrumentedDFlashDecoder:
             target_output.hidden_states,
             [int(value) for value in self.draft.target_layer_ids],
         )
+        if prefill_target_hidden_transform is not None:
+            transformed_hidden = prefill_target_hidden_transform(target_hidden)
+            if not torch.is_tensor(transformed_hidden) or transformed_hidden.shape != target_hidden.shape:
+                raise ValueError(
+                    "prefill_target_hidden_transform must return a tensor with the same shape"
+                )
+            target_hidden = transformed_hidden
         pending_anchor = target_output.logits[:, -1:, :].argmax(dim=-1)
         output_ids[:, prompt_length : prompt_length + 1] = pending_anchor
         decode_started = _now(self.device)
@@ -546,11 +615,13 @@ __all__ = [
     "PreparedVideoPrompt",
     "SpeculativeDecodeResult",
     "build_batch_statistics",
+    "capture_dflash_attention",
     "load_manifest_records",
     "load_manifest_sample",
     "resolve_video_path",
     "run_all_comparisons",
     "score_caption",
+    "summarize_dflash_attention",
     "validate_report_success",
     "write_vdc50_report",
 ]

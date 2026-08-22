@@ -62,9 +62,15 @@ def load_qwen_model(
     """Load a Qwen-VL checkpoint with eager attention for inspectable probes."""
 
     try:
-        from transformers import AutoModelForVision2Seq, BitsAndBytesConfig
+        from transformers import BitsAndBytesConfig
     except ImportError as exc:  # pragma: no cover - environment gate
-        raise RuntimeUnavailableError("Transformers is required for model analysis") from exc
+        if quantized:
+            raise RuntimeUnavailableError("Transformers with BitsAndBytesConfig is required for quantized analysis") from exc
+        BitsAndBytesConfig = None
+    try:
+        from transformers import AutoModelForVision2Seq
+    except ImportError:  # pragma: no cover - older/newer Transformers variants
+        AutoModelForVision2Seq = None
     if dtype == "bfloat16":
         torch_dtype = torch.bfloat16
     elif dtype == "float32":
@@ -79,23 +85,45 @@ def load_qwen_model(
         "low_cpu_mem_usage": True,
     }
     if quantized:
+        if BitsAndBytesConfig is None:
+            raise RuntimeUnavailableError("BitsAndBytesConfig is required for quantized analysis")
         kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch_dtype if torch_dtype != torch.float32 else torch.float16,
             bnb_4bit_use_double_quant=True,
         )
-    try:
-        # Qwen2-VL is a vision-encoder-decoder: AutoModelForCausalLM rejects
-        # Qwen2VLConfig on modern transformers, so use AutoModelForVision2Seq.
-        model = AutoModelForVision2Seq.from_pretrained(model_id, **kwargs)
-    except TypeError:
-        # Older Transformers releases use the config field instead of the
-        # from_pretrained keyword for the attention implementation.
-        kwargs.pop("attn_implementation", None)
-        model = AutoModelForVision2Seq.from_pretrained(model_id, **kwargs)
-        if hasattr(model.config, "_attn_implementation"):
-            model.config._attn_implementation = "eager"
+
+    def _load_explicit_qwen25() -> Any:
+        try:
+            from transformers import Qwen2_5_VLForConditionalGeneration
+        except ImportError as exc:
+            raise RuntimeUnavailableError(
+                "Transformers does not expose a Qwen2.5-VL model class"
+            ) from exc
+        return Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id, **kwargs)
+
+    if AutoModelForVision2Seq is None:
+        model = _load_explicit_qwen25()
+    else:
+        try:
+            # Qwen2-VL is a vision-encoder-decoder: AutoModelForCausalLM rejects
+            # Qwen2VLConfig on modern transformers, so use AutoModelForVision2Seq.
+            model = AutoModelForVision2Seq.from_pretrained(model_id, **kwargs)
+        except (ValueError, KeyError):
+            # Some Transformers versions expose the Qwen2.5 class directly but
+            # do not register its config with AutoModelForVision2Seq.
+            model = _load_explicit_qwen25()
+        except TypeError:
+            # Older Transformers releases use the config field instead of the
+            # from_pretrained keyword for the attention implementation.
+            kwargs.pop("attn_implementation", None)
+            try:
+                model = AutoModelForVision2Seq.from_pretrained(model_id, **kwargs)
+            except (ValueError, KeyError):
+                model = _load_explicit_qwen25()
+    if hasattr(model.config, "_attn_implementation"):
+        model.config._attn_implementation = "eager"
     model.eval()
     return model
 

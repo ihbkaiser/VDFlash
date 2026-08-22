@@ -16,10 +16,12 @@ from src.infer.qwen25vl_dflash_compare import (
     _print_report,
     _target_greedy,
     build_parser,
+    capture_dflash_attention,
     run_comparison,
     load_manifest_sample,
     resolve_video_path,
     score_caption,
+    summarize_dflash_attention,
     validate_report_success,
 )
 
@@ -485,6 +487,35 @@ def test_instrumented_decoder_accepts_stub_block_and_forwards_video_once():
     assert all(call["has_video"] is False for call in target.calls[1:])
 
 
+def test_instrumented_decoder_applies_prefill_hidden_transform_only_to_dflash_context():
+    target = _Target()
+    class RecordingDraft(_Draft):
+        def __init__(self):
+            self.seen = []
+
+        def __call__(self, *args, **kwargs):
+            self.seen.append(kwargs["target_hidden"].clone())
+            return super().__call__(*args, **kwargs)
+
+    draft = RecordingDraft()
+    decoder = InstrumentedDFlashDecoder(target, draft, device=torch.device("cpu"))
+
+    result = decoder.decode(
+        input_ids=torch.tensor([[1, 2, 3]]),
+        position_ids=torch.arange(3).view(1, 3),
+        target_kwargs=None,
+        max_new_tokens=5,
+        stop_token_ids=[],
+        prefill_target_hidden_transform=lambda hidden: hidden.masked_fill(
+            torch.tensor([[[False], [True], [False]]]), 0
+        ),
+    )
+
+    assert result.num_output_tokens == 5
+    assert draft.seen
+    assert draft.seen[0][0, 1, 1].item() == 0
+
+
 def test_instrumented_decoder_trims_at_stop_token_after_full_budget():
     target = _Target()
     draft = _Draft()
@@ -501,6 +532,30 @@ def test_instrumented_decoder_trims_at_stop_token_after_full_budget():
 
     assert result.output_ids[0, input_ids.shape[1] :].tolist() == [4, 5, 6, 7, 8]
     assert result.num_output_tokens == 5
+
+
+def test_dflash_attention_capture_separates_target_context_from_noise():
+    class Attention(nn.Module):
+        def forward(self, hidden_states):
+            del hidden_states
+            weights = torch.tensor([[[[0.1, 0.2, 0.3, 0.4]]]])
+            return torch.zeros(1, 1, 1), weights
+
+    layer = SimpleNamespace(self_attn=Attention())
+    draft = SimpleNamespace(layers=[layer])
+
+    with capture_dflash_attention(draft) as records:
+        layer.self_attn(torch.ones(1, 1, 1))
+
+    assert len(records) == 1
+    assert records[0]["layer_index"] == 0
+    assert records[0]["context_length"] == 3
+    summary = summarize_dflash_attention(records[0]["weights"], context_length=3)
+    assert summary["attention_source"] == "dflash_context"
+    assert summary["context_length"] == 3
+    assert summary["query_length"] == 1
+    assert summary["context_attention_mass"] == pytest.approx(0.6)
+    assert summary["noise_attention_mass"] == pytest.approx(0.4)
 
 
 def test_run_comparison_records_mismatch_and_continues_to_second_checkpoint(

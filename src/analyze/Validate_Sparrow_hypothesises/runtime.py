@@ -400,10 +400,15 @@ def build_video_messages(
     question: str,
     fps: float,
     max_pixels: int | None = None,
+    max_frames: int | None = None,
 ) -> list[dict[str, Any]]:
     video = {"type": "video", "video": str(video_path), "fps": float(fps)}
     if max_pixels is not None:
         video["max_pixels"] = int(max_pixels)
+    if max_frames is not None:
+        if max_frames <= 0:
+            raise ValueError(f"max_frames must be positive, got {max_frames}")
+        video["max_frames"] = int(max_frames)
     return [{
         "role": "user",
         "content": [
@@ -420,6 +425,7 @@ def process_video(
     fps: float,
     max_pixels: int | None = None,
     attempts: int = 2,
+    max_frames: int | None = None,
 ) -> Any:
     """Process a video with a small number of retries.
 
@@ -431,7 +437,7 @@ def process_video(
     last_exc: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
-            return _process_video_once(processor, video_path, question, fps, max_pixels)
+            return _process_video_once(processor, video_path, question, fps, max_pixels, max_frames)
         except Exception as exc:  # noqa: BLE001 - transient video read failures
             last_exc = exc
             if attempt < attempts:
@@ -446,12 +452,19 @@ def _process_video_once(
     question: str,
     fps: float,
     max_pixels: int | None = None,
+    max_frames: int | None = None,
 ) -> Any:
     try:
         from qwen_vl_utils import process_vision_info
     except ImportError as exc:  # pragma: no cover
         raise RuntimeUnavailableError("qwen-vl-utils is required for Qwen video preprocessing") from exc
-    messages = build_video_messages(video_path, question, fps, max_pixels=max_pixels)
+    messages = build_video_messages(
+        video_path,
+        question,
+        fps,
+        max_pixels=max_pixels,
+        max_frames=max_frames,
+    )
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     try:
         image_inputs, video_inputs, video_kwargs = process_vision_info(messages, return_video_kwargs=True)

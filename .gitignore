@@ -38,6 +38,7 @@ env/
 
 # Downloaded evaluation data (large, reproducible from the Hugging Face source)
 dataset/VideoDetailCaption/
+dataset/MVBench/
 
 # Model weights (large binaries, keep out of git)
 *.safetensors
@@ -58,3 +59,4 @@ progress.md
 task_plan.md
 docs/superpowers/
 .venv-msd
+.jspace/

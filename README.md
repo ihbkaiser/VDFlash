@@ -339,5 +339,67 @@ torchrun --standalone --nproc_per_node=8 \
   --output-dir artifacts/ablation_4k/stage1/checkpoint
 ```
 
+## 10. Sparrow/MSD hypothesis validation for DFlash
+
+The existing MSD validation command remains unchanged. The Qwen2.5-VL DFlash
+matrix has a separate runner and writes to its own result directory:
+
+```bash
+HF_HOME=/path/to/huggingface-cache \
+src/analyze/Validate_Sparrow_hypothesises/run_dflash_validation_gpu.sh
+```
+
+The default checkpoint is
+`dataset/qwen25vl-3b-dflash-llava68k-latest/training_state.pt`; override it with
+`CHECKPOINT=...`. Use `LIMIT=1` and `--dry-run` for a bounded check. Figure 1(b)
+is reported as an adapted target-hidden visual-retention diagnostic, Figure 2
+as DFlash context attention, and Figures 3/3(b)/6 as Qwen2.5-VL target-side
+diagnostics. These labels are intentional because DFlash consumes target
+hidden context rather than the raw visual embedding stream used by MSD.
+
+### Reject-position audit
+
+Reject-position analysis belongs to the inference result pipeline. It reads the
+per-sample JSON reports produced by the Qwen2.5-VL DFlash runner and extracts
+the first proposal mismatch from each acceptance round:
+
+```bash
+python -m src.infer.reject_position_audit \
+  --input-dir results/infer/qwen25vl_3b_dflash_vdc50_8frames_isolated_20260820 \
+  --output-dir results/infer/qwen25vl_3b_dflash_vdc50_8frames_isolated_20260820/reject_position_audit
+```
+
+The rule-based result is authoritative at token level:
+
+```text
+reject iff matched_proposals < proposal_count
+reject_index_in_block = matched_proposals       # zero-based
+generated_position = 1 + sum(previous effective_emitted_tokens) + reject_index_in_block
+relative_position = generated_position / max(num_output_tokens - 1, 1)
+```
+
+`rounds.jsonl` contains every round, `reject_events.jsonl` contains only first
+reject events, `rule_summary.json` contains aggregate/per-checkpoint/per-sample
+statistics, and `reject_position_report.md` is the human-readable report.
+Partial and terminal rounds remain visible and are flagged.
+
+LM review is optional and supports JSONL replay, a self-hosted
+OpenAI-compatible endpoint, or a local Transformers checkpoint:
+
+```bash
+python -m src.infer.reject_position_audit \
+  --input-dir results/infer/qwen25vl_3b_dflash_vdc50_8frames_isolated_20260820 \
+  --output-dir results/infer/qwen25vl_3b_dflash_vdc50_8frames_isolated_20260820/reject_position_audit_lm \
+  --lm-backend http \
+  --lm-endpoint http://127.0.0.1:8000/v1/chat/completions \
+  --lm-model <served-model> \
+  --lm-limit 100
+```
+
+The `both` mode runs blind and informed passes. The blind pass receives raw
+round evidence without rule conclusions; the informed pass receives the rule
+definitions and derived position. A deterministic validator checks both LM
+responses, and disagreement never overwrites the rule result.
+
 Chi tiết kiến trúc, manifest, online legacy trainer và benchmark nằm trong
 `src/train_VLM/README.md`.
