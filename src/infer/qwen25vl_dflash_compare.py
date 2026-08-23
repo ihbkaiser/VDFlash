@@ -1360,7 +1360,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-frames", type=int, default=8)
     parser.add_argument("--video-min-pixels", type=int, default=50176)
     parser.add_argument("--video-max-pixels", type=int, default=50176)
-    parser.add_argument("--video-reader", default="torchvision")
+    # torchvision decodes the complete source video before sampling, which
+    # can exceed host RAM for long 1080p MVBench clips.  Decord seeks only the
+    # requested frames and is the safe default for inference batches.
+    parser.add_argument("--video-reader", default="decord")
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument(
         "--visual-ablation-layers",
@@ -2102,6 +2105,14 @@ def run_all_comparisons(args: argparse.Namespace) -> dict[str, Any]:
         )
         if report.get("run_status") == "completed":
             completed_reports.append(report)
+
+        # Each sample loads a fresh target and draft model.  The batch runner
+        # must collect cyclic references and release cached CUDA blocks before
+        # the next sample, otherwise long MVBench runs can be OOM-killed even
+        # though the per-sample inference objects are out of scope.
+        gc.collect()
+        if str(getattr(args, "device", "")).startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     completed = sum(item["run_status"] == "completed" for item in entries)
     lossless = sum(

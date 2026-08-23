@@ -328,7 +328,8 @@ def _prepare_prompt(
         num_frames=int(settings["frames"]),
         video_min_pixels=int(settings["max_pixels"]),
         video_max_pixels=int(settings["max_pixels"]),
-        video_reader="torchvision",
+        # Avoid torchvision's full-video decode on long 1080p VDC clips.
+        video_reader="decord",
     )
     positions = find_visual_positions(prompt.inputs["input_ids"], target=target, processor=processor)
     return prompt, positions, input_fingerprint(prompt.inputs), settings

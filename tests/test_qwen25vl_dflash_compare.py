@@ -114,6 +114,12 @@ def test_parser_accepts_visual_ablation_mode():
     assert args.visual_ablation_mode == "cut"
 
 
+def test_parser_defaults_to_memory_bounded_video_reader():
+    args = build_parser().parse_args([])
+
+    assert args.video_reader == "decord"
+
+
 def test_build_mvbench_prompt_includes_ordered_option_letters():
     record = {
         "question": "What color is the object?",
@@ -938,6 +944,32 @@ def test_run_all_comparisons_persists_every_sample_and_counts_mismatches(
     assert summary["runtime_errors"] == 0
     assert len(list(output_dir.glob("sample_*.json"))) == 3
     assert (output_dir / "summary.json").is_file()
+
+
+def test_run_all_comparisons_collects_inference_resources_after_each_sample(
+    monkeypatch, tmp_path
+):
+    import src.infer.qwen25vl_dflash_compare as runner
+
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(
+        "\n".join(json.dumps({"video_name": f"sample-{index}"}) for index in range(3))
+        + "\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "batch"
+    collect_calls = []
+
+    def fake_run_comparison(args):
+        return {"sample_index": args.sample_index, "success": True}
+
+    monkeypatch.setattr(runner, "run_comparison", fake_run_comparison)
+    monkeypatch.setattr(runner.gc, "collect", lambda: collect_calls.append(True))
+    args = SimpleNamespace(manifest=manifest, output_dir=output_dir, resume=False)
+
+    runner.run_all_comparisons(args)
+
+    assert len(collect_calls) == 3
 
 
 def test_build_batch_statistics_reports_numeric_aggregates_and_lossless_rate():
