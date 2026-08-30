@@ -250,6 +250,10 @@ if __name__ == "__main__":
     
     # Load data
     data_video = load_data(args.task, args.data_num, args.data_path)
+    if not data_video:
+        raise RuntimeError(
+            f"No usable samples found for task={args.task!r} under {args.data_path!r}"
+        )
     
     # Set save path
     if args.save_path is None:

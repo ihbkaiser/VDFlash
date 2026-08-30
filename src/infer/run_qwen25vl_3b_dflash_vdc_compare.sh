@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../../scripts/resolve_workspace.sh"
 cd "$REPO_ROOT"
 
 TARGET_MODEL="${TARGET_MODEL:-Qwen/Qwen2.5-VL-3B-Instruct}"
@@ -41,11 +42,11 @@ if [[ "$ALL_SAMPLES" == "1" ]]; then
   if [[ "$RESUME" == "1" ]]; then
     BATCH_ARGS+=(--resume)
   fi
-  exec python -u -m src.infer.qwen25vl_dflash_compare \
+  exec "$PYTHON_BIN" -u -m src.infer.qwen25vl_dflash_compare \
     "${COMMON_ARGS[@]}" "${BATCH_ARGS[@]}"
 fi
 
-exec python -u -m src.infer.qwen25vl_dflash_compare \
+exec "$PYTHON_BIN" -u -m src.infer.qwen25vl_dflash_compare \
   "${COMMON_ARGS[@]}" \
   --sample-index "$SAMPLE_INDEX" \
   --output "$OUTPUT"

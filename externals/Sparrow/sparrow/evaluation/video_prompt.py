@@ -3,8 +3,30 @@ import av
 import os
 import numpy as np
 import torch
+from pathlib import Path
 from ..model.processing_qwen2_5_vl import Qwen2_5_VLProcessor
 from qwen_vl_utils import process_vision_info
+
+
+def _resolve_vdc_video_path(data_path, data_instance):
+    """Resolve VDC video names without depending on a host-specific suffix."""
+
+    root = Path(data_path).expanduser()
+    candidates = []
+    for field in ("local_video_path", "archive_member", "video_path"):
+        value = data_instance.get(field)
+        if isinstance(value, str) and value:
+            candidate = Path(value).expanduser()
+            candidates.append(candidate if candidate.is_absolute() else root / candidate)
+    video_name = data_instance.get("video_name")
+    if isinstance(video_name, str) and video_name:
+        for suffix in (".mp4", ".mkv", ".MP4", ".MKV"):
+            candidates.append(root / "Test_Videos" / f"{video_name}{suffix}")
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    shown = ", ".join(str(candidate) for candidate in candidates[:6])
+    raise FileNotFoundError(f"VideoDetailCaption video not found; tried: {shown}")
 
 def read_video_pyav(container, indices=None):
     '''
@@ -46,9 +68,7 @@ def clip_input_video( base_model_path,task, data_instance, frame_num=64, model_t
 
     if model_type == 'llava_ov':
         if task == "VideoDetailCaption":
-            video_path = os.path.join(data_path, "Test_Videos/")
-            video_name = data_instance["video_name"]
-            video_path = video_path + video_name + ".mp4"
+            video_path = _resolve_vdc_video_path(data_path, data_instance)
 
             question = data_instance["question"]
             conversation = [
@@ -152,9 +172,7 @@ def clip_input_video( base_model_path,task, data_instance, frame_num=64, model_t
             return required_fps
 
         if task == "VideoDetailCaption":
-            video_path = os.path.join(data_path, "Test_Videos/")
-            video_name = data_instance["video_name"]
-            video_path = video_path + video_name + ".mp4"
+            video_path = _resolve_vdc_video_path(data_path, data_instance)
             question = data_instance["question"]
             # print("video_name",video_name)
             # print("video_path",video_path)

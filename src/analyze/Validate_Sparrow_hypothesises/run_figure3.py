@@ -17,6 +17,7 @@ from .figure3_pipeline import (
     validate_figure3_summaries,
     write_figure3_metadata,
 )
+from src.workspace import resolve_namespace_paths, resolve_workspace_path, workspace_python
 
 
 def _sha256_file(path: Path) -> str:
@@ -51,7 +52,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> int:
-    root = Path(args.repo_root).resolve()
+    root = resolve_workspace_path(args.repo_root)
+    expected_python = workspace_python(root)
+    actual_python = Path(sys.executable)
+    if not expected_python.is_file():
+        raise SystemExit(f"The shared workspace environment is missing: {expected_python}")
+    if not actual_python.samefile(expected_python):
+        raise SystemExit(
+            "This Figure 3 runner must use the shared workspace interpreter "
+            f"{expected_python}; got {actual_python}"
+        )
+    resolve_namespace_paths(args, "manifest", "output_dir")
     output = (root / args.output_dir).resolve()
     manifest = (root / args.manifest).resolve()
     if not manifest.is_file():

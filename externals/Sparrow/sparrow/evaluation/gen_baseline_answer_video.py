@@ -8,6 +8,7 @@ import argparse
 import json
 import os
 import av
+from pathlib import Path
 script_dir = os.path.dirname(__file__)
 parent_dir = os.path.dirname(script_dir)
 import time
@@ -29,36 +30,46 @@ from .video_prompt import clip_input_video
 
 
 def load_data(task, data_num, data_path):
+    def take_samples(dataset, requested):
+        if requested is None or requested < 0:
+            return dataset
+        return dataset.select(range(min(int(requested), len(dataset))))
+
     if task == "VideoDetailCaption":
-       
-        data_video = load_dataset(
-                "/root/autodl-tmp/datasets/VideoDetailCaption",
-                split="test",
-                # cache_dir=cache_dir,
-            ).shuffle(seed=42).select(range(data_num))
-        
+        local_root = Path(data_path).expanduser()
+        local_json = local_root / "test.jsonl"
+        if local_json.exists():
+            data_video = Dataset.from_json(str(local_json))
+        else:
+            data_video = load_dataset(str(local_root), split="test")
+
         def video_exists(example):
-            video_path = os.path.join(video_dir, f"{example['video_name']}.mp4")
-            return os.path.exists(video_path)
+            video_name = example["video_name"]
+            return any(
+                (Path(video_dir) / f"{video_name}{suffix}").exists()
+                for suffix in (".mp4", ".mkv", ".MP4", ".MKV")
+            )
 
         video_dir = os.path.join(data_path, "Test_Videos")
-        filtered_data = data_video.filter(video_exists)
-        data_video = filtered_data
+        data_video = take_samples(data_video.filter(video_exists).shuffle(seed=42), data_num)
         # print("data_video",data_video)
     elif task == 'MVBench':
         data_video_1 = load_dataset(
-                "/root/autodl-tmp/data/MVBench",
+                data_path,
                 'action_sequence',
                 split="train",
                 # cache_dir=cache_dir,
-            ).shuffle(seed=42).select(range(data_num))
+            ).shuffle(seed=42)
 
         data_video_2 = load_dataset(
-                "/root/autodl-tmp/data/MVBench",
+                data_path,
                 'action_prediction',
                 split="train",
                 # cache_dir=cache_dir,
-            ).shuffle(seed=42).select(range(data_num))
+            ).shuffle(seed=42)
+
+        data_video_1 = take_samples(data_video_1, data_num)
+        data_video_2 = take_samples(data_video_2, data_num)
         
         data_video = concatenate_datasets([data_video_1, data_video_2])
        
@@ -69,7 +80,7 @@ def load_data(task, data_num, data_path):
             video_path = os.path.join(video_dir, f"{example['video']}")
             return os.path.exists(video_path)
         
-        video_dir = "/root/autodl-tmp/data/MVBench/video/star/Charades_v1_480"
+        video_dir = os.path.join(data_path, "video", "star", "Charades_v1_480")
         filtered_data = data_video.filter(video_exists)
         data_video = filtered_data
     elif task == 'MVLU':
@@ -80,10 +91,10 @@ def load_data(task, data_num, data_path):
             ).shuffle(seed=42).select(range(data_num))
     elif task == 'LongVideoBench':
         data_video = load_dataset(
-                "/root/autodl-fs/LongVideoBench",
+                data_path,
                 split="test",
                 # cache_dir=cache_dir,
-            ).shuffle(seed=24).select(range(data_num))
+            ).shuffle(seed=24)
         
         def video_exists(example):
             video_path = os.path.join(video_dir, f"{example['video_path']}")
@@ -100,10 +111,10 @@ def load_data(task, data_num, data_path):
             except:
                 return False
 
-        video_dir = "/root/autodl-fs/LongVideoBench/videos"
+        video_dir = os.path.join(data_path, "videos")
         filtered_data = data_video.filter(video_exists)
         target_valid_num = 100
-        data_video = filtered_data.select(range(target_valid_num))
+        data_video = take_samples(filtered_data, target_valid_num)
        
         valid_sample_num = len(data_video)
        
@@ -126,6 +137,15 @@ def load_data(task, data_num, data_path):
 
     # print(data_video)
     return data_video
+
+
+def _resolve_workspace_relative_path(value):
+    """Resolve evaluator paths from this checkout rather than the caller cwd."""
+
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    return Path(__file__).resolve().parents[4] / path
 
 
 
@@ -460,7 +480,12 @@ def run_eval(
     else:
         get_answers_func = get_model_answers
 
-    chunk_size = len(data) // (num_gpus_total // num_gpus_per_model)  # // 2
+    worker_count = num_gpus_total // num_gpus_per_model
+    if not data:
+        raise RuntimeError(
+            f"No usable samples found for task={args.task!r} under {args.data_path!r}"
+        )
+    chunk_size = max(1, (len(data) + worker_count - 1) // worker_count)
     ans_handles = []
     for i in range(0, len(data), chunk_size):
         ans_handles.append(
@@ -694,14 +719,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--spec-model-path",
         type=str,
-        default="down_checkpoints/LC70B",
+        default=None,
         help="The path to the weights. This can be a local folder or a Hugging Face repo ID.",
     )
     parser.add_argument(
         "--base-model-path",
         type=str,
-        default="/home/lyh/weights/hf/llama2chat/70B/",
-        help="1",
+        default=None,
+        help="The path to the base model, or a Hugging Face repo ID.",
     )
     parser.add_argument(
         "--load-in-8bit", action="store_false", help="Use 8-bit quantization"
@@ -767,7 +792,7 @@ if __name__ == "__main__":
 
     ##################
     parser.add_argument('--data_path', type=str,
-                        default='/data',
+                        default='dataset/VideoDetailCaption',
                         help='Path to the data directory')
     # Evaluation parameters
     parser.add_argument('--task', type=str, default='VideoDetailCaption',
@@ -785,6 +810,14 @@ if __name__ == "__main__":
     parser.add_argument('--idx_layer', type=int, 
                         help='Number of layer to jianzhi')
     args = parser.parse_args()
+
+    if not args.base_model_path or not args.spec_model_path:
+        parser.error("--base-model-path and --spec-model-path are required")
+
+    args.data_path = str(_resolve_workspace_relative_path(args.data_path))
+    if args.answer_file:
+        args.answer_file = str(_resolve_workspace_relative_path(args.answer_file))
+    args.bench_name = str(_resolve_workspace_relative_path(args.bench_name))
 
     args.model = args.base_model_path
     args.model_id = args.model_id + "-temperature-" + str(args.temperature)

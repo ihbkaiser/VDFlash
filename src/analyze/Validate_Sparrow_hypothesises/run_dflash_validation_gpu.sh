@@ -3,7 +3,8 @@ set -euo pipefail
 
 # DFlash-only Sparrow/MSD hypothesis validation.  The existing MSD launchers
 # are intentionally not sourced or modified here.
-PYTHON_BIN="${PYTHON_BIN:-.venv-msd/bin/python}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../../../scripts/resolve_workspace.sh"
 TARGET_MODEL="${TARGET_MODEL:-Qwen/Qwen2.5-VL-3B-Instruct}"
 CHECKPOINT="${CHECKPOINT:-dataset/qwen25vl-3b-dflash-llava68k-latest/training_state.pt}"
 DRAFT_CONFIG="${DRAFT_CONFIG:-src/train_Dflash_SpecForge/configs/qwen2.5-vl-3b-dflash.json}"

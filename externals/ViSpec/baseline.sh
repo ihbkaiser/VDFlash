@@ -1,10 +1,16 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../../scripts/resolve_workspace.sh"
+cd "${REPO_ROOT}"
+export PYTHONPATH="${SCRIPT_DIR}:${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 ulimit -n 1048576
 
 spec_dir=""
-bench_dir="vispec_data/bench_data/"
-result_dir="vispec_data/results/"
+bench_dir="${BENCH_DIR:-${REPO_ROOT}/externals/ViSpec/vispec_data/bench_data/}"
+result_dir="${RESULT_DIR:-${REPO_ROOT}/results/vispec/}"
 result_name=""
 base_model=""
 temperature="1.0"
@@ -42,12 +48,19 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ "${bench_dir}" != /* ]]; then
+  bench_dir="${REPO_ROOT}/${bench_dir}"
+fi
+if [[ "${result_dir}" != /* ]]; then
+  result_dir="${REPO_ROOT}/${result_dir}"
+fi
+
 if [[ -z "$spec_dir" || -z "$result_name" || -z "$base_model" ]]; then
   echo "Error: Missing required parameter."
   exit 1
 fi
 
-python -m vispec.evaluation.gen_baseline_answer_sqa \
+"${PYTHON_BIN}" -u -m vispec.evaluation.gen_baseline_answer_sqa \
 --model-id test \
 --test_split=test \
 --test_number=-1 \
@@ -58,14 +71,14 @@ python -m vispec.evaluation.gen_baseline_answer_sqa \
 --spec-model-path="$spec_dir"  \
 --temperature="$temperature"
 
-python -m vispec.evaluation.gen_baseline_answer_coco_caption \
+"${PYTHON_BIN}" -u -m vispec.evaluation.gen_baseline_answer_coco_caption \
 --base-model-path="$base_model" \
 --model-id test \
 --bench-name="${result_dir}/coco_caption_test/${result_name}/" \
 --spec-model-path="$spec_dir" \
 --temperature="$temperature"
 
-python -m vispec.evaluation.gen_baseline_answer_gqa \
+"${PYTHON_BIN}" -u -m vispec.evaluation.gen_baseline_answer_gqa \
 --base-model-path="$base_model" \
 --model-id test \
 --data-folder="${bench_dir}/gqa/" \
@@ -73,7 +86,7 @@ python -m vispec.evaluation.gen_baseline_answer_gqa \
 --spec-model-path="$spec_dir" \
 --temperature="$temperature"
 
-python -m vispec.evaluation.gen_baseline_answer_mme \
+"${PYTHON_BIN}" -u -m vispec.evaluation.gen_baseline_answer_mme \
 --base-model-path="$base_model" \
 --model-id test \
 --data-folder="${bench_dir}/MME/" \
@@ -81,14 +94,14 @@ python -m vispec.evaluation.gen_baseline_answer_mme \
 --spec-model-path="$spec_dir" \
 --temperature="$temperature"
 
-python -m vispec.evaluation.gen_baseline_answer_mmvet \
+"${PYTHON_BIN}" -u -m vispec.evaluation.gen_baseline_answer_mmvet \
 --base-model-path="$base_model" \
 --model-id test \
 --bench-name="${result_dir}/mmvet_test/${result_name}/" \
 --spec-model-path="$spec_dir" \
 --temperature="$temperature"
 
-python -m vispec.evaluation.gen_baseline_answer_seed_bench \
+"${PYTHON_BIN}" -u -m vispec.evaluation.gen_baseline_answer_seed_bench \
 --base-model-path="$base_model" \
 --model-id test \
 --data-folder="${bench_dir}/seed_bench/" \
@@ -96,7 +109,7 @@ python -m vispec.evaluation.gen_baseline_answer_seed_bench \
 --spec-model-path="$spec_dir" \
 --temperature="$temperature"
 
-python -m vispec.evaluation.gen_baseline_answer_textvqa \
+"${PYTHON_BIN}" -u -m vispec.evaluation.gen_baseline_answer_textvqa \
 --base-model-path="$base_model" \
 --model-id test \
 --bench-name="${result_dir}/textvqa_test/${result_name}/" \
@@ -104,7 +117,7 @@ python -m vispec.evaluation.gen_baseline_answer_textvqa \
 --spec-model-path="$spec_dir" \
 --temperature="$temperature"
 
-python -m vispec.evaluation.gen_baseline_answer_vizwiz \
+"${PYTHON_BIN}" -u -m vispec.evaluation.gen_baseline_answer_vizwiz \
 --base-model-path="$base_model" \
 --model-id test \
 --data-folder="${bench_dir}/vizwiz" \

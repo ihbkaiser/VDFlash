@@ -6,7 +6,7 @@ overwrite the numeric rule result.
 
 Example::
 
-    python -m src.infer.reject_position_audit \
+    "$PYTHON_BIN" -m src.infer.reject_position_audit \
         --input-dir results/infer/qwen25vl_3b_dflash_vdc50_8frames_isolated_20260820 \
         --output-dir results/infer/qwen25vl_3b_dflash_vdc50_8frames_isolated_20260820/reject_position_audit
 
@@ -25,6 +25,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
 from urllib import request as urllib_request
+
+from src.workspace import resolve_workspace_path
 
 
 REGIONS = ("early", "middle", "late")
@@ -826,6 +828,10 @@ def _apply_lm_reviews(records: Sequence[Mapping[str, Any]], args: argparse.Names
 
 
 def run(args: argparse.Namespace) -> dict[str, Path]:
+    args.input_dir = resolve_workspace_path(args.input_dir)
+    args.output_dir = resolve_workspace_path(args.output_dir)
+    if args.lm_responses:
+        args.lm_responses = resolve_workspace_path(args.lm_responses)
     records = extract_rule_rounds(args.input_dir, checkpoint=args.checkpoint)
     if args.lm_backend != "none":
         records = _apply_lm_reviews(records, args)

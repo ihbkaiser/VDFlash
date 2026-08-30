@@ -28,24 +28,29 @@ from .dflash_runtime import (
     input_fingerprint,
 )
 from .run_dflash_attention import run_dflash_context_attention
-from .run_dflash_layers import eager_target_attention, run_qwen25vl_layer_diagnostics
+from .run_dflash_layers import run_qwen25vl_layer_diagnostics
 from .run_dflash_length import run_hidden_visual_retention, run_length_sweep
+from src.workspace import resolve_workspace_path, workspace_path
 
 DFLASH_STAGE_ORDER = ("length", "retention", "attention", "layers", "report")
 DEFAULT_TARGET_MODEL = "Qwen/Qwen2.5-VL-3B-Instruct"
 DEFAULT_CHECKPOINT = "dataset/qwen25vl-3b-dflash-llava68k-latest/training_state.pt"
 DEFAULT_DRAFT_CONFIG = str(
-    Path(__file__).resolve().parents[2]
-    / "train_Dflash_SpecForge"
-    / "configs"
-    / "qwen2.5-vl-3b-dflash.json"
+    workspace_path(
+        "src", "train_Dflash_SpecForge", "configs", "qwen2.5-vl-3b-dflash.json"
+    )
 )
-DEFAULT_MANIFEST = "dataset/VideoDetailCaption/test.jsonl"
-DEFAULT_VIDEO_ROOT = "dataset/VideoDetailCaption"
+DEFAULT_MANIFEST = str(workspace_path("dataset", "VideoDetailCaption", "test.jsonl"))
+DEFAULT_VIDEO_ROOT = str(workspace_path("dataset", "VideoDetailCaption"))
 
 
 def default_output_dir() -> str:
-    return f"results/sparrow_validation_dflash_qwen25vl3b_{date.today().isoformat()}"
+    return str(
+        workspace_path(
+            "results",
+            f"sparrow_validation_dflash_qwen25vl3b_{date.today().isoformat()}",
+        )
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -65,12 +70,33 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", default=default_output_dir())
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--draft-device",
+        default=None,
+        help="DFlash draft/conditioning device; defaults to --device.",
+    )
+    parser.add_argument(
+        "--device-map",
+        choices=("cuda", "auto", "model_parallel"),
+        default="cuda",
+        help="Target-model placement; DFlash prompt/draft stay on --device.",
+    )
+    parser.add_argument(
+        "--max-memory",
+        default=None,
+        help="Per-visible-GPU budgets, for example 0:22GiB,1:14GiB.",
+    )
     parser.add_argument("--dtype", choices=("auto", "bf16", "fp16", "no"), default="auto")
     parser.add_argument("--target-attention", default="sdpa")
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--layer-visual-targets", type=int, nargs="+", default=[3000])
     parser.add_argument("--layer-cut-points", type=int, nargs="+", default=[0, 4, 8, 12, 16, 20, 24])
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--allow-out-of-tolerance",
+        action="store_true",
+        help="Run measured calibration points marked out_of_tolerance.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -83,6 +109,17 @@ def run_dflash_experiments(args: argparse.Namespace) -> dict[str, Any]:
     the MSD command path.
     """
 
+    for name in (
+        "checkpoint",
+        "draft_config",
+        "manifest",
+        "video_root",
+        "calibration_input",
+        "output_dir",
+    ):
+        value = getattr(args, name, None)
+        if value is not None:
+            setattr(args, name, str(resolve_workspace_path(value)))
     output_dir = Path(args.output_dir)
     selected = DFLASH_STAGE_ORDER if args.stage == "all" else (args.stage,)
     plan = {
@@ -93,6 +130,10 @@ def run_dflash_experiments(args: argparse.Namespace) -> dict[str, Any]:
         "draft_config": str(args.draft_config),
         "manifest": str(args.manifest),
         "output_dir": str(output_dir),
+        "allow_out_of_tolerance": bool(args.allow_out_of_tolerance),
+        "device_map": args.device_map,
+        "draft_device": args.draft_device or args.device,
+        "max_memory": args.max_memory,
         "dry_run": bool(args.dry_run),
     }
     if args.dry_run:
@@ -104,11 +145,11 @@ def run_dflash_experiments(args: argparse.Namespace) -> dict[str, Any]:
 
 def _preflight(args: argparse.Namespace) -> dict[str, Any]:
     paths = {
-        "checkpoint": Path(args.checkpoint).expanduser(),
-        "draft_config": Path(args.draft_config).expanduser(),
-        "manifest": Path(args.manifest).expanduser(),
-        "video_root": Path(args.video_root).expanduser(),
-        "calibration_input": Path(args.calibration_input).expanduser(),
+        "checkpoint": resolve_workspace_path(args.checkpoint),
+        "draft_config": resolve_workspace_path(args.draft_config),
+        "manifest": resolve_workspace_path(args.manifest),
+        "video_root": resolve_workspace_path(args.video_root),
+        "calibration_input": resolve_workspace_path(args.calibration_input),
     }
     missing = [str(path) for path in paths.values() if not path.exists()]
     checkpoint = paths["checkpoint"]
@@ -277,27 +318,40 @@ def _sample_record(sample: Any, calibration_rows: list[dict[str, Any]]) -> dict[
 
 
 def _metadata(args: argparse.Namespace) -> dict[str, Any]:
-    return make_dflash_metadata(
+    metadata = make_dflash_metadata(
         target_model=args.target_model,
         draft_checkpoint=str(args.checkpoint),
         draft_config=str(args.draft_config),
         experiment=DFlashExperiment.LENGTH_SWEEP,
         semantic_status=DFlashSemanticStatus.DIRECT,
     )
+    metadata["calibration_policy"] = (
+        "allow_out_of_tolerance" if args.allow_out_of_tolerance else "ok_only"
+    )
+    metadata["device_map"] = args.device_map
+    metadata["draft_device"] = args.draft_device or args.device
+    metadata["max_memory"] = args.max_memory
+    return metadata
 
 
 def _unsupported(error: str, *, input_value: str = "unavailable") -> dict[str, Any]:
     return {"status": "unsupported", "error": error, "input_fingerprint": input_value, "metrics": {}}
 
 
-def _calibration_settings(sample: dict[str, Any], target: int) -> tuple[dict[str, Any] | None, str | None]:
+def _calibration_settings(
+    sample: dict[str, Any],
+    target: int,
+    *,
+    allow_out_of_tolerance: bool = False,
+) -> tuple[dict[str, Any] | None, str | None]:
     point = sample.get("calibration_by_target", {}).get(int(target))
     if point is None:
         return None, f"no calibration point for target_visual_tokens={target}"
-    if point.get("calibration_status", point.get("status")) != "ok":
+    status = point.get("calibration_status", point.get("status"))
+    if status != "ok" and not (allow_out_of_tolerance and status == "out_of_tolerance"):
         return None, (
             f"calibration point target_visual_tokens={target} is not usable: "
-            f"{point.get('calibration_status', point.get('status'))}"
+            f"{status}"
         )
     settings = point.get("candidate_settings")
     if not isinstance(settings, dict):
@@ -313,10 +367,15 @@ def _prepare_prompt(
     video_root: str,
     device: torch.device,
     target_visual_tokens: int,
+    allow_out_of_tolerance: bool = False,
 ):
     from src.infer.qwen25vl_dflash_compare import prepare_video_prompt
 
-    settings, error = _calibration_settings(sample, target_visual_tokens)
+    settings, error = _calibration_settings(
+        sample,
+        target_visual_tokens,
+        allow_out_of_tolerance=allow_out_of_tolerance,
+    )
     if error:
         raise RuntimeError(error)
     prompt = prepare_video_prompt(
@@ -342,6 +401,7 @@ def _decode_prompt(
     processor: Any,
     prompt: Any,
     device: torch.device,
+    draft_device: torch.device | None,
     max_new_tokens: int,
     prefill_transform=None,
     capture_attention: bool = False,
@@ -360,7 +420,12 @@ def _decode_prompt(
         stop_token_ids=_eos_token_ids(processor, target),
         device=device,
     )
-    decoder = InstrumentedDFlashDecoder(target, draft, device=device)
+    decoder = InstrumentedDFlashDecoder(
+        target,
+        draft,
+        device=device,
+        draft_device=draft_device or device,
+    )
     capture_context = capture_dflash_attention(draft) if capture_attention else None
     if capture_context is None:
         context_manager = _null_capture()
@@ -510,6 +575,7 @@ def execute_dflash_stages(args: argparse.Namespace) -> dict[str, Any]:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
+    draft_device = torch.device(args.draft_device or args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable; run DFlash validation on a GPU host")
     samples = load_vdc_manifest(args.manifest, args.video_root)
@@ -542,8 +608,15 @@ def execute_dflash_stages(args: argparse.Namespace) -> dict[str, Any]:
             device=device,
             dtype=dtype,
             attention=args.target_attention,
+            device_map=args.device_map,
+            max_memory=args.max_memory,
         )
-        models["draft"], _ = _load_draft(args.checkpoint, args.draft_config, device=device, dtype=dtype)
+        models["draft"], _ = _load_draft(
+            args.checkpoint,
+            args.draft_config,
+            device=draft_device,
+            dtype=dtype,
+        )
     try:
         if "length" in stage_names and "length" not in completed_stages:
             def length_decode(sample, condition):
@@ -553,12 +626,14 @@ def execute_dflash_stages(args: argparse.Namespace) -> dict[str, Any]:
                         processor=models["processor"], target=models["target"], sample=sample,
                         video_root=args.video_root, device=device,
                         target_visual_tokens=target_tokens,
+                        allow_out_of_tolerance=args.allow_out_of_tolerance,
                     )
                 except Exception as exc:
                     return _unsupported(f"{type(exc).__name__}: {exc}")
                 result = _decode_prompt(
                     target=models["target"], draft=models["draft"], processor=models["processor"], prompt=prompt,
-                    device=device, max_new_tokens=args.max_new_tokens,
+                    device=device, draft_device=draft_device,
+                    max_new_tokens=args.max_new_tokens,
                 )
                 result["input_fingerprint"] = fingerprint
                 result["actual_visual_tokens"] = len(_visual)
@@ -593,7 +668,8 @@ def execute_dflash_stages(args: argparse.Namespace) -> dict[str, Any]:
                 mask = torch.as_tensor(condition["hidden_context_mask"], dtype=torch.bool, device=device)
                 result = _decode_prompt(
                     target=models["target"], draft=models["draft"], processor=models["processor"], prompt=prompt,
-                    device=device, max_new_tokens=args.max_new_tokens,
+                    device=device, draft_device=draft_device,
+                    max_new_tokens=args.max_new_tokens,
                     prefill_transform=lambda hidden: apply_hidden_context_mask(hidden, mask),
                 )
                 result["input_fingerprint"] = f"{sample['full_target_input_fingerprint']}:retention-{condition['retention_percentage']}"
@@ -628,6 +704,7 @@ def execute_dflash_stages(args: argparse.Namespace) -> dict[str, Any]:
                             processor=models["processor"], target=models["target"], sample=sample,
                             video_root=args.video_root, device=device,
                             target_visual_tokens=3000,
+                            allow_out_of_tolerance=args.allow_out_of_tolerance,
                         )
                         sample["context_length"] = int(prompt.inputs["input_ids"].shape[1])
                         sample["visual_positions"] = positions
@@ -667,6 +744,7 @@ def execute_dflash_stages(args: argparse.Namespace) -> dict[str, Any]:
                         processor=models["processor"], target=models["target"], sample=sample,
                         video_root=args.video_root, device=device,
                         target_visual_tokens=int(sample["attention_target"]),
+                        allow_out_of_tolerance=args.allow_out_of_tolerance,
                     )
                     config = getattr(models["draft"], "config", None)
                     previous = getattr(config, "_attn_implementation", None)
@@ -675,7 +753,8 @@ def execute_dflash_stages(args: argparse.Namespace) -> dict[str, Any]:
                     try:
                         result = _decode_prompt(
                             target=models["target"], draft=models["draft"], processor=models["processor"], prompt=prompt,
-                            device=device, max_new_tokens=args.max_new_tokens,
+                            device=device, draft_device=draft_device,
+                            max_new_tokens=args.max_new_tokens,
                             capture_attention=True,
                         )
                     finally:
@@ -732,14 +811,14 @@ def execute_dflash_stages(args: argparse.Namespace) -> dict[str, Any]:
                         processor=models["processor"], target=models["target"], sample=sample,
                         video_root=args.video_root, device=device,
                         target_visual_tokens=int(sample["layer_target"]),
+                        allow_out_of_tolerance=args.allow_out_of_tolerance,
                     )
-                    with eager_target_attention(models["target"]):
-                        diagnostics = _target_side_probe(
-                            target=models["target"], processor=models["processor"], prompt=prompt,
-                            visual_positions=visual, device=device,
-                            max_new_tokens=args.max_new_tokens,
-                            layer_cut_points=args.layer_cut_points,
-                        )
+                    diagnostics = _target_side_probe(
+                        target=models["target"], processor=models["processor"], prompt=prompt,
+                        visual_positions=visual, device=device,
+                        max_new_tokens=args.max_new_tokens,
+                        layer_cut_points=args.layer_cut_points,
+                    )
                     for diagnostic in diagnostics:
                         diagnostic["target_visual_tokens"] = int(sample["layer_target"])
                         diagnostic["input_fingerprint"] = fingerprint
@@ -789,7 +868,15 @@ def execute_dflash_stages(args: argparse.Namespace) -> dict[str, Any]:
                 "draft_checkpoint": str(args.checkpoint),
                 "manifest": str(args.manifest),
                 "device": str(device),
+                "draft_device": str(draft_device),
                 "dtype": args.dtype,
+                "device_map": args.device_map,
+                "max_memory": args.max_memory,
+                "calibration_policy": (
+                    "allow_out_of_tolerance"
+                    if args.allow_out_of_tolerance
+                    else "ok_only"
+                ),
             },
         )
     return {

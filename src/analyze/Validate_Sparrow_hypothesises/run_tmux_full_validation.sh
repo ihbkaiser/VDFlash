@@ -4,11 +4,11 @@
 # run_sparrow_validation_gpu.sh. All stages use the cached Qwen2-VL checkpoints.
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../../../scripts/resolve_workspace.sh"
 cd "$REPO_ROOT"
 
 RUN_DIR="${RUN_DIR:-results/sparrow_validation_tmux_20260815_1643}"
-source "$REPO_ROOT/src/analyze/Validate_Sparrow_hypothesises/activate_msd_env.sh"
 mkdir -p "$RUN_DIR"
 exec > >(tee -a "$RUN_DIR/tmux.log") 2>&1
 

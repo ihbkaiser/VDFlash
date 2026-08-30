@@ -22,13 +22,21 @@ explicitly want the legacy non-enforcing schema audit.
 
 ## First checks
 
-From the repository root:
+From any directory, source the existing workspace environment first. Do not
+create another environment; the resolver sets `PYTHON_BIN` to the one shared
+`.venv` interpreter and derives the workspace-relative paths:
 
 ```bash
-python -m src.analyze.Validate_Sparrow_hypothesises preflight \
+source /path/to/VDFlash/src/analyze/Validate_Sparrow_hypothesises/activate_msd_env.sh
+```
+
+Then run:
+
+```bash
+"$PYTHON_BIN" -m src.analyze.Validate_Sparrow_hypothesises preflight \
   --output results/sparrow_validation/preflight.json
 
-python -m src.analyze.Validate_Sparrow_hypothesises prepare \
+"$PYTHON_BIN" -m src.analyze.Validate_Sparrow_hypothesises prepare \
   --output results/sparrow_validation/planned_manifest.jsonl
 ```
 
@@ -41,7 +49,7 @@ Calibration must happen through the Qwen processor because the real token
 count is determined by `video_grid_thw`, not by FPS alone:
 
 ```bash
-python -m src.analyze.Validate_Sparrow_hypothesises calibrate \
+"$PYTHON_BIN" -m src.analyze.Validate_Sparrow_hypothesises calibrate \
   --limit 2 \
   --output results/sparrow_validation/calibration.jsonl
 ```
@@ -57,7 +65,7 @@ context grid:
 
 ```bash
 HF_HOME=/path/to/hf-cache HF_HUB_OFFLINE=1 \
-python -m src.analyze.Validate_Sparrow_hypothesises calibrate \
+"$PYTHON_BIN" -m src.analyze.Validate_Sparrow_hypothesises calibrate \
   --targets 400 \
   --reuse-calibration results/sparrow_validation_20260818/calibration.jsonl \
   --grid-frames 1,2,3,4,6,8,12,16 \
@@ -68,7 +76,7 @@ python -m src.analyze.Validate_Sparrow_hypothesises calibrate \
 Then create one shared, status=`ok` cohort before any GPU stage:
 
 ```bash
-python -m src.analyze.Validate_Sparrow_hypothesises cohort \
+"$PYTHON_BIN" -m src.analyze.Validate_Sparrow_hypothesises cohort \
   --input results/sparrow_validation_qwen2vl_supplement/calibration.jsonl \
   --output-manifest results/sparrow_validation_qwen2vl_supplement/cohort_manifest.jsonl \
   --output-selection results/sparrow_validation_qwen2vl_supplement/cohort_selection.json
@@ -82,11 +90,11 @@ draft-retention ablation, the query position is not the final instruction, a
 layer intervention is not recorded, or target/speculative token IDs differ.
 
 ```bash
-python -m src.analyze.Validate_Sparrow_hypothesises audit \
+"$PYTHON_BIN" -m src.analyze.Validate_Sparrow_hypothesises audit \
   --input results/sparrow_validation/results.jsonl \
   --output results/sparrow_validation/audit.json
 
-python -m src.analyze.Validate_Sparrow_hypothesises report \
+"$PYTHON_BIN" -m src.analyze.Validate_Sparrow_hypothesises report \
   --input results/sparrow_validation/results.jsonl \
   --output-dir results/sparrow_validation/report
 ```
@@ -200,7 +208,7 @@ resolution.
 After the T4 environment and checkpoints are available, first run one sample:
 
 ```bash
-python -m src.analyze.Validate_Sparrow_hypothesises.run_msd \
+"$PYTHON_BIN" -m src.analyze.Validate_Sparrow_hypothesises.run_msd \
   --limit 1 \
   --output results/sparrow_validation/msd_full_smoke.jsonl
 ```
@@ -209,7 +217,7 @@ The complete MSD runner uses the measured calibration rows and supports both
 the full-input visual-length sweep and the draft-only visual-retention sweep:
 
 ```bash
-python -m src.analyze.Validate_Sparrow_hypothesises msd \
+"$PYTHON_BIN" -m src.analyze.Validate_Sparrow_hypothesises msd \
   --calibration results/sparrow_validation/calibration.jsonl \
   --condition both \
   --output results/sparrow_validation/msd.jsonl
@@ -251,7 +259,7 @@ the JSONL contains disjoint instruction/visual/text positions plus per-visual
 token weights:
 
 ```bash
-python -m src.analyze.Validate_Sparrow_hypothesises attention \
+"$PYTHON_BIN" -m src.analyze.Validate_Sparrow_hypothesises attention \
   --calibration results/sparrow_validation/calibration.jsonl \
   --visual-targets 400 3000 \
   --quantized \
@@ -264,7 +272,7 @@ during its full-context prefill — the only draft forward with an empty KV
 cache inside `topK_genrate`:
 
 ```bash
-python -m src.analyze.Validate_Sparrow_hypothesises draft_attention \
+"$PYTHON_BIN" -m src.analyze.Validate_Sparrow_hypothesises draft_attention \
   --calibration results/sparrow_validation/calibration.jsonl \
   --visual-targets 400 3000 \
   --output results/sparrow_validation/figure2_draft_attention.jsonl
@@ -283,7 +291,7 @@ profile uses the cached Qwen2-VL-7B checkpoint, SDPA attention and bounded
 hooks for hidden states:
 
 ```bash
-python -m src.analyze.Validate_Sparrow_hypothesises layers \
+"$PYTHON_BIN" -m src.analyze.Validate_Sparrow_hypothesises layers \
   --calibration results/sparrow_validation/calibration.jsonl \
   --visual-targets 3000 \
   --experiments both \
@@ -306,7 +314,7 @@ length/retention series, layer probes, merges their JSONL rows, audits them and
 writes the report:
 
 ```bash
-python -m src.analyze.Validate_Sparrow_hypothesises all \
+"$PYTHON_BIN" -m src.analyze.Validate_Sparrow_hypothesises all \
   --output-dir results/sparrow_validation \
   --quantized
 ```

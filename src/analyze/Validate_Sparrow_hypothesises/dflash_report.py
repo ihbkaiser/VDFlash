@@ -55,8 +55,11 @@ def write_dflash_report(
         "",
         f"- Target model: `{model}`",
         f"- Draft checkpoint: `{checkpoint}`",
+        f"- Result rows: **{audit['result_rows']}**",
         f"- Valid rows: **{audit['valid_rows']}**",
+        f"- Mismatch rows: **{audit['mismatch_rows']}**",
         f"- Error rows: **{len(audit['error_rows'])}**",
+        f"- Unsupported rows: **{len(audit['unsupported_rows'])}**",
         f"- Contract-invalid rows: **{len(audit['invalid_rows'])}**",
         f"- Lossless decode rows: **{audit['lossless_rows']}**",
         f"- Coverage valid: **{audit['coverage_valid']}**",
@@ -67,6 +70,15 @@ def write_dflash_report(
         "|---|---:|",
     ]
     for status, count in sorted(audit["semantic_status_counts"].items()):
+        lines.append(f"| `{status}` | {count} |")
+    lines.extend([
+        "",
+        "## Result status",
+        "",
+        "| Status | Rows |",
+        "|---|---:|",
+    ])
+    for status, count in sorted(audit["result_status_counts"].items()):
         lines.append(f"| `{status}` | {count} |")
     lines.extend(["", "## Experiment coverage", "", "| Experiment | Rows |", "|---|---:|"])
     for experiment, count in sorted(audit["experiment_counts"].items()):

@@ -17,9 +17,9 @@
 #   ./run_sparrow_validation_gpu.sh [--limit N] [--skip-calibration] [--skip-msd] ...
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../../../scripts/resolve_workspace.sh"
 cd "$REPO_ROOT"
-source "$REPO_ROOT/src/analyze/Validate_Sparrow_hypothesises/activate_msd_env.sh"
 
 OUTPUT_DIR="${OUTPUT_DIR:-results/sparrow_validation}"
 LOG_PATH="${LOG_PATH:-$OUTPUT_DIR/gpu_run.log}"
@@ -39,7 +39,7 @@ exec > >(tee -a "$LOG_PATH") 2>&1
 
 echo "== Sparrow validation run: $(date -Is) =="
 
-python - <<'PY'
+"$PYTHON_BIN" - <<'PY'
 import torch
 if not torch.cuda.is_available():
     raise SystemExit("CUDA is not available; run this script on the GPU host")
@@ -51,7 +51,7 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 # 1. Calibration is processor-only and needs no GPU model; run it first if the
 #    file is missing (or force with RECALIBRATE=1).
 if [[ ! -s "$OUTPUT_DIR/calibration.jsonl" || "${RECALIBRATE:-0}" == "1" ]]; then
-    python -u -m src.analyze.Validate_Sparrow_hypothesises calibrate \
+    "$PYTHON_BIN" -u -m src.analyze.Validate_Sparrow_hypothesises calibrate \
         --output "$OUTPUT_DIR/calibration.jsonl"
 fi
 
@@ -88,7 +88,7 @@ fi
 # when invoked directly.
 RESUME_FLAGS=(--resume)
 
-python -u -m src.analyze.Validate_Sparrow_hypothesises all \
+"$PYTHON_BIN" -u -m src.analyze.Validate_Sparrow_hypothesises all \
     --output-dir "$OUTPUT_DIR" \
     "${RESUME_FLAGS[@]}" \
     --quantized \

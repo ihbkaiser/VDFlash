@@ -16,13 +16,18 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 import sys
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import torch
 
 from src.analyze.Whether_they_are_appliable_for_dDrafter.compare_dflash_reference import (
     score_pair,
 )
+from src.infer.qwen25vl_dflash_parallel import (
+    build_qwen25vl_model_parallel_map,
+    parse_max_memory,
+)
+from src.workspace import resolve_workspace_path, workspace_path
 
 
 def _now(device: torch.device) -> float:
@@ -31,7 +36,12 @@ def _now(device: torch.device) -> float:
     return time.perf_counter()
 
 
-def _extract_context_feature(hidden_states: Any, layer_ids: list[int]) -> torch.Tensor:
+def _extract_context_feature(
+    hidden_states: Any,
+    layer_ids: list[int],
+    *,
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
     if hidden_states is None:
         raise RuntimeError("target forward did not return hidden_states")
     try:
@@ -40,7 +50,103 @@ def _extract_context_feature(hidden_states: Any, layer_ids: list[int]) -> torch.
         raise RuntimeError(
             "target hidden_states do not contain the configured DFlash layers"
         ) from exc
+    if device is not None:
+        selected = [value.to(device=device) for value in selected]
     return torch.cat(selected, dim=-1)
+
+
+def _target_decoder_layers(target: Any) -> Any:
+    """Return the target decoder layer collection for Qwen-style models."""
+
+    candidates = (
+        getattr(getattr(getattr(target, "model", None), "language_model", None), "layers", None),
+        getattr(getattr(target, "language_model", None), "layers", None),
+        getattr(getattr(target, "model", None), "layers", None),
+        getattr(target, "layers", None),
+    )
+    for layers in candidates:
+        if layers is not None:
+            return layers
+    raise AttributeError(
+        f"target model {type(target).__name__} does not expose decoder layers"
+    )
+
+
+@contextmanager
+def _capture_target_hidden_states(
+    target: Any,
+    layer_ids: list[int] | tuple[int, ...],
+    *,
+    device: torch.device | str,
+) -> Iterator[dict[int, torch.Tensor]]:
+    """Capture only selected decoder outputs during one target forward.
+
+    Qwen's ``hidden_states`` output retains every layer activation.  DFlash
+    only consumes a fixed ordered subset, so hooks avoid materializing the
+    unused activations for long visual prompts.
+    """
+
+    layers = _target_decoder_layers(target)
+    normalized_ids = [int(layer_id) for layer_id in layer_ids]
+    if len(set(normalized_ids)) != len(normalized_ids):
+        raise ValueError("target layer IDs must be unique")
+    if any(layer_id < 0 or layer_id >= len(layers) for layer_id in normalized_ids):
+        raise ValueError(
+            f"target layer IDs must be within [0, {len(layers) - 1}], got {normalized_ids}"
+        )
+
+    captured: dict[int, torch.Tensor] = {}
+    handles = []
+
+    def make_hook(layer_id: int):
+        def hook(_module: Any, _inputs: Any, output: Any):
+            hidden = output[0] if isinstance(output, (tuple, list)) else output
+            if not torch.is_tensor(hidden):
+                raise TypeError(
+                    f"target decoder layer {layer_id} did not return a hidden-state tensor"
+                )
+            captured[layer_id] = hidden.detach().to(device=device)
+
+        return hook
+
+    try:
+        for layer_id in normalized_ids:
+            handles.append(layers[layer_id].register_forward_hook(make_hook(layer_id)))
+        yield captured
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+def _concat_captured_target_hidden(
+    captured: dict[int, torch.Tensor],
+    layer_ids: list[int] | tuple[int, ...],
+) -> torch.Tensor:
+    """Concatenate selected target hidden states in DFlash channel order."""
+
+    missing = [int(layer_id) for layer_id in layer_ids if int(layer_id) not in captured]
+    if missing:
+        raise RuntimeError(f"target forward did not capture hidden states for layers {missing}")
+    return torch.cat([captured[int(layer_id)] for layer_id in layer_ids], dim=-1)
+
+
+def _module_device(module: Any, fallback: torch.device) -> torch.device:
+    """Find a module's first parameter/buffer device, with a safe fallback."""
+
+    for parameter in module.parameters(recurse=True):
+        return parameter.device
+    for buffer in module.buffers(recurse=True):
+        return buffer.device
+    return fallback
+
+
+def _move_tensor_kwargs(kwargs: dict[str, Any], device: torch.device) -> dict[str, Any]:
+    """Move top-level tensor model inputs without touching scalar metadata."""
+
+    return {
+        key: value.to(device=device) if torch.is_tensor(value) else value
+        for key, value in kwargs.items()
+    }
 
 
 def _configured_token_ids(target: Any, names: tuple[str, ...]) -> set[int]:
@@ -344,11 +450,13 @@ class InstrumentedDFlashDecoder:
         draft: Any,
         *,
         device: torch.device,
+        draft_device: torch.device | str | None = None,
         token_decoder: Callable[[list[int]], str] | None = None,
     ):
         self.target = target
         self.draft = draft
         self.device = torch.device(device)
+        self.draft_device = torch.device(draft_device or device)
         self.token_decoder = token_decoder
 
     def _decode_token_ids(self, token_ids: list[int]) -> str:
@@ -365,6 +473,37 @@ class InstrumentedDFlashDecoder:
             fallback = dict(kwargs)
             fallback.pop("logits_to_keep", None)
             return self.target(**fallback)
+
+    def _target_forward_with_context(
+        self,
+        kwargs: dict[str, Any],
+    ) -> tuple[Any, torch.Tensor]:
+        """Run target forward while retaining only DFlash's selected layers."""
+
+        layer_ids = [int(value) for value in self.draft.target_layer_ids]
+        capture_kwargs = dict(kwargs)
+        capture_kwargs["output_hidden_states"] = False
+        try:
+            with _capture_target_hidden_states(
+                self.target,
+                layer_ids,
+                device=self.draft_device,
+            ) as captured:
+                output = self._target_forward(capture_kwargs)
+        except AttributeError:
+            # Small test doubles and legacy target wrappers may not expose
+            # decoder modules. Preserve their old hidden_states contract while
+            # real Qwen models use the memory-bounded hook path above.
+            fallback_kwargs = dict(kwargs)
+            fallback_kwargs["output_hidden_states"] = True
+            output = self._target_forward(fallback_kwargs)
+            context = _extract_context_feature(
+                output.hidden_states,
+                layer_ids,
+                device=self.draft_device,
+            )
+            return output, context
+        return output, _concat_captured_target_hidden(captured, layer_ids)
 
     def _extend_positions(self, position_ids: torch.Tensor, total_length: int) -> torch.Tensor:
         return _extend_position_ids(position_ids, total_length, self.device)
@@ -412,7 +551,7 @@ class InstrumentedDFlashDecoder:
         target_cache = _new_cache()
         draft_cache = None if cut_context else _new_cache()
         stop_ids = _as_stop_set(stop_token_ids)
-        target_kwargs = dict(target_kwargs or {})
+        target_kwargs = _move_tensor_kwargs(dict(target_kwargs or {}), self.device)
         output_ids = torch.full(
             (1, max_length + block_size),
             mask_token_id,
@@ -433,21 +572,21 @@ class InstrumentedDFlashDecoder:
                 "cache_position": torch.arange(prompt_length, device=self.device),
                 "use_cache": True,
                 "logits_to_keep": 1,
-                "output_hidden_states": True,
                 "return_dict": True,
             }
         )
         prefill_started = _now(self.device)
-        target_output = self._target_forward(prefill_kwargs)
+        target_output, target_hidden = self._target_forward_with_context(prefill_kwargs)
         prefill_s = _now(self.device) - prefill_started
         target_calls = 1
         if getattr(target_output, "past_key_values", None) is not None:
             target_cache = target_output.past_key_values
         target_embed = self.target.get_input_embeddings()
-        target_hidden = _extract_context_feature(
-            target_output.hidden_states,
-            [int(value) for value in self.draft.target_layer_ids],
-        )
+        target_embed_device = _module_device(target_embed, self.device)
+        target_lm_head = getattr(self.target, "lm_head", None)
+        if target_lm_head is None:
+            target_lm_head = self.target.get_output_embeddings()
+        target_lm_head_device = _module_device(target_lm_head, self.device)
         if prefill_target_hidden_transform is not None:
             transformed_hidden = prefill_target_hidden_transform(target_hidden)
             if (
@@ -471,11 +610,13 @@ class InstrumentedDFlashDecoder:
                 "cut target hidden length must equal the number of kept context positions"
             )
         cut_prompt_positions = (
-            all_positions[..., :prompt_length][..., prefill_target_context_keep_mask]
+            all_positions[..., :prompt_length][..., prefill_target_context_keep_mask].to(
+                device=self.draft_device
+            )
             if cut_context
             else None
         )
-        pending_anchor = target_output.logits[:, -1:, :].argmax(dim=-1)
+        pending_anchor = target_output.logits[:, -1:, :].argmax(dim=-1).to(self.device)
         output_ids[:, prompt_length : prompt_length + 1] = pending_anchor
         decode_started = _now(self.device)
 
@@ -500,12 +641,16 @@ class InstrumentedDFlashDecoder:
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = all_positions[..., start : start + block_size]
             draft_started = _now(self.device)
-            noise_embedding = target_embed(block_output_ids)
+            noise_embedding = target_embed(
+                block_output_ids.to(device=target_embed_device)
+            ).to(device=self.draft_device)
             if cut_context:
                 draft_position_ids = torch.cat(
                     [
                         cut_prompt_positions,
-                        all_positions[..., prompt_length : start + block_size],
+                        all_positions[
+                            ..., prompt_length : start + block_size
+                        ].to(device=self.draft_device),
                     ],
                     dim=-1,
                 )
@@ -515,7 +660,7 @@ class InstrumentedDFlashDecoder:
                 draft_position_ids = all_positions[
                     ...,
                     _cache_length(draft_cache) : start + block_size,
-                ]
+                ].to(device=self.draft_device)
                 draft_past_key_values = draft_cache
                 draft_use_cache = True
             draft_hidden = self.draft(
@@ -530,14 +675,14 @@ class InstrumentedDFlashDecoder:
                 _crop_cache(draft_cache, start)
             proposals = self.draft._sample_draft_tokens(
                 self.target,
-                draft_hidden,
-                block_output_ids,
-            )
+                draft_hidden.to(device=target_lm_head_device),
+                block_output_ids.to(device=target_lm_head_device),
+            ).to(device=self.device)
             draft_s += _now(self.device) - draft_started
             block_output_ids[:, 1:] = proposals
 
             verify_started = _now(self.device)
-            target_output = self._target_forward(
+            target_output, new_target_hidden = self._target_forward_with_context(
                 {
                     "input_ids": block_output_ids,
                     "position_ids": block_position_ids,
@@ -546,7 +691,6 @@ class InstrumentedDFlashDecoder:
                         start, start + block_output_ids.shape[1], device=self.device
                     ),
                     "use_cache": True,
-                    "output_hidden_states": True,
                     "return_dict": True,
                 }
             )
@@ -554,7 +698,7 @@ class InstrumentedDFlashDecoder:
             target_calls += 1
             if getattr(target_output, "past_key_values", None) is not None:
                 target_cache = target_output.past_key_values
-            posterior = target_output.logits.argmax(dim=-1)
+            posterior = target_output.logits.argmax(dim=-1).to(self.device)
             proposal_matches = block_output_ids[:, 1:] == posterior[:, :-1]
             accepted = int(proposal_matches.cumprod(dim=1).sum(dim=1)[0].item())
             emitted = accepted + 1
@@ -565,10 +709,7 @@ class InstrumentedDFlashDecoder:
             next_anchor_token_id = int(posterior[0, accepted].item())
             start += emitted
             _crop_cache(target_cache, start)
-            new_target_hidden = _extract_context_feature(
-                target_output.hidden_states,
-                [int(value) for value in self.draft.target_layer_ids],
-            )[:, :emitted, :]
+            new_target_hidden = new_target_hidden[:, :emitted, :]
             if cut_context:
                 target_hidden = torch.cat([target_hidden, new_target_hidden], dim=1)
             else:
@@ -882,18 +1023,15 @@ __all__ = [
 
 DEFAULT_TARGET_MODEL = "Qwen/Qwen2.5-VL-3B-Instruct"
 DEFAULT_DRAFT_CONFIG = (
-    Path(__file__).resolve().parents[1]
-    / "train_Dflash_SpecForge"
-    / "configs"
-    / "qwen2.5-vl-3b-dflash.json"
+    workspace_path("src", "train_Dflash_SpecForge", "configs", "qwen2.5-vl-3b-dflash.json")
 )
 DEFAULT_CHECKPOINTS = (
-    Path("dataset/qwen25vl-3b-dflash-llava68k-latest"),
-    Path("dataset/qwen25vl-3b-dflash-sharegpt68k-latest"),
+    workspace_path("dataset", "qwen25vl-3b-dflash-llava68k-latest"),
+    workspace_path("dataset", "qwen25vl-3b-dflash-sharegpt68k-latest"),
 )
-DEFAULT_MANIFEST = Path("dataset/VideoDetailCaption/test.jsonl")
-DEFAULT_VIDEO_ROOT = Path("dataset/VideoDetailCaption")
-DEFAULT_OUTPUT = Path("results/infer/qwen25vl_3b_dflash_vdc_sample0.json")
+DEFAULT_MANIFEST = workspace_path("dataset", "VideoDetailCaption", "test.jsonl")
+DEFAULT_VIDEO_ROOT = workspace_path("dataset", "VideoDetailCaption")
+DEFAULT_OUTPUT = workspace_path("results", "infer", "qwen25vl_3b_dflash_vdc_sample0.json")
 
 
 @dataclass(frozen=True)
@@ -933,11 +1071,37 @@ def _load_target(
     device: torch.device,
     dtype: torch.dtype,
     attention: str,
+    device_map: str | dict[str, int] = "cuda",
+    max_memory: str | dict[int, str] | None = None,
 ) -> tuple[Any, Any, float]:
     from transformers import AutoProcessor
 
     started = _now(device)
     processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+    resolved_device_map: str | dict[str, int] = device_map
+    dispatch_managed = device_map != "cuda"
+    if device_map == "model_parallel":
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        text_config = getattr(config, "text_config", config)
+        layer_count = getattr(text_config, "num_hidden_layers", None)
+        if layer_count is None:
+            raise ValueError(
+                "Qwen2.5-VL config does not expose text_config.num_hidden_layers"
+            )
+        resolved_device_map = build_qwen25vl_model_parallel_map(int(layer_count))
+
+    load_kwargs: dict[str, Any] = {
+        "low_cpu_mem_usage": True,
+        "attn_implementation": attention,
+        "trust_remote_code": True,
+    }
+    if dispatch_managed:
+        load_kwargs["device_map"] = resolved_device_map
+        parsed_max_memory = parse_max_memory(max_memory)
+        if parsed_max_memory is not None:
+            load_kwargs["max_memory"] = parsed_max_memory
     try:
         from transformers import AutoModelForImageTextToText
 
@@ -948,9 +1112,7 @@ def _load_target(
         target = model_cls.from_pretrained(
             model_path,
             dtype=dtype,
-            low_cpu_mem_usage=True,
-            attn_implementation=attention,
-            trust_remote_code=True,
+            **load_kwargs,
         )
     except (AttributeError, TypeError, ValueError):
         try:
@@ -960,11 +1122,11 @@ def _load_target(
         target = fallback_cls.from_pretrained(
             model_path,
             torch_dtype=dtype,
-            low_cpu_mem_usage=True,
-            attn_implementation=attention,
-            trust_remote_code=True,
+            **load_kwargs,
         )
-    target.to(device=device, dtype=dtype).eval()
+    if not dispatch_managed:
+        target.to(device=device, dtype=dtype)
+    target.eval()
     for parameter in target.parameters():
         parameter.requires_grad_(False)
     return processor, target, _now(device) - started
@@ -1336,6 +1498,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--sample-index", type=int, default=0)
     parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="limit --all-samples mode to the first N manifest records (use 1 for smoke)",
+    )
+    parser.add_argument(
         "--all-samples",
         action="store_true",
         help="run every non-empty manifest record and write one report per sample",
@@ -1346,7 +1514,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("results/infer/qwen25vl_3b_dflash_vdc50"),
+        default=workspace_path("results", "infer", "qwen25vl_3b_dflash_vdc50"),
         help="directory for per-sample reports in --all-samples mode",
     )
     parser.add_argument(
@@ -1387,7 +1555,21 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_path_arguments(args: argparse.Namespace) -> argparse.Namespace:
+    """Make all repository-relative inference paths independent of ``cwd``."""
+
+    for name in ("manifest", "video_root", "draft_config", "output", "output_dir"):
+        value = getattr(args, name, None)
+        if value is not None:
+            setattr(args, name, resolve_workspace_path(value))
+    checkpoints = getattr(args, "checkpoint", None)
+    if checkpoints:
+        args.checkpoint = [resolve_workspace_path(value) for value in checkpoints]
+    return args
+
+
 def run_comparison(args: argparse.Namespace) -> dict[str, Any]:
+    _resolve_path_arguments(args)
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable; run this comparison on a GPU host")
@@ -2037,7 +2219,12 @@ def write_mvbench_report(
 def run_all_comparisons(args: argparse.Namespace) -> dict[str, Any]:
     """Run and persist every manifest sample, keeping mismatch diagnostics."""
 
+    _resolve_path_arguments(args)
     records = load_manifest_records(args.manifest)
+    if getattr(args, "limit", None) is not None:
+        if args.limit < 0:
+            raise ValueError("--limit must be non-negative")
+        records = records[: args.limit]
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     entries: list[dict[str, Any]] = []
@@ -2191,7 +2378,7 @@ def _print_report(report: dict[str, Any]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    args = _resolve_path_arguments(build_parser().parse_args(argv))
     if args.all_samples:
         summary = run_all_comparisons(args)
         return 0 if summary["run_completed"] else 1

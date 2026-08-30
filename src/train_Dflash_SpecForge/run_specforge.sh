@@ -2,6 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../../scripts/resolve_workspace.sh"
 cd "${SCRIPT_DIR}"
 
 # SpecForge imports its package by the top-level name ``specforge``.  Keeping
@@ -13,4 +14,4 @@ else
   export PYTHONPATH="${SCRIPT_DIR}"
 fi
 
-exec python -m specforge.cli "$@"
+exec "${PYTHON_BIN}" -m specforge.cli "$@"

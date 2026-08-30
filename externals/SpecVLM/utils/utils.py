@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import torch
+from pathlib import Path
 
 from datasets import load_dataset, concatenate_datasets
 import av
@@ -13,6 +14,27 @@ from models.processing_qwen2_5_vl import Qwen2_5_VLProcessor
 from qwen_vl_utils import process_vision_info
 
 # from visualize import *
+
+
+def _resolve_vdc_video_path(data_path, data_instance):
+    """Resolve VDC video names from the configured dataset root."""
+
+    root = Path(data_path).expanduser()
+    candidates = []
+    for field in ("local_video_path", "archive_member", "video_path"):
+        value = data_instance.get(field)
+        if isinstance(value, str) and value:
+            candidate = Path(value).expanduser()
+            candidates.append(candidate if candidate.is_absolute() else root / candidate)
+    video_name = data_instance.get("video_name")
+    if isinstance(video_name, str) and video_name:
+        for suffix in (".mp4", ".mkv", ".MP4", ".MKV"):
+            candidates.append(root / "Test_Videos" / f"{video_name}{suffix}")
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    shown = ", ".join(str(candidate) for candidate in candidates[:6])
+    raise FileNotFoundError(f"VideoDetailCaption video not found; tried: {shown}")
 
 
 def load_model(model_type, base_model_path, draft_model_path):
@@ -59,19 +81,26 @@ def load_model(model_type, base_model_path, draft_model_path):
 
 def load_data(task, data_num, data_path):
     if task == "VideoDetailCaption":
-        data_video = load_dataset(
-                "/ycji/datasets/VideoDetailCaption",
-                split="test",
-                # cache_dir=cache_dir,
-            ).shuffle(seed=42).select(range(data_num))
+        local_root = Path(data_path).expanduser()
+        local_json = local_root / "test.jsonl"
+        if local_json.exists():
+            from datasets import Dataset
+
+            data_video = Dataset.from_json(str(local_json))
+        else:
+            data_video = load_dataset(str(local_root), split="test")
 
         video_dir = os.path.join(data_path, "Test_Videos/")
-        def video_exists(example):
-            video_path = os.path.join(video_dir, f"{example['video_name']}.mp4")
-            return os.path.exists(video_path)
 
-        filtered_data = data_video.filter(video_exists)
-        data_video = filtered_data
+        def video_exists(example):
+            video_name = example["video_name"]
+            return any(
+                (Path(video_dir) / f"{video_name}{suffix}").exists()
+                for suffix in (".mp4", ".mkv", ".MP4", ".MKV")
+            )
+
+        data_video = data_video.filter(video_exists).shuffle(seed=42)
+        data_video = data_video.select(range(min(int(data_num), len(data_video))))
     elif task == 'MVBench':
         data_video_1 = load_dataset(
                 "",
@@ -541,9 +570,7 @@ def clip_input(processor, data_instance):
 def clip_input_video(processor, task, data_instance, frame_num=64, model_type='llava_ov',data_path=None):
     if model_type == 'llava_ov':
         if task == "VideoDetailCaption":
-            video_path = os.path.join(data_path, "Test_Videos/")
-            video_name = data_instance["video_name"]
-            video_path = video_path + video_name + ".mp4"
+            video_path = _resolve_vdc_video_path(data_path, data_instance)
 
             question = data_instance["question"]
             conversation = [
@@ -647,9 +674,7 @@ def clip_input_video(processor, task, data_instance, frame_num=64, model_type='l
             return required_fps
 
         if task == "VideoDetailCaption":
-            video_path = os.path.join(data_path, "Test_Videos/")
-            video_name = data_instance["video_name"]
-            video_path = video_path + video_name + ".mp4"
+            video_path = _resolve_vdc_video_path(data_path, data_instance)
             question = data_instance["question"]
         
         elif task == "MVBench":

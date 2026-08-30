@@ -18,10 +18,14 @@ def audit_dflash_rows(
 
     invalid_rows: list[dict[str, Any]] = []
     error_rows: list[dict[str, Any]] = []
+    unsupported_rows: list[dict[str, Any]] = []
     valid_rows = 0
+    result_rows = 0
     lossless_rows = 0
+    mismatch_rows = 0
     semantic_status_counts: dict[str, int] = defaultdict(int)
     experiment_counts: dict[str, int] = defaultdict(int)
+    result_status_counts: dict[str, int] = defaultdict(int)
     retention_fingerprints: dict[str, set[str]] = defaultdict(set)
     valid_materialized: list[dict[str, Any]] = []
 
@@ -32,7 +36,15 @@ def audit_dflash_rows(
                 {"index": index, "sample_id": row.get("sample_id"), "errors": errors}
             )
             continue
-        if row.get("status") in {"error", "unsupported"}:
+        result_rows += 1
+        status = str(row.get("status") or "ok")
+        experiment = str(row["experiment"])
+        result_status_counts[status] += 1
+        semantic_status_counts[str(row["semantic_status"])] += 1
+        experiment_counts[experiment] += 1
+        if status == "mismatch":
+            mismatch_rows += 1
+        if row.get("status") == "error":
             error_rows.append(
                 {
                     "index": index,
@@ -42,13 +54,19 @@ def audit_dflash_rows(
                 }
             )
             continue
+        if row.get("status") == "unsupported":
+            unsupported_rows.append(
+                {
+                    "index": index,
+                    "sample_id": row.get("sample_id"),
+                    "experiment": row.get("experiment"),
+                    "reason": row.get("error", row.get("status")),
+                }
+            )
+            continue
 
         valid_rows += 1
         valid_materialized.append(dict(row))
-        status = str(row["semantic_status"])
-        experiment = str(row["experiment"])
-        semantic_status_counts[status] += 1
-        experiment_counts[experiment] += 1
         if row.get("target_output_ids") is not None and row.get("speculative_output_ids") is not None:
             if row["target_output_ids"] == row["speculative_output_ids"]:
                 lossless_rows += 1
@@ -84,10 +102,14 @@ def audit_dflash_rows(
         if missing:
             coverage_gaps[key] = missing
     return {
+        "result_rows": result_rows,
         "valid_rows": valid_rows,
         "invalid_rows": invalid_rows,
         "error_rows": error_rows,
+        "unsupported_rows": unsupported_rows,
+        "mismatch_rows": mismatch_rows,
         "lossless_rows": lossless_rows,
+        "result_status_counts": dict(result_status_counts),
         "semantic_status_counts": dict(semantic_status_counts),
         "experiment_counts": dict(experiment_counts),
         "retention_fingerprint_errors": retention_fingerprint_errors,

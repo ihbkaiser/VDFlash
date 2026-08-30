@@ -4,11 +4,11 @@
 # GPUs, not two independent full-model workers.
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../../../scripts/resolve_workspace.sh"
 cd "$REPO_ROOT"
-source "$REPO_ROOT/src/analyze/Validate_Sparrow_hypothesises/activate_msd_env.sh"
 
-PYTHON="${PYTHON:-$REPO_ROOT/.venv-msd/bin/python}"
+PYTHON="$PYTHON_BIN"
 GPUS="${GPUS:-0,1}"
 MANIFEST="dataset/VideoDetailCaption/subset_manifest.jsonl"
 DATASET_ROOT="dataset/VideoDetailCaption"

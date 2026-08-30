@@ -61,3 +61,4 @@ docs/superpowers/
 .venv-msd
 .jspace/
 data/
+.serena/

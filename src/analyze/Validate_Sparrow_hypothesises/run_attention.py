@@ -11,6 +11,8 @@ from typing import Any
 
 import torch
 
+from src.workspace import resolve_namespace_paths
+
 from .dataset import load_vdc_manifest, qwen2vl_video_token_count, write_jsonl
 from .model_analysis import (
     capture_query_attention,
@@ -90,6 +92,14 @@ def _grid_count(batch: Any) -> int | None:
 
 
 def run(args: argparse.Namespace) -> int:
+    resolve_namespace_paths(
+        args,
+        "contract",
+        "manifest",
+        "dataset_root",
+        "output",
+        "calibration",
+    )
     try:
         require_cuda()
     except RuntimeUnavailableError as exc:

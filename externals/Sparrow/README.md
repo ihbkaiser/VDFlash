@@ -27,11 +27,22 @@ We provide several pre-trained model checkpoints on Hugging Face (see the **Weig
 
 Evaluate the inference speed of the model using both standard autoregressive decoding (baseline) and speculative decoding.
 
+For this checkout, use the portable wrapper from any working directory after
+sourcing the existing shared environment:
+
+```bash
+source /path/to/VDFlash/src/analyze/Validate_Sparrow_hypothesises/activate_msd_env.sh
+externals/Sparrow/run_all_videodetailcaption_qwen2_5_vl.sh \
+  --base-model-path Qwen/Qwen2.5-VL-7B-Instruct \
+  --spec-model-path <path_to_your_model_directory> \
+  --data-path dataset/VideoDetailCaption --data-num 1 --gpu-ids 0
+```
+
 
 #### Baseline Speed Evaluation
 
 ```bash
-python -m sparrow.evaluation.gen_baseline_answer_video \
+"$PYTHON_BIN" -m sparrow.evaluation.gen_baseline_answer_video \
   --base-model-path Qwen/Qwen2.5-VL-7B-Instruct \
   --spec-model-path <path_to_your_model_directory> \
   --model-id test \
@@ -59,7 +70,7 @@ python -m sparrow.evaluation.gen_baseline_answer_video \
 #### Speculative Decoding Speed Evaluation
 
 ```bash
-python -m sparrow.evaluation.gen_spec_answer_video \
+"$PYTHON_BIN" -m sparrow.evaluation.gen_spec_answer_video \
   --base-model-path Qwen/Qwen2.5-VL-7B-Instruct \
   --spec-model-path=<path_to_your_model_directory> \
   --model-id test \
@@ -90,4 +101,4 @@ python -m sparrow.evaluation.gen_spec_answer_video \
 
 ## Acknowledgements
 
-We would like to acknowledge the foundational work of previous projects that inspired our approach, especially [EAGLE](https://github.com/SafeAILab/EAGLE), [ViSpec](https://github.com/KangJialiang/ViSpec), [MSD](https://github.com/Lyn-Lucy/MSD) and [SpecVLM](https://github.com/zju-jiyicheng/SpecVLM). 
+We would like to acknowledge the foundational work of previous projects that inspired our approach, especially [EAGLE](https://github.com/SafeAILab/EAGLE), [ViSpec](https://github.com/KangJialiang/ViSpec), [MSD](https://github.com/Lyn-Lucy/MSD) and [SpecVLM](https://github.com/zju-jiyicheng/SpecVLM).

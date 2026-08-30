@@ -27,6 +27,7 @@ from .figure3_pipeline import (
     write_figure3_metadata,
 )
 from .paper_contract import load_contract
+from src.workspace import resolve_workspace_path, workspace_python
 
 
 PACKAGE = "src.analyze.Validate_Sparrow_hypothesises"
@@ -213,7 +214,19 @@ def _run_current_figure3(
 
 
 def run(args: argparse.Namespace) -> int:
-    root = Path(args.repo_root).resolve()
+    root = resolve_workspace_path(args.repo_root)
+    expected_python = workspace_python(root)
+    actual_python = Path(sys.executable)
+    if not expected_python.is_file():
+        raise SystemExit(
+            "The shared workspace environment is missing: "
+            f"{expected_python}"
+        )
+    if not actual_python.samefile(expected_python):
+        raise SystemExit(
+            "This orchestrator must be launched with the shared workspace "
+            f"interpreter {expected_python}; got {actual_python}"
+        )
     output_dir = root / args.output_dir
     if output_dir.exists() and any(output_dir.iterdir()) and not args.resume:
         raise SystemExit(

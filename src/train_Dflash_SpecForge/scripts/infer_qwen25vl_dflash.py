@@ -5,9 +5,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import torch
+
+_WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+_SPECFORGE_ROOT = _WORKSPACE_ROOT / "src" / "train_Dflash_SpecForge"
+for _import_root in (_WORKSPACE_ROOT, _SPECFORGE_ROOT):
+    if str(_import_root) not in sys.path:
+        sys.path.insert(0, str(_import_root))
+
+from src.workspace import resolve_workspace_path, workspace_path
 
 from specforge.export.checkpoint_io import materialize_draft, resolve_training_state
 from specforge.qwen25vl import prepare_inference_prompt
@@ -40,7 +49,14 @@ def _load_target(path: str):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target-model-path", required=True)
-    parser.add_argument("--draft-model-config", default="configs/qwen2.5-vl-3b-dflash.json")
+    parser.add_argument(
+        "--draft-model-config",
+        default=str(
+            workspace_path(
+                "src", "train_Dflash_SpecForge", "configs", "qwen2.5-vl-3b-dflash.json"
+            )
+        ),
+    )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--image-root", required=True)
@@ -57,6 +73,10 @@ def _move(value, device):
 
 def main() -> int:
     args = parse_args()
+    args.draft_model_config = str(resolve_workspace_path(args.draft_model_config))
+    args.checkpoint = str(resolve_workspace_path(args.checkpoint))
+    args.manifest = resolve_workspace_path(args.manifest)
+    args.image_root = resolve_workspace_path(args.image_root)
     records = [
         json.loads(line)
         for line in Path(args.manifest).read_text(encoding="utf-8").splitlines()
@@ -129,7 +149,9 @@ def main() -> int:
             f"target_shape={tuple(target_new.shape)} speculative_shape={tuple(speculative_new.shape)}"
         )
     text = processor.tokenizer.decode(target_new[0], skip_special_tokens=True)
-    print(json.dumps({"sample_id": records[args.sample_index]["id"], "text": text}, ensure_ascii=False))
+    sample = records[args.sample_index]
+    sample_id = sample.get("id") or sample.get("sample_id") or sample.get("video_name")
+    print(json.dumps({"sample_id": sample_id, "text": text}, ensure_ascii=False))
     return 0
 
 

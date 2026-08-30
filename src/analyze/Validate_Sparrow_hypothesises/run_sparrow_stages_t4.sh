@@ -8,7 +8,8 @@
 # Usage: ./run_sparrow_stages_t4.sh [--limit N] [--skip-msd] ...
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../../../scripts/resolve_workspace.sh"
 cd "$REPO_ROOT"
 
 OUTPUT_DIR="${OUTPUT_DIR:-results/sparrow_validation}"
@@ -26,7 +27,7 @@ EXTRA_ARGS=("$@")
 
 echo "== Sparrow T4 stages: $(date -Is) =="
 
-python - <<'PY'
+"$PYTHON_BIN" - <<'PY'
 import torch
 assert torch.cuda.is_available(), "CUDA is not available"
 print(f"GPU: {torch.cuda.get_device_name(0)}")
@@ -55,7 +56,7 @@ CAL_ARGS=(--calibration "$CALIBRATION" --allow-out-of-tolerance --visual-targets
 echo "== stage msd (Figure 1a+1b, milestones 400/3000) $(date -Is) =="
 # The msd runner is idempotent: it resumes completed jobs from the output
 # file (incremental write), so re-running after a pause is cheap.
-python -u -m src.analyze.Validate_Sparrow_hypothesises msd \
+"$PYTHON_BIN" -u -m src.analyze.Validate_Sparrow_hypothesises msd \
     "${CAL_ARGS[@]}" --condition both \
     --output "$MSD_OUT" "${EXTRA_ARGS[@]}" \
     > "$LOG_DIR/msd.log" 2>&1 || { echo "msd FAILED"; tail -20 "$LOG_DIR/msd.log"; exit 1; }
@@ -64,7 +65,7 @@ if [[ -s "$ATTENTION_OUT" ]]; then
     echo "skip attention (exists)"
 else
     echo "== stage attention (Figure 2 target proxy) $(date -Is) =="
-    python -u -m src.analyze.Validate_Sparrow_hypothesises attention \
+    "$PYTHON_BIN" -u -m src.analyze.Validate_Sparrow_hypothesises attention \
         "${CAL_ARGS[@]}" --quantized \
         --output "$ATTENTION_OUT" "${EXTRA_ARGS[@]}" \
         > "$LOG_DIR/attention.log" 2>&1 || { echo "attention FAILED"; tail -20 "$LOG_DIR/attention.log"; exit 1; }
@@ -74,7 +75,7 @@ if [[ -s "$DRAFT_ATTENTION_OUT" ]]; then
     echo "skip draft_attention (exists)"
 else
     echo "== stage draft_attention (Figure 2 MSD draft) $(date -Is) =="
-    python -u -m src.analyze.Validate_Sparrow_hypothesises draft_attention \
+    "$PYTHON_BIN" -u -m src.analyze.Validate_Sparrow_hypothesises draft_attention \
         "${CAL_ARGS[@]}" \
         --output "$DRAFT_ATTENTION_OUT" "${EXTRA_ARGS[@]}" \
         > "$LOG_DIR/draft_attention.log" 2>&1 || { echo "draft_attention FAILED"; tail -20 "$LOG_DIR/draft_attention.log"; exit 1; }
@@ -84,7 +85,7 @@ if [[ -s "$LAYERS_OUT" ]]; then
     echo "skip layers (exists)"
 else
     echo "== stage layers (Figure 3+6, Qwen2-VL-7B) $(date -Is) =="
-    python -u -m src.analyze.Validate_Sparrow_hypothesises layers \
+    "$PYTHON_BIN" -u -m src.analyze.Validate_Sparrow_hypothesises layers \
         "${CAL_ARGS[@]}" --experiments both --quantized \
         --output "$LAYERS_OUT" "${EXTRA_ARGS[@]}" \
         > "$LOG_DIR/layers.log" 2>&1 || { echo "layers FAILED"; tail -20 "$LOG_DIR/layers.log"; exit 1; }
@@ -92,7 +93,7 @@ fi
 
 # 3. Merge + audit + report.
 echo "== merge + audit + report $(date -Is) =="
-python -u - <<PY
+"$PYTHON_BIN" -u - <<PY
 import json
 from pathlib import Path
 paths = [Path("$MSD_OUT"), Path("$ATTENTION_OUT"), Path("$DRAFT_ATTENTION_OUT"), Path("$LAYERS_OUT")]
@@ -105,9 +106,9 @@ Path("$OUTPUT_DIR/results.jsonl").write_text(
 )
 print(f"merged {len(rows)} rows")
 PY
-python -u -m src.analyze.Validate_Sparrow_hypothesises audit \
+"$PYTHON_BIN" -u -m src.analyze.Validate_Sparrow_hypothesises audit \
     --input "$OUTPUT_DIR/results.jsonl" --output "$OUTPUT_DIR/audit.json" || true
-python -u -m src.analyze.Validate_Sparrow_hypothesises report \
+"$PYTHON_BIN" -u -m src.analyze.Validate_Sparrow_hypothesises report \
     --input "$OUTPUT_DIR/results.jsonl" --output-dir "$OUTPUT_DIR/report" || true
 
 echo "== Done: $OUTPUT_DIR/report/REPORT.md =="

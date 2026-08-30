@@ -7,6 +7,8 @@ from typing import Any
 
 import torch
 
+from src.workspace import resolve_namespace_paths
+
 from .dataset import load_vdc_manifest, write_jsonl
 from .metrics import rouge_l
 from .model_analysis import (
@@ -210,6 +212,14 @@ def _run_figure6(
 
 
 def run(args: argparse.Namespace) -> int:
+    resolve_namespace_paths(
+        args,
+        "contract",
+        "manifest",
+        "dataset_root",
+        "output",
+        "calibration",
+    )
     try:
         require_cuda()
     except RuntimeUnavailableError as exc:

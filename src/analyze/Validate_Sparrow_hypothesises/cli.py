@@ -22,6 +22,7 @@ from .figure3_pipeline import load_figure3_bundle
 from .paper_contract import load_contract, validate_contract
 from .preflight import run_preflight, write_preflight
 from .report import build_report, read_jsonl, write_report
+from src.workspace import resolve_namespace_paths
 
 
 def _contract(args: argparse.Namespace):
@@ -365,6 +366,19 @@ def main(argv: list[str] | None = None) -> int:
             from .run_paper_experiments import build_parser as delegated_parser, run as delegated_run
         return delegated_run(delegated_parser().parse_args(values))
     args = build_parser().parse_args(values)
+    resolve_namespace_paths(
+        args,
+        "contract",
+        "output",
+        "manifest",
+        "dataset_root",
+        "input",
+        "calibration",
+        "output_manifest",
+        "output_selection",
+        "output_dir",
+        "current_figure3_dir",
+    )
     return args.function(args)
 
 

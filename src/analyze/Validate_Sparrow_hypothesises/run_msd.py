@@ -13,6 +13,8 @@ from typing import Any
 
 import torch
 
+from src.workspace import resolve_namespace_paths
+
 from .dataset import load_vdc_manifest, write_jsonl
 from .paper_contract import load_contract
 from .runtime import (
@@ -178,6 +180,15 @@ def _job_target(point: dict[str, Any] | None) -> str:
 
 
 def run(args: argparse.Namespace) -> int:
+    resolve_namespace_paths(
+        args,
+        "contract",
+        "manifest",
+        "dataset_root",
+        "output",
+        "calibration",
+        "worklist",
+    )
     try:
         require_cuda()
     except RuntimeUnavailableError as exc:

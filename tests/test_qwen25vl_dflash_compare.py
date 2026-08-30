@@ -12,7 +12,9 @@ from src.infer.qwen25vl_dflash_compare import (
     SpeculativeDecodeResult,
     _checkpoint_result,
     _compute_position_ids,
+    _capture_target_hidden_states,
     _eos_token_ids,
+    _extract_context_feature,
     _print_report,
     _target_greedy,
     build_parser,
@@ -27,6 +29,62 @@ from src.infer.qwen25vl_dflash_compare import (
     summarize_dflash_attention,
     validate_report_success,
 )
+
+
+class _CaptureLayer(nn.Module):
+    def __init__(self, offset):
+        super().__init__()
+        self.offset = float(offset)
+
+    def forward(self, hidden_states):
+        return (hidden_states + self.offset,)
+
+
+class _CaptureTarget:
+    def __init__(self, layer_count=4):
+        self.model = SimpleNamespace(
+            language_model=SimpleNamespace(
+                layers=nn.ModuleList([_CaptureLayer(index) for index in range(layer_count)])
+            )
+        )
+
+
+def test_capture_target_hidden_states_keeps_only_requested_layers_and_removes_hooks():
+    target = _CaptureTarget()
+    hidden = torch.zeros(1, 2, 3)
+
+    with _capture_target_hidden_states(
+        target,
+        [1, 3],
+        device=torch.device("cpu"),
+    ) as captured:
+        for layer in target.model.language_model.layers:
+            hidden = layer(hidden)[0]
+
+        assert list(captured) == [1, 3]
+        assert torch.equal(captured[1], torch.full_like(hidden, 1.0))
+        assert torch.equal(captured[3], torch.full_like(hidden, 6.0))
+
+    assert all(not layer._forward_hooks for layer in target.model.language_model.layers)
+
+
+def test_extract_context_feature_moves_selected_layers_to_requested_device():
+    hidden_states = (
+        torch.zeros(1, 2, 3),
+        torch.ones(1, 2, 3),
+        torch.full((1, 2, 3), 2.0),
+    )
+
+    selected = _extract_context_feature(
+        hidden_states,
+        [0, 1],
+        device=torch.device("cpu"),
+    )
+
+    assert selected.device == torch.device("cpu")
+    assert selected.shape == (1, 2, 6)
+    assert torch.equal(selected[..., :3], hidden_states[1])
+    assert torch.equal(selected[..., 3:], hidden_states[2])
 
 
 def test_visual_hidden_ablation_masks_only_selected_layers_and_visual_positions():
@@ -613,6 +671,21 @@ def test_instrumented_decoder_accepts_stub_block_and_forwards_video_once():
     assert result.target_forward_calls >= 2
     assert target.calls[0]["has_video"] is True
     assert all(call["has_video"] is False for call in target.calls[1:])
+
+
+def test_instrumented_decoder_accepts_explicit_draft_device():
+    target = _Target()
+    draft = _Draft()
+
+    decoder = InstrumentedDFlashDecoder(
+        target,
+        draft,
+        device=torch.device("cpu"),
+        draft_device=torch.device("meta"),
+    )
+
+    assert decoder.device == torch.device("cpu")
+    assert decoder.draft_device == torch.device("meta")
 
 
 def test_instrumented_decoder_applies_prefill_hidden_transform_only_to_dflash_context():

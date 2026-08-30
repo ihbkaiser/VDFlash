@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="${REPO_ROOT:-/home/hust/Phuc/VDFlash}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/resolve_workspace.sh"
 GPU_DEVICE="${GPU_DEVICE:-cuda:0}"
 MANIFEST="${MANIFEST:-${REPO_ROOT}/results/infer/mvbench100_manifest_20260823/selected.jsonl}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/results/infer}"
+LIMIT="${LIMIT:-}"
 
 cd "${REPO_ROOT}"
 
@@ -27,13 +29,17 @@ COMMON_ARGS=(
   --resume
 )
 
+if [[ -n "${LIMIT}" ]]; then
+  COMMON_ARGS+=(--limit "${LIMIT}")
+fi
+
 run_condition() {
   local name="$1"
   shift
-  HF_HOME=/home/hust/.cache/huggingface \
+  HF_HOME="${HF_HOME}" \
   HF_HUB_OFFLINE=1 \
   PYTHONPATH="${REPO_ROOT}/src/train_Dflash_SpecForge" \
-  "${REPO_ROOT}/.venv-msd/bin/python" -u -m src.infer.qwen25vl_dflash_compare \
+  "${PYTHON_BIN}" -u -m src.infer.qwen25vl_dflash_compare \
     "${COMMON_ARGS[@]}" "$@" \
     --output-dir "${OUTPUT_ROOT}/${name}"
 }

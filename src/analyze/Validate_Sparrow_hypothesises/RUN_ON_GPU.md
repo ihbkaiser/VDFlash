@@ -27,20 +27,16 @@ nguồn được phân biệt bằng field `attention_source` (`target` / `msd_d
 ## 2. Môi trường GPU host (T4 16GB trở lên)
 
 ```bash
-# Python 3.10, PyTorch CUDA 12.1 và Transformers 4.49.0 (xem requirements.txt của harness)
-python3.10 -m venv .venv-msd && source .venv-msd/bin/activate
-pip install -r src/analyze/Validate_Sparrow_hypothesises/requirements.txt
-pip install torch==2.1.2 --index-url https://download.pytorch.org/whl/cu121
-
-# Kích hoạt venv và CUDA runtime wheels cho bitsandbytes
+# Dùng duy nhất môi trường đã có ở thư mục gốc workspace.
+# Không tạo venv mới: mọi launcher tự tìm workspace từ vị trí của chính nó.
 source src/analyze/Validate_Sparrow_hypothesises/activate_msd_env.sh
-python -m bitsandbytes
+"$PYTHON_BIN" -m bitsandbytes
 ```
 
 Nếu `bitsandbytes` báo thiếu `libcusparse.so.12`, cài bổ sung:
 
 ```bash
-python -m pip install nvidia-cusparse-cu12==12.1.0.106
+"$PYTHON_BIN" -m pip install nvidia-cusparse-cu12==12.1.0.106
 source src/analyze/Validate_Sparrow_hypothesises/activate_msd_env.sh
 ```
 
@@ -62,6 +58,13 @@ Dataset: `dataset/VideoDetailCaption/` (50 videos + `subset_manifest.jsonl`)
 phải nằm cạnh repo (đã có sẵn trong repo này).
 
 ## 3. Cách chạy
+
+Từ bất kỳ thư mục nào, source launcher bằng đường dẫn tới checkout. Resolver
+chung sẽ tìm workspace và chỉ chấp nhận `workspace/.venv/bin/python`:
+
+```bash
+source /path/to/VDFlash/src/analyze/Validate_Sparrow_hypothesises/activate_msd_env.sh
+```
 
 ### Cách 1 — Một lệnh duy nhất (khuyên dùng)
 
@@ -141,7 +144,7 @@ Tham số hữu ích:
 Chạy riêng current Figure 3 (không chạy Figures 1/2/6):
 
 ```bash
-python -m src.analyze.Validate_Sparrow_hypothesises figure3 \
+"$PYTHON_BIN" -m src.analyze.Validate_Sparrow_hypothesises figure3 \
   --model Qwen/Qwen2.5-VL-3B-Instruct \
   --manifest dataset/MVBench/classified/selected.jsonl \
   --output-dir results/figure3_qwen25vl3b
@@ -151,35 +154,35 @@ python -m src.analyze.Validate_Sparrow_hypothesises figure3 \
 
 ```bash
 # CPU-ish: calibration (chỉ cần processor + video, không cần model 7B)
-python -m src.analyze.Validate_Sparrow_hypothesises calibrate \
+"$PYTHON_BIN" -m src.analyze.Validate_Sparrow_hypothesises calibrate \
   --output results/sparrow_validation/calibration.jsonl
 
 # GPU
-python -m src.analyze.Validate_Sparrow_hypothesises msd \
+"$PYTHON_BIN" -m src.analyze.Validate_Sparrow_hypothesises msd \
   --calibration results/sparrow_validation/calibration.jsonl \
   --condition both --allow-out-of-tolerance \
   --output results/sparrow_validation/msd.jsonl
 
-python -m src.analyze.Validate_Sparrow_hypothesises attention \
+"$PYTHON_BIN" -m src.analyze.Validate_Sparrow_hypothesises attention \
   --calibration results/sparrow_validation/calibration.jsonl \
   --visual-targets 400 3000 --quantized --allow-out-of-tolerance \
   --output results/sparrow_validation/figure2_attention.jsonl
 
-python -m src.analyze.Validate_Sparrow_hypothesises draft_attention \
+"$PYTHON_BIN" -m src.analyze.Validate_Sparrow_hypothesises draft_attention \
   --calibration results/sparrow_validation/calibration.jsonl \
   --visual-targets 400 3000 --allow-out-of-tolerance \
   --output results/sparrow_validation/figure2_draft_attention.jsonl
 
-python -m src.analyze.Validate_Sparrow_hypothesises layers \
+"$PYTHON_BIN" -m src.analyze.Validate_Sparrow_hypothesises layers \
   --calibration results/sparrow_validation/calibration.jsonl \
   --experiments both --visual-targets 3000 --quantized --allow-out-of-tolerance \
   --output results/sparrow_validation/layer_analysis.jsonl
 
 # CPU: audit + report (fail-closed)
-python -m src.analyze.Validate_Sparrow_hypothesises audit \
+"$PYTHON_BIN" -m src.analyze.Validate_Sparrow_hypothesises audit \
   --input results/sparrow_validation/results.jsonl \
   --output results/sparrow_validation/audit.json
-python -m src.analyze.Validate_Sparrow_hypothesises report \
+"$PYTHON_BIN" -m src.analyze.Validate_Sparrow_hypothesises report \
   --input results/sparrow_validation/results.jsonl \
   --current-figure3-dir results/sparrow_validation/report/figure3 \
   --output-dir results/sparrow_validation/report
@@ -191,7 +194,7 @@ này), có thể copy file đó sang GPU host và dùng `--skip-calibration`.
 ## 4. Smoke test trước khi chạy full
 
 ```bash
-python -m src.analyze.Validate_Sparrow_hypothesises msd --limit 1 \
+"$PYTHON_BIN" -m src.analyze.Validate_Sparrow_hypothesises msd --limit 1 \
   --output results/sparrow_validation/msd_smoke.jsonl
 ```
 
