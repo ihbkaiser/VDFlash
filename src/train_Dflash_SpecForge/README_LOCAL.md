@@ -257,3 +257,9 @@ SPECFORGE_DFLASH_DEPTH=2 SPECFORGE_GPU_IDS=2,3 \
 The job launcher assigns a private run/config suffix and data-cache directory
 per depth, so the two jobs can share hidden-state files without overwriting
 each other's training state.
+
+Caches produced by an older VDFlash checkout may contain only `rows_*/data_*.ckpt`
+files and no `hidden_state_metadata.json`. The depth-job launcher migrates such
+a cache on first use after checking one row's required keys and feature width;
+the feature rows themselves are not rewritten. A width or phase/layer mismatch
+still stops the run and requires a fresh capture.

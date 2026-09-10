@@ -40,6 +40,7 @@ RUN_SUFFIX=${SPECFORGE_RUN_SUFFIX:-}
 DRAFT_CONFIG_SUFFIX=${SPECFORGE_DRAFT_CONFIG_SUFFIX:-}
 PHASE1_FEATURE_ROOT=${SPECFORGE_PHASE1_FEATURE_ROOT:-}
 ALLOW_FEATURE_ONLY_TRAIN=${SPECFORGE_ALLOW_FEATURE_ONLY_TRAIN:-0}
+MIGRATE_LEGACY_METADATA=${SPECFORGE_MIGRATE_LEGACY_HIDDEN_STATE_METADATA:-0}
 
 usage() {
   printf '%s\n' \
@@ -75,7 +76,8 @@ usage() {
     '  SPECFORGE_DRAFT_CONFIG_SUFFIX=suffix for concurrent depth config files' \
     '  SPECFORGE_DATA_CACHE_ROOT=per-job dataset cache directory' \
     '  SPECFORGE_PHASE1_FEATURE_ROOT=explicit feature root when artifact has only hidden states' \
-    '  SPECFORGE_ALLOW_FEATURE_ONLY_TRAIN=1 to train without converted ShareGPT JSONL'
+    '  SPECFORGE_ALLOW_FEATURE_ONLY_TRAIN=1 to train without converted ShareGPT JSONL' \
+    '  SPECFORGE_MIGRATE_LEGACY_HIDDEN_STATE_METADATA=1 for old row-only caches'
 }
 
 while (($#)); do
@@ -143,6 +145,10 @@ fi
 case "$ALLOW_FEATURE_ONLY_TRAIN" in
   0|1) ;;
   *) echo "SPECFORGE_ALLOW_FEATURE_ONLY_TRAIN must be 0 or 1" >&2; exit 2 ;;
+esac
+case "$MIGRATE_LEGACY_METADATA" in
+  0|1) ;;
+  *) echo "SPECFORGE_MIGRATE_LEGACY_HIDDEN_STATE_METADATA must be 0 or 1" >&2; exit 2 ;;
 esac
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   echo "Python executable not found: $PYTHON_BIN" >&2
@@ -279,6 +285,17 @@ validate_feature_cache() {
     --phase "$phase"
 }
 
+migrate_legacy_metadata() {
+  local feature_dir=$1 draft_config=$2 phase=$3
+  if (( MIGRATE_LEGACY_METADATA )) && [[ ! -f "$feature_dir/hidden_state_metadata.json" ]]; then
+    "$PYTHON_BIN" "$SPECFORGE_DIR/scripts/migrate_hidden_state_metadata.py" \
+      --feature-root "$feature_dir" \
+      --draft-model-config "$draft_config" \
+      --phase "$phase" \
+      --target-model "$target_model"
+  fi
+}
+
 run_model() {
   local size=$1
   local target_model base_draft_config draft_config run_config slug run_id
@@ -314,6 +331,7 @@ run_model() {
     local existing_features
     existing_features=$(feature_count "$feature_dir")
     if ((existing_features > 0)); then
+      migrate_legacy_metadata "$feature_dir" "$draft_config" phase1
       validate_feature_cache "$feature_dir" "$draft_config" phase1
     fi
     if ((existing_features > 0 && !RESUME)); then
@@ -369,6 +387,7 @@ run_model() {
       echo "No offline features found at $feature_dir; run --phase capture first" >&2
       exit 1
     fi
+    migrate_legacy_metadata "$feature_dir" "$draft_config" phase1
     validate_feature_cache "$feature_dir" "$draft_config" phase1
     per_rank_samples=$(((count + GPU_COUNT - 1) / GPU_COUNT))
     micro_batches_per_epoch=$((per_rank_samples / MICRO_BATCH_SIZE))

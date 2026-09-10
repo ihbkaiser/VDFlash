@@ -75,6 +75,7 @@ PHASE2_TARGET_LAYER_IDS=${SPECFORGE_PHASE2_TARGET_LAYER_IDS:-}
 DRAFT_NUM_HIDDEN_LAYERS=${SPECFORGE_DFLASH_DEPTH:-5}
 RUN_SUFFIX=${SPECFORGE_RUN_SUFFIX:-}
 DRAFT_CONFIG_SUFFIX=${SPECFORGE_DRAFT_CONFIG_SUFFIX:-}
+MIGRATE_LEGACY_METADATA=${SPECFORGE_MIGRATE_LEGACY_HIDDEN_STATE_METADATA:-0}
 
 usage() {
   cat <<'EOF'
@@ -108,6 +109,7 @@ Optional environment:
   SPECFORGE_RUN_SUFFIX=suffix appended to run IDs to isolate ablations
   SPECFORGE_DRAFT_CONFIG_SUFFIX=suffix for concurrent depth config files
   SPECFORGE_DATA_CACHE_ROOT=per-job dataset cache directory
+  SPECFORGE_MIGRATE_LEGACY_HIDDEN_STATE_METADATA=1 for old row-only caches
 
 Options:
   --env-file FILE
@@ -155,6 +157,10 @@ if [[ ! "$DRAFT_NUM_HIDDEN_LAYERS" =~ ^[1-9][0-9]*$ ]]; then
   echo "SPECFORGE_DFLASH_DEPTH must be a positive integer" >&2
   exit 2
 fi
+case "$MIGRATE_LEGACY_METADATA" in
+  0|1) ;;
+  *) echo "SPECFORGE_MIGRATE_LEGACY_HIDDEN_STATE_METADATA must be 0 or 1" >&2; exit 2 ;;
+esac
 if (( GLOBAL_BATCH_SIZE % (GPU_COUNT * MICRO_BATCH_SIZE) != 0 )); then
   echo "global batch must be divisible by GPUs * micro batch" >&2
   exit 2
@@ -248,6 +254,16 @@ validate_feature_cache() {
     --phase phase2
 }
 
+migrate_legacy_metadata() {
+  if (( MIGRATE_LEGACY_METADATA )) && [[ ! -f "$FEATURE_ROOT/hidden_state_metadata.json" ]]; then
+    "$PYTHON_BIN" "$ROOT_DIR/scripts/migrate_hidden_state_metadata.py" \
+      --feature-root "$FEATURE_ROOT" \
+      --draft-model-config "$DRAFT_CONFIG" \
+      --phase phase2 \
+      --target-model "$TARGET_MODEL_PATH"
+  fi
+}
+
 require_value() {
   local name=$1 value=${!1:-}
   if [[ -z "$value" ]]; then
@@ -293,6 +309,7 @@ if [[ "$PHASE" == capture || "$PHASE" == all ]]; then
   require_value IMAGE_ROOT
   existing_features=$(feature_count)
   if ((existing_features > 0)); then
+    migrate_legacy_metadata
     validate_feature_cache
   fi
   if ((existing_features > 0 && !RESUME)); then
@@ -337,6 +354,7 @@ fi
 if [[ "$PHASE" == train || "$PHASE" == all ]]; then
   require_value TARGET_MODEL_PATH
   [[ -d "$FEATURE_ROOT" ]] || { echo "feature directory missing: $FEATURE_ROOT" >&2; exit 1; }
+  migrate_legacy_metadata
   validate_feature_cache
   train_args=(
     "model.target_model_path=$TARGET_MODEL_PATH"
