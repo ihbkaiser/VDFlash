@@ -70,7 +70,8 @@ usage() {
     '  SPECFORGE_PHASE1_TARGET_LAYER_IDS=comma-separated five layer IDs' \
     '  SPECFORGE_DFLASH_DEPTH=positive DFlash decoder depth (H3.2: 1, 3, or 5)' \
     '  SPECFORGE_RUN_SUFFIX=suffix appended to run IDs to isolate ablations' \
-    '  SPECFORGE_DRAFT_CONFIG_SUFFIX=suffix for concurrent depth config files'
+    '  SPECFORGE_DRAFT_CONFIG_SUFFIX=suffix for concurrent depth config files' \
+    '  SPECFORGE_DATA_CACHE_ROOT=per-job dataset cache directory'
 }
 
 while (($#)); do
@@ -183,6 +184,8 @@ mkdir -p "$ARTIFACT_ROOT/shared"
 ARTIFACT_ROOT=$(cd "$ARTIFACT_ROOT" && pwd)
 mkdir -p "$OUTPUT_ROOT"
 OUTPUT_ROOT=$(cd "$OUTPUT_ROOT" && pwd)
+DATA_CACHE_ROOT=${SPECFORGE_DATA_CACHE_ROOT:-"$ARTIFACT_ROOT/cache"}
+mkdir -p "$DATA_CACHE_ROOT"
 SPECFORGE_DATA="$ARTIFACT_ROOT/shared/sharegpt_train.jsonl"
 
 jsonl_count() {
@@ -393,7 +396,7 @@ run_model() {
         "model.use_liger_kernel=$USE_LIGER" \
         "data.hidden_states_path=$feature_dir" \
         "data.hidden_state_phase=phase1" \
-        "data.cache_dir=$ARTIFACT_ROOT/cache" \
+        "data.cache_dir=$DATA_CACHE_ROOT" \
         "data.max_length=$MAX_LENGTH" \
         "data.dataloader_num_workers=$DATALOADER_WORKERS" \
         "training.num_epochs=$NUM_EPOCHS" \

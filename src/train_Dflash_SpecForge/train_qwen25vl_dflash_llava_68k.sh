@@ -107,6 +107,7 @@ Optional environment:
   SPECFORGE_DFLASH_DEPTH=positive DFlash decoder depth (H3.2: 1, 3, or 5)
   SPECFORGE_RUN_SUFFIX=suffix appended to run IDs to isolate ablations
   SPECFORGE_DRAFT_CONFIG_SUFFIX=suffix for concurrent depth config files
+  SPECFORGE_DATA_CACHE_ROOT=per-job dataset cache directory
 
 Options:
   --env-file FILE
@@ -204,6 +205,8 @@ esac
 if [[ -z "$ARTIFACT_ROOT" ]]; then
   ARTIFACT_ROOT="$ROOT_DIR/artifacts/qwen25vl_${MODEL_SIZE}_dflash_llava68k"
 fi
+DATA_CACHE_ROOT=${SPECFORGE_DATA_CACHE_ROOT:-"$ARTIFACT_ROOT/cache"}
+mkdir -p "$DATA_CACHE_ROOT"
 
 DRAFT_CONFIG="$ARTIFACT_ROOT/draft_config_phase2${DRAFT_CONFIG_SUFFIX}.json"
 resolve_phase_config() {
@@ -342,6 +345,7 @@ if [[ "$PHASE" == train || "$PHASE" == all ]]; then
     "model.use_liger_kernel=$USE_LIGER"
     "data.hidden_states_path=$FEATURE_ROOT"
     "data.hidden_state_phase=phase2"
+    "data.cache_dir=$DATA_CACHE_ROOT"
     "data.max_length=$MAX_LENGTH"
     "data.dataloader_num_workers=$DATALOADER_WORKERS"
     "training.num_epochs=$NUM_EPOCHS"

@@ -222,8 +222,8 @@ SPECFORGE_DFLASH_DEPTHS=1,3,5 \
 bash train_qwen25vl_dflash_h32.sh
 ```
 
-The launch creates separate `-h32-depth1`, `-h32-depth3`, and
-`-h32-depth5` Phase 1/Phase 2 runs. `--resume` resumes interrupted captures
+The launch creates separate `-h32-depthN` Phase 1/Phase 2 runs for each
+configured depth. `--resume` resumes interrupted captures
 or checkpoints. Set `SPECFORGE_H32_CAPTURE_FIRST=0` only when the shared
 feature caches already exist under the configured H3.2 artifact roots.
 
@@ -232,3 +232,28 @@ Under the hood, `SPECFORGE_DFLASH_DEPTH=1`, `2`, or `3` changes
 does not change `dflash_config.target_layer_ids`. Do not set
 `model.draft_num_hidden_layers` in the YAML for this ablation: the generic
 model override derives a new target-layer list and would confound H3.2.
+
+For concurrent end-to-end jobs, use one process per depth. Each process runs
+Phase 1 and then Phase 2 on its own GPU set while reusing the existing feature
+caches:
+
+```bash
+export SPECFORGE_MODEL_SIZE=3b
+export TARGET_MODEL_PATH=/models/qwen25-vl-3b
+export SPECFORGE_PHASE1_ARTIFACT_ROOT=/data/artifacts/qwen25vl_dflash_sharegpt68k
+export SPECFORGE_PHASE2_ARTIFACT_ROOT=/data/artifacts/qwen25vl_3b_dflash_llava68k
+export SPECFORGE_OUTPUT_ROOT=/data/outputs/dflash_depth_jobs
+
+bash train_qwen25vl_dflash_depth_job.sh --depth 1 --gpu-ids 0,1
+```
+
+In a second terminal, change only the depth and GPU IDs:
+
+```bash
+SPECFORGE_DFLASH_DEPTH=2 SPECFORGE_GPU_IDS=2,3 \
+  bash train_qwen25vl_dflash_depth_job.sh
+```
+
+The job launcher assigns a private run/config suffix and data-cache directory
+per depth, so the two jobs can share hidden-state files without overwriting
+each other's training state.
