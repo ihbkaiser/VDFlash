@@ -38,6 +38,8 @@ PHASE1_TARGET_LAYER_IDS=${SPECFORGE_PHASE1_TARGET_LAYER_IDS:-}
 DRAFT_NUM_HIDDEN_LAYERS=${SPECFORGE_DFLASH_DEPTH:-5}
 RUN_SUFFIX=${SPECFORGE_RUN_SUFFIX:-}
 DRAFT_CONFIG_SUFFIX=${SPECFORGE_DRAFT_CONFIG_SUFFIX:-}
+PHASE1_FEATURE_ROOT=${SPECFORGE_PHASE1_FEATURE_ROOT:-}
+ALLOW_FEATURE_ONLY_TRAIN=${SPECFORGE_ALLOW_FEATURE_ONLY_TRAIN:-0}
 
 usage() {
   printf '%s\n' \
@@ -71,7 +73,9 @@ usage() {
     '  SPECFORGE_DFLASH_DEPTH=positive DFlash decoder depth (H3.2: 1, 3, or 5)' \
     '  SPECFORGE_RUN_SUFFIX=suffix appended to run IDs to isolate ablations' \
     '  SPECFORGE_DRAFT_CONFIG_SUFFIX=suffix for concurrent depth config files' \
-    '  SPECFORGE_DATA_CACHE_ROOT=per-job dataset cache directory'
+    '  SPECFORGE_DATA_CACHE_ROOT=per-job dataset cache directory' \
+    '  SPECFORGE_PHASE1_FEATURE_ROOT=explicit feature root when artifact has only hidden states' \
+    '  SPECFORGE_ALLOW_FEATURE_ONLY_TRAIN=1 to train without converted ShareGPT JSONL'
 }
 
 while (($#)); do
@@ -136,6 +140,10 @@ if [[ ! "$DRAFT_NUM_HIDDEN_LAYERS" =~ ^[1-9][0-9]*$ ]]; then
   echo "SPECFORGE_DFLASH_DEPTH must be a positive integer" >&2
   exit 2
 fi
+case "$ALLOW_FEATURE_ONLY_TRAIN" in
+  0|1) ;;
+  *) echo "SPECFORGE_ALLOW_FEATURE_ONLY_TRAIN must be 0 or 1" >&2; exit 2 ;;
+esac
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   echo "Python executable not found: $PYTHON_BIN" >&2
   exit 1
@@ -290,7 +298,7 @@ run_model() {
       run_id=qwen25vl-7b-dflash-sharegpt68k${RUN_SUFFIX}
       ;;
   esac
-  local feature_dir="$ARTIFACT_ROOT/$slug/hidden_states"
+  local feature_dir="${PHASE1_FEATURE_ROOT:-$ARTIFACT_ROOT/$slug/hidden_states}"
   local output_dir="$OUTPUT_ROOT/$run_id"
   draft_config="$ARTIFACT_ROOT/$slug/draft_config_phase1${DRAFT_CONFIG_SUFFIX}.json"
   resolve_phase_config \
@@ -418,10 +426,13 @@ run_model() {
 
 if [[ "$PHASE" == data || "$PHASE" == all ]]; then
   prepare_data
-elif [[ ! -s "$SPECFORGE_DATA" ]]; then
-  echo "Converted dataset not found: $SPECFORGE_DATA; run --phase data first" >&2
-  exit 1
+elif [[ "$PHASE" == train && "$ALLOW_FEATURE_ONLY_TRAIN" == 1 ]]; then
+  echo "[data] feature-only training enabled; skipping converted dataset validation"
 else
+  if [[ ! -s "$SPECFORGE_DATA" ]]; then
+    echo "Converted dataset not found: $SPECFORGE_DATA; run --phase data first" >&2
+    exit 1
+  fi
   require_data_count
 fi
 

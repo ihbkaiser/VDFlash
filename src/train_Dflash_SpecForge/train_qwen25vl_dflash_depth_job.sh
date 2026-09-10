@@ -14,6 +14,7 @@ PHASE1_ARTIFACT_ROOT=${SPECFORGE_PHASE1_ARTIFACT_ROOT:-"$ROOT_DIR/artifacts/qwen
 PHASE2_ARTIFACT_ROOT=${SPECFORGE_PHASE2_ARTIFACT_ROOT:-"$ROOT_DIR/artifacts/qwen25vl_${MODEL_SIZE}_dflash_llava68k"}
 BASE_OUTPUT_ROOT=${SPECFORGE_OUTPUT_ROOT:-"$ROOT_DIR/outputs/dflash_depth_jobs"}
 TARGET_MODEL_PATH=${TARGET_MODEL_PATH:-}
+PHASE1_FEATURE_ROOT=${SPECFORGE_PHASE1_FEATURE_ROOT:-}
 RESUME=0
 
 usage() {
@@ -32,6 +33,7 @@ Environment:
   SPECFORGE_MODEL_SIZE=3b|7b (default: 3b)
   TARGET_MODEL_PATH=/models/qwen25-vl-3b (required)
   SPECFORGE_PHASE1_ARTIFACT_ROOT=old Phase 1 artifact root
+  SPECFORGE_PHASE1_FEATURE_ROOT=explicit Phase 1 hidden-state root (optional)
   SPECFORGE_PHASE2_ARTIFACT_ROOT=old Phase 2 artifact root
   SPECFORGE_OUTPUT_ROOT=base output root; depthN is appended
   SPECFORGE_GPU_IDS=IDS (alternative to --gpu-ids)
@@ -86,6 +88,14 @@ if [[ -z "$TARGET_MODEL_PATH" ]]; then
   exit 2
 fi
 
+# Accept either the normal Phase 1 artifact root (which contains
+# qwen25vl_3b/hidden_states) or the model-specific directory that contains
+# hidden_states directly. The latter is useful when the old run retained only
+# feature files and no converted ShareGPT JSONL.
+if [[ -z "$PHASE1_FEATURE_ROOT" && -d "$PHASE1_ARTIFACT_ROOT/hidden_states" ]]; then
+  PHASE1_FEATURE_ROOT="$PHASE1_ARTIFACT_ROOT/hidden_states"
+fi
+
 IFS=',' read -r -a GPU_ID_ARRAY <<< "$GPU_IDS"
 GPU_COUNT=${#GPU_ID_ARRAY[@]}
 RUN_SUFFIX=${SPECFORGE_RUN_SUFFIX:-"-h32-depth${DEPTH}"}
@@ -119,6 +129,8 @@ echo "[depth-job] Phase 1: reuse $PHASE1_ARTIFACT_ROOT"
 ARTIFACT_ROOT="$PHASE1_ARTIFACT_ROOT" \
 OUTPUT_ROOT="$PHASE1_OUTPUT_ROOT" \
 SPECFORGE_DATA_CACHE_ROOT="$JOB_CACHE_ROOT/phase1" \
+SPECFORGE_PHASE1_FEATURE_ROOT="$PHASE1_FEATURE_ROOT" \
+SPECFORGE_ALLOW_FEATURE_ONLY_TRAIN=1 \
   bash "$ROOT_DIR/train_qwen25vl_dflash_sharegpt_68k.sh" \
   --models "$MODEL_SIZE" --phase train "${RESUME_ARGS[@]}"
 
