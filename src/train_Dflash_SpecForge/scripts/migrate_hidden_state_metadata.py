@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 from specforge.hidden_state import (
@@ -17,7 +18,21 @@ from specforge.hidden_state import (
     write_hidden_state_metadata,
 )
 from specforge.runtime.data_plane.feature_store import load_feature_file
-from specforge.runtime.data_plane.offline_reader import list_feature_files
+
+
+def _first_feature_file(root: Path) -> str | None:
+    """Find one deterministic feature row without walking the whole cache."""
+
+    if root.is_file() and root.name.endswith((".ckpt", ".ckpt.gz")):
+        return str(root)
+    if not root.is_dir():
+        return None
+    for directory, directories, filenames in os.walk(root):
+        directories.sort()
+        for name in sorted(filenames):
+            if name.endswith((".ckpt", ".ckpt.gz")):
+                return str(Path(directory) / name)
+    return None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -29,8 +44,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     feature_root = Path(args.feature_root).expanduser()
-    files = list_feature_files(str(feature_root))
-    if not files:
+    first_file = _first_feature_file(feature_root)
+    if first_file is None:
         raise ValueError(f"no .ckpt or .ckpt.gz files found under {feature_root}")
 
     with Path(args.draft_model_config).expanduser().open(encoding="utf-8") as handle:
@@ -43,11 +58,11 @@ def main(argv: list[str] | None = None) -> int:
     if not isinstance(hidden_size, int) or hidden_size <= 0:
         raise ValueError(f"draft config hidden_size must be positive, got {hidden_size!r}")
 
-    raw = load_feature_file(files[0])
+    raw = load_feature_file(first_file)
     required = {"input_ids", "loss_mask", "hidden_states"}
     missing = sorted(required - set(raw))
     if missing:
-        raise ValueError(f"legacy feature row {files[0]} is missing keys: {missing}")
+        raise ValueError(f"legacy feature row {first_file} is missing keys: {missing}")
     hidden_states = raw["hidden_states"]
     if hidden_states.ndim not in (2, 3):
         raise ValueError(
@@ -62,7 +77,7 @@ def main(argv: list[str] | None = None) -> int:
             f"({len(layer_ids)} target layers x hidden_size {hidden_size})"
         )
     if args.phase == "phase2" and "position_ids" not in raw:
-        raise ValueError(f"Phase 2 feature row {files[0]} is missing position_ids")
+        raise ValueError(f"Phase 2 feature row {first_file} is missing position_ids")
 
     dtype = draft_config.get("dtype")
     metadata = build_hidden_state_metadata(
@@ -80,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
             {
                 "feature_root": str(feature_root),
                 "metadata": str(output),
-                "checked_row": files[0],
+                "checked_row": first_file,
                 "feature_width": feature_width,
                 "target_layer_ids": layer_ids,
                 "phase": args.phase,
