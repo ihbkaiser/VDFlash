@@ -37,6 +37,7 @@ CAPTURE_TORCH_COMPILE=${SPECFORGE_CAPTURE_TORCH_COMPILE:-0}
 PHASE1_TARGET_LAYER_IDS=${SPECFORGE_PHASE1_TARGET_LAYER_IDS:-}
 DRAFT_NUM_HIDDEN_LAYERS=${SPECFORGE_DFLASH_DEPTH:-5}
 RUN_SUFFIX=${SPECFORGE_RUN_SUFFIX:-}
+DRAFT_CONFIG_SUFFIX=${SPECFORGE_DRAFT_CONFIG_SUFFIX:-}
 
 usage() {
   printf '%s\n' \
@@ -68,7 +69,8 @@ usage() {
     '  SPECFORGE_COMPRESS=1' \
     '  SPECFORGE_PHASE1_TARGET_LAYER_IDS=comma-separated five layer IDs' \
     '  SPECFORGE_DFLASH_DEPTH=positive DFlash decoder depth (H3.2: 1, 3, or 5)' \
-    '  SPECFORGE_RUN_SUFFIX=suffix appended to run IDs to isolate ablations'
+    '  SPECFORGE_RUN_SUFFIX=suffix appended to run IDs to isolate ablations' \
+    '  SPECFORGE_DRAFT_CONFIG_SUFFIX=suffix for concurrent depth config files'
 }
 
 while (($#)); do
@@ -287,7 +289,7 @@ run_model() {
   esac
   local feature_dir="$ARTIFACT_ROOT/$slug/hidden_states"
   local output_dir="$OUTPUT_ROOT/$run_id"
-  draft_config="$ARTIFACT_ROOT/$slug/draft_config_phase1.json"
+  draft_config="$ARTIFACT_ROOT/$slug/draft_config_phase1${DRAFT_CONFIG_SUFFIX}.json"
   resolve_phase_config \
     "$base_draft_config" "$draft_config" phase1 "$PHASE1_TARGET_LAYER_IDS" \
     "$DRAFT_NUM_HIDDEN_LAYERS"

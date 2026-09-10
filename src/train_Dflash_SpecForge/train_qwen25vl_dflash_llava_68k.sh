@@ -74,6 +74,7 @@ SGLANG_MEM_FRACTION_STATIC=${SPECFORGE_SGLANG_MEM_FRACTION_STATIC:-0.4}
 PHASE2_TARGET_LAYER_IDS=${SPECFORGE_PHASE2_TARGET_LAYER_IDS:-}
 DRAFT_NUM_HIDDEN_LAYERS=${SPECFORGE_DFLASH_DEPTH:-5}
 RUN_SUFFIX=${SPECFORGE_RUN_SUFFIX:-}
+DRAFT_CONFIG_SUFFIX=${SPECFORGE_DRAFT_CONFIG_SUFFIX:-}
 
 usage() {
   cat <<'EOF'
@@ -105,6 +106,7 @@ Optional environment:
   SPECFORGE_PHASE2_TARGET_LAYER_IDS=comma-separated five layer IDs
   SPECFORGE_DFLASH_DEPTH=positive DFlash decoder depth (H3.2: 1, 3, or 5)
   SPECFORGE_RUN_SUFFIX=suffix appended to run IDs to isolate ablations
+  SPECFORGE_DRAFT_CONFIG_SUFFIX=suffix for concurrent depth config files
 
 Options:
   --env-file FILE
@@ -203,7 +205,7 @@ if [[ -z "$ARTIFACT_ROOT" ]]; then
   ARTIFACT_ROOT="$ROOT_DIR/artifacts/qwen25vl_${MODEL_SIZE}_dflash_llava68k"
 fi
 
-DRAFT_CONFIG="$ARTIFACT_ROOT/draft_config_phase2.json"
+DRAFT_CONFIG="$ARTIFACT_ROOT/draft_config_phase2${DRAFT_CONFIG_SUFFIX}.json"
 resolve_phase_config() {
   local source=$1 destination=$2 phase=$3 layer_ids=${4:-} draft_layers=${5:-}
   local args=(

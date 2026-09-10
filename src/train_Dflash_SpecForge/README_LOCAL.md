@@ -206,7 +206,7 @@ Qwen2.5-VL three-axis M-RoPE contract as the 3B multimodal profile.
 
 ## H3.2 DFlash depth ablation
 
-H3.2 compares DFlash decoder depths 1, 3, and 5 while keeping the target
+H3.2 compares DFlash decoder depths such as 1, 2, 3, and 5 while keeping the target
 hidden-state inputs fixed at `[1, 9, 17, 25, 33]`. This isolates the number of
 DFlash layers from the number of target features. The convenience launcher
 captures each Phase 1/Phase 2 feature cache once, then trains an independent
@@ -227,7 +227,7 @@ The launch creates separate `-h32-depth1`, `-h32-depth3`, and
 or checkpoints. Set `SPECFORGE_H32_CAPTURE_FIRST=0` only when the shared
 feature caches already exist under the configured H3.2 artifact roots.
 
-Under the hood, `SPECFORGE_DFLASH_DEPTH=1` or `3` changes
+Under the hood, `SPECFORGE_DFLASH_DEPTH=1`, `2`, or `3` changes
 `num_hidden_layers` and `layer_types` in the materialized draft config, but
 does not change `dflash_config.target_layer_ids`. Do not set
 `model.draft_num_hidden_layers` in the YAML for this ablation: the generic

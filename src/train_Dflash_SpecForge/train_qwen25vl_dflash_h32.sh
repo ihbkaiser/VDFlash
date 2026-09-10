@@ -19,7 +19,7 @@ usage() {
   cat <<'EOF'
 Usage: train_qwen25vl_dflash_h32.sh [--resume]
 
-Runs DFlash depth 1, 3, and 5 (or SPECFORGE_DFLASH_DEPTHS) through:
+Runs DFlash depth 1, 2, 3, and 5 (or SPECFORGE_DFLASH_DEPTHS) through:
   Phase 1: ShareGPT text-only training
   Phase 2: LLaVA multimodal training
 
@@ -28,7 +28,7 @@ Required for Phase 2:
 
 Environment:
   SPECFORGE_MODEL_SIZE=3b|7b (default: 3b)
-  SPECFORGE_DFLASH_DEPTHS=1,3,5 (default: 1,3,5)
+  SPECFORGE_DFLASH_DEPTHS=1,2,3,5 (default: 1,3,5)
   SPECFORGE_H32_ROOT (default: train_Dflash_SpecForge/artifacts/..._h32)
   SPECFORGE_H32_CAPTURE_FIRST=1|0 (capture the shared cache on the first depth)
   SPECFORGE_H32_PHASE1_ARTIFACT_ROOT, SPECFORGE_H32_PHASE2_ARTIFACT_ROOT
@@ -76,8 +76,8 @@ fi
 declare -A seen_depths=()
 for depth in "${DEPTHS[@]}"; do
   case "$depth" in
-    1|3|5) ;;
-    *) echo "H3.2 depths must be chosen from 1, 3, or 5; got: $depth" >&2; exit 2 ;;
+    1|2|3|5) ;;
+    *) echo "H3.2 depths must be chosen from 1, 2, 3, or 5; got: $depth" >&2; exit 2 ;;
   esac
   if [[ -n "${seen_depths[$depth]:-}" ]]; then
     echo "duplicate H3.2 depth: $depth" >&2
@@ -115,7 +115,8 @@ export SPECFORGE_MODEL_SIZE="$MODEL_SIZE"
 first_depth=${DEPTHS[0]}
 SPECFORGE_DFLASH_DEPTH="$first_depth"
 SPECFORGE_RUN_SUFFIX="-h32-depth${first_depth}"
-export SPECFORGE_DFLASH_DEPTH SPECFORGE_RUN_SUFFIX
+SPECFORGE_DRAFT_CONFIG_SUFFIX="-h32-depth${first_depth}"
+export SPECFORGE_DFLASH_DEPTH SPECFORGE_RUN_SUFFIX SPECFORGE_DRAFT_CONFIG_SUFFIX
 
 echo "[h3.2] Phase 1 data"
 ARTIFACT_ROOT="$PHASE1_ARTIFACT_ROOT" OUTPUT_ROOT="$OUTPUT_ROOT/phase1" \
@@ -133,7 +134,8 @@ for depth in "${DEPTHS[@]}"; do
   suffix="-h32-depth${depth}"
   SPECFORGE_DFLASH_DEPTH="$depth"
   SPECFORGE_RUN_SUFFIX="$suffix"
-  export SPECFORGE_DFLASH_DEPTH SPECFORGE_RUN_SUFFIX
+  SPECFORGE_DRAFT_CONFIG_SUFFIX="$suffix"
+  export SPECFORGE_DFLASH_DEPTH SPECFORGE_RUN_SUFFIX SPECFORGE_DRAFT_CONFIG_SUFFIX
   echo "[h3.2] Phase 1 train depth=$depth"
   ARTIFACT_ROOT="$PHASE1_ARTIFACT_ROOT" OUTPUT_ROOT="$OUTPUT_ROOT/phase1" \
     bash "$ROOT_DIR/train_qwen25vl_dflash_sharegpt_68k.sh" \
@@ -142,7 +144,8 @@ done
 
 SPECFORGE_DFLASH_DEPTH="$first_depth"
 SPECFORGE_RUN_SUFFIX="-h32-depth${first_depth}"
-export SPECFORGE_DFLASH_DEPTH SPECFORGE_RUN_SUFFIX
+SPECFORGE_DRAFT_CONFIG_SUFFIX="-h32-depth${first_depth}"
+export SPECFORGE_DFLASH_DEPTH SPECFORGE_RUN_SUFFIX SPECFORGE_DRAFT_CONFIG_SUFFIX
 
 echo "[h3.2] Phase 2 data"
 ARTIFACT_ROOT="$PHASE2_ARTIFACT_ROOT" OUTPUT_ROOT="$OUTPUT_ROOT/phase2" \
@@ -161,8 +164,9 @@ for depth in "${DEPTHS[@]}"; do
   phase1_checkpoint="$OUTPUT_ROOT/phase1/$phase1_run_id/$phase1_run_id-latest"
   SPECFORGE_DFLASH_DEPTH="$depth"
   SPECFORGE_RUN_SUFFIX="$suffix"
+  SPECFORGE_DRAFT_CONFIG_SUFFIX="$suffix"
   PHASE1_CHECKPOINT="$phase1_checkpoint"
-  export SPECFORGE_DFLASH_DEPTH SPECFORGE_RUN_SUFFIX PHASE1_CHECKPOINT
+  export SPECFORGE_DFLASH_DEPTH SPECFORGE_RUN_SUFFIX SPECFORGE_DRAFT_CONFIG_SUFFIX PHASE1_CHECKPOINT
   echo "[h3.2] Phase 2 train depth=$depth"
   ARTIFACT_ROOT="$PHASE2_ARTIFACT_ROOT" OUTPUT_ROOT="$OUTPUT_ROOT/phase2" \
     bash "$ROOT_DIR/train_qwen25vl_dflash_llava_68k.sh" \
