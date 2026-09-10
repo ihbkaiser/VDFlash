@@ -35,6 +35,8 @@ LOG_INTERVAL=${SPECFORGE_LOG_INTERVAL:-100}
 USE_LIGER=${SPECFORGE_USE_LIGER:-auto}
 CAPTURE_TORCH_COMPILE=${SPECFORGE_CAPTURE_TORCH_COMPILE:-0}
 PHASE1_TARGET_LAYER_IDS=${SPECFORGE_PHASE1_TARGET_LAYER_IDS:-}
+DRAFT_NUM_HIDDEN_LAYERS=${SPECFORGE_DFLASH_DEPTH:-5}
+RUN_SUFFIX=${SPECFORGE_RUN_SUFFIX:-}
 
 usage() {
   printf '%s\n' \
@@ -64,7 +66,9 @@ usage() {
     '  SPECFORGE_LOG_INTERVAL, SPECFORGE_USE_LIGER=auto|0|1' \
     '  SPECFORGE_CAPTURE_TORCH_COMPILE=0|1, SPECFORGE_EMBEDDING_KEY' \
     '  SPECFORGE_COMPRESS=1' \
-    '  SPECFORGE_PHASE1_TARGET_LAYER_IDS=comma-separated five layer IDs'
+    '  SPECFORGE_PHASE1_TARGET_LAYER_IDS=comma-separated five layer IDs' \
+    '  SPECFORGE_DFLASH_DEPTH=positive DFlash decoder depth (H3.2: 1, 3, or 5)' \
+    '  SPECFORGE_RUN_SUFFIX=suffix appended to run IDs to isolate ablations'
 }
 
 while (($#)); do
@@ -123,6 +127,10 @@ case "$USE_LIGER" in
 esac
 if [[ "$CAPTURE_TORCH_COMPILE" != 0 && "$CAPTURE_TORCH_COMPILE" != 1 ]]; then
   echo "SPECFORGE_CAPTURE_TORCH_COMPILE must be 0 or 1" >&2
+  exit 2
+fi
+if [[ ! "$DRAFT_NUM_HIDDEN_LAYERS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "SPECFORGE_DFLASH_DEPTH must be a positive integer" >&2
   exit 2
 fi
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
@@ -235,7 +243,7 @@ feature_count() {
 }
 
 resolve_phase_config() {
-  local source=$1 destination=$2 phase=$3 layer_ids=${4:-}
+  local source=$1 destination=$2 phase=$3 layer_ids=${4:-} draft_layers=${5:-}
   local args=(
     --input "$source"
     --output "$destination"
@@ -243,6 +251,9 @@ resolve_phase_config() {
   )
   if [[ -n "$layer_ids" ]]; then
     args+=(--target-layer-ids "$layer_ids")
+  fi
+  if [[ -n "$draft_layers" ]]; then
+    args+=(--draft-num-hidden-layers "$draft_layers")
   fi
   "$PYTHON_BIN" "$SPECFORGE_DIR/scripts/resolve_dflash_config.py" "${args[@]}"
 }
@@ -264,21 +275,22 @@ run_model() {
       base_draft_config="$SPECFORGE_DIR/configs/qwen2.5-vl-3b-dflash.json"
       run_config="$SPECFORGE_DIR/examples/configs/qwen2.5-vl-3b-dflash-offline-b200.yaml"
       slug=qwen25vl_3b
-      run_id=qwen25vl-3b-dflash-sharegpt68k
+      run_id=qwen25vl-3b-dflash-sharegpt68k${RUN_SUFFIX}
       ;;
     7b)
       target_model=$MODEL_7B
       base_draft_config="$SPECFORGE_DIR/configs/qwen2.5-vl-7b-dflash.json"
       run_config="$SPECFORGE_DIR/examples/configs/qwen2.5-vl-7b-dflash-offline-b200.yaml"
       slug=qwen25vl_7b
-      run_id=qwen25vl-7b-dflash-sharegpt68k
+      run_id=qwen25vl-7b-dflash-sharegpt68k${RUN_SUFFIX}
       ;;
   esac
   local feature_dir="$ARTIFACT_ROOT/$slug/hidden_states"
   local output_dir="$OUTPUT_ROOT/$run_id"
   draft_config="$ARTIFACT_ROOT/$slug/draft_config_phase1.json"
   resolve_phase_config \
-    "$base_draft_config" "$draft_config" phase1 "$PHASE1_TARGET_LAYER_IDS"
+    "$base_draft_config" "$draft_config" phase1 "$PHASE1_TARGET_LAYER_IDS" \
+    "$DRAFT_NUM_HIDDEN_LAYERS"
 
   if [[ ! -e "$target_model" && ( "$target_model" == /* || "$target_model" == ./* || "$target_model" == ../* ) ]]; then
     echo "Target model path not found: $target_model" >&2

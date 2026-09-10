@@ -203,3 +203,32 @@ Never point 3B and 7B at the same `ARTIFACT_ROOT`. Their captured feature
 widths differ, so existing files from one size are not valid for the other.
 The 7B profile captures target layers `[1, 7, 13, 19, 25]` and uses the same
 Qwen2.5-VL three-axis M-RoPE contract as the 3B multimodal profile.
+
+## H3.2 DFlash depth ablation
+
+H3.2 compares DFlash decoder depths 1, 3, and 5 while keeping the target
+hidden-state inputs fixed at `[1, 9, 17, 25, 33]`. This isolates the number of
+DFlash layers from the number of target features. The convenience launcher
+captures each Phase 1/Phase 2 feature cache once, then trains an independent
+checkpoint for every depth:
+
+```bash
+cd src/train_Dflash_SpecForge
+SOURCE_JSONL=/data/llava_dflash_68k_clean_3b.jsonl \
+TARGET_MODEL_PATH=/models/qwen25-vl-3b \
+IMAGE_ARCHIVE=/data/images.zip \
+SPECFORGE_MODEL_SIZE=3b \
+SPECFORGE_DFLASH_DEPTHS=1,3,5 \
+bash train_qwen25vl_dflash_h32.sh
+```
+
+The launch creates separate `-h32-depth1`, `-h32-depth3`, and
+`-h32-depth5` Phase 1/Phase 2 runs. `--resume` resumes interrupted captures
+or checkpoints. Set `SPECFORGE_H32_CAPTURE_FIRST=0` only when the shared
+feature caches already exist under the configured H3.2 artifact roots.
+
+Under the hood, `SPECFORGE_DFLASH_DEPTH=1` or `3` changes
+`num_hidden_layers` and `layer_types` in the materialized draft config, but
+does not change `dflash_config.target_layer_ids`. Do not set
+`model.draft_num_hidden_layers` in the YAML for this ablation: the generic
+model override derives a new target-layer list and would confound H3.2.

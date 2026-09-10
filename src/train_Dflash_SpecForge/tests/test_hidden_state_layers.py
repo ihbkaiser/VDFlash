@@ -63,6 +63,35 @@ def test_resolve_dflash_config_preserves_default_and_materializes_override(tmp_p
     ]["target_layer_ids"] == [1, 9, 17, 25, 33]
 
 
+def test_resolve_dflash_config_resizes_draft_but_keeps_five_target_inputs(tmp_path):
+    source = tmp_path / "draft.json"
+    resolved = tmp_path / "depth3-draft.json"
+    source.write_text(
+        json.dumps(
+            {
+                "architectures": ["DFlashDraftModel"],
+                "layer_types": ["full_attention"] * 5,
+                "num_hidden_layers": 5,
+                "num_target_layers": 36,
+                "dflash_config": {"target_layer_ids": [1, 9, 17, 25, 33]},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = resolve_dflash_config(
+        source,
+        resolved,
+        draft_num_hidden_layers=3,
+        phase="phase1",
+    )
+
+    assert payload["num_hidden_layers"] == 3
+    assert payload["layer_types"] == ["full_attention"] * 3
+    assert payload["dflash_config"]["target_layer_ids"] == [1, 9, 17, 25, 33]
+    assert json.loads(source.read_text(encoding="utf-8"))["num_hidden_layers"] == 5
+
+
 def test_hidden_state_metadata_round_trips_and_detects_layer_mismatch(tmp_path):
     metadata = build_hidden_state_metadata(
         target_layer_ids=[1, 9, 17, 25, 33],

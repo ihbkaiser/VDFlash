@@ -93,9 +93,15 @@ def resolve_dflash_config(
     destination: str | os.PathLike[str],
     *,
     target_layer_ids: str | Sequence[int] | None = None,
+    draft_num_hidden_layers: int | None = None,
     phase: str | None = None,
 ) -> dict[str, Any]:
-    """Materialize one phase's DFlash config without mutating the source file."""
+    """Materialize one phase's DFlash config without mutating the source file.
+
+    ``draft_num_hidden_layers`` changes only the DFlash decoder depth.  It does
+    not derive a new target-layer list: this is important for depth ablations
+    where every draft must consume the same cached target hidden states.
+    """
 
     source_path = Path(source).expanduser()
     with source_path.open(encoding="utf-8") as handle:
@@ -119,6 +125,25 @@ def resolve_dflash_config(
     resolved_method_config = dict(method_config)
     resolved_method_config["target_layer_ids"] = list(requested)
     resolved["dflash_config"] = resolved_method_config
+    if draft_num_hidden_layers is not None:
+        if (
+            isinstance(draft_num_hidden_layers, bool)
+            or not isinstance(draft_num_hidden_layers, int)
+            or draft_num_hidden_layers <= 0
+        ):
+            raise ValueError(
+                "draft_num_hidden_layers must be a positive integer, got "
+                f"{draft_num_hidden_layers!r}"
+            )
+        layer_types = list(payload.get("layer_types") or [])
+        if layer_types and len(set(layer_types)) > 1:
+            raise ValueError(
+                "draft_num_hidden_layers cannot resize a mixed layer_types "
+                "layout; provide a homogeneous DFlash config"
+            )
+        layer_type = layer_types[0] if layer_types else "full_attention"
+        resolved["num_hidden_layers"] = draft_num_hidden_layers
+        resolved["layer_types"] = [layer_type] * draft_num_hidden_layers
     if phase is not None and (not isinstance(phase, str) or not phase.strip()):
         raise ValueError("phase must be a non-empty string when provided")
 

@@ -72,6 +72,8 @@ COMPRESS=${SPECFORGE_COMPRESS:-0}
 SKIP_PREFLIGHT=${SKIP_PREFLIGHT:-0}
 SGLANG_MEM_FRACTION_STATIC=${SPECFORGE_SGLANG_MEM_FRACTION_STATIC:-0.4}
 PHASE2_TARGET_LAYER_IDS=${SPECFORGE_PHASE2_TARGET_LAYER_IDS:-}
+DRAFT_NUM_HIDDEN_LAYERS=${SPECFORGE_DFLASH_DEPTH:-5}
+RUN_SUFFIX=${SPECFORGE_RUN_SUFFIX:-}
 
 usage() {
   cat <<'EOF'
@@ -101,6 +103,8 @@ Optional environment:
   SPECFORGE_USE_LIGER=auto|0|1, SPECFORGE_SAVE_INTERVAL,
   SPECFORGE_LOG_INTERVAL
   SPECFORGE_PHASE2_TARGET_LAYER_IDS=comma-separated five layer IDs
+  SPECFORGE_DFLASH_DEPTH=positive DFlash decoder depth (H3.2: 1, 3, or 5)
+  SPECFORGE_RUN_SUFFIX=suffix appended to run IDs to isolate ablations
 
 Options:
   --env-file FILE
@@ -144,6 +148,10 @@ if (( CAPTURE_BATCH_SIZE < 1 || CAPTURE_PREPROCESS_WORKERS < 0 || CAPTURE_PREPRO
   echo "invalid numeric configuration" >&2
   exit 2
 fi
+if [[ ! "$DRAFT_NUM_HIDDEN_LAYERS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "SPECFORGE_DFLASH_DEPTH must be a positive integer" >&2
+  exit 2
+fi
 if (( GLOBAL_BATCH_SIZE % (GPU_COUNT * MICRO_BATCH_SIZE) != 0 )); then
   echo "global batch must be divisible by GPUs * micro batch" >&2
   exit 2
@@ -179,12 +187,12 @@ case "$MODEL_SIZE" in
   3b)
     BASE_DRAFT_CONFIG="$ROOT_DIR/configs/qwen2.5-vl-3b-dflash.json"
     CONFIG="$ROOT_DIR/examples/configs/qwen2.5-vl-3b-dflash-llava68k-offline.yaml"
-    RUN_ID=qwen25vl-3b-dflash-llava68k
+    RUN_ID=qwen25vl-3b-dflash-llava68k${RUN_SUFFIX}
     ;;
   7b)
     BASE_DRAFT_CONFIG="$ROOT_DIR/configs/qwen2.5-vl-7b-dflash.json"
     CONFIG="$ROOT_DIR/examples/configs/qwen2.5-vl-7b-dflash-offline-b200.yaml"
-    RUN_ID=qwen25vl-7b-dflash-llava68k
+    RUN_ID=qwen25vl-7b-dflash-llava68k${RUN_SUFFIX}
     ;;
   *)
     echo "SPECFORGE_MODEL_SIZE must be 3b or 7b" >&2
@@ -197,7 +205,7 @@ fi
 
 DRAFT_CONFIG="$ARTIFACT_ROOT/draft_config_phase2.json"
 resolve_phase_config() {
-  local source=$1 destination=$2 phase=$3 layer_ids=${4:-}
+  local source=$1 destination=$2 phase=$3 layer_ids=${4:-} draft_layers=${5:-}
   local args=(
     --input "$source"
     --output "$destination"
@@ -206,10 +214,14 @@ resolve_phase_config() {
   if [[ -n "$layer_ids" ]]; then
     args+=(--target-layer-ids "$layer_ids")
   fi
+  if [[ -n "$draft_layers" ]]; then
+    args+=(--draft-num-hidden-layers "$draft_layers")
+  fi
   "$PYTHON_BIN" "$ROOT_DIR/scripts/resolve_dflash_config.py" "${args[@]}"
 }
 resolve_phase_config \
-  "$BASE_DRAFT_CONFIG" "$DRAFT_CONFIG" phase2 "$PHASE2_TARGET_LAYER_IDS"
+  "$BASE_DRAFT_CONFIG" "$DRAFT_CONFIG" phase2 "$PHASE2_TARGET_LAYER_IDS" \
+  "$DRAFT_NUM_HIDDEN_LAYERS"
 
 MANIFEST="$ARTIFACT_ROOT/manifest.jsonl"
 FEATURE_ROOT="$ARTIFACT_ROOT/hidden_states"
