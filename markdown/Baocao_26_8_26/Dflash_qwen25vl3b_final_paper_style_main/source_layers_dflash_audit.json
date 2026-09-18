@@ -1,0 +1,42 @@
+{
+  "coverage_gaps": {
+    "attention_targets": [
+      400,
+      3000
+    ],
+    "length_targets": [
+      400,
+      3000,
+      13000,
+      25000
+    ],
+    "retention_percentages": [
+      0,
+      1,
+      5,
+      10,
+      25,
+      100
+    ]
+  },
+  "coverage_valid": false,
+  "error_rows": [],
+  "experiment_counts": {
+    "qwen25vl_target_attention": 1800,
+    "qwen25vl_target_hidden_cosine": 1800,
+    "qwen25vl_target_visual_kv": 350
+  },
+  "invalid_rows": [],
+  "lossless_rows": 0,
+  "mismatch_rows": 0,
+  "result_rows": 3950,
+  "result_status_counts": {
+    "ok": 3950
+  },
+  "retention_fingerprint_errors": [],
+  "semantic_status_counts": {
+    "target_side_diagnostic": 3950
+  },
+  "unsupported_rows": [],
+  "valid_rows": 3950
+}

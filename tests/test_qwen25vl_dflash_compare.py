@@ -664,6 +664,8 @@ def test_instrumented_decoder_accepts_stub_block_and_forwards_video_once():
     assert result.output_ids[0, input_ids.shape[1] :].tolist() == [4, 5, 6, 7, 8]
     assert result.acceptance_rounds
     assert result.acceptance_rounds[0]["matched_proposals"] == 3
+    assert result.acceptance_rounds[0]["proposal_positions"] == [1, 2, 3]
+    assert result.acceptance_rounds[0]["accepted_proposal_positions"] == [1, 2, 3]
     assert result.acceptance_rounds[0]["block_text"]
     assert result.acceptance_rounds[0]["draft_proposal_text"]
     assert result.acceptance_rounds[0]["block_token_ids"]
@@ -779,6 +781,32 @@ def test_instrumented_decoder_rebuilds_positions_for_cut_context():
     assert draft.seen[0][0] == 2
     assert draft.seen[0][1] == 2 + draft.block_size
     assert draft.seen[0][2] is None
+
+
+def test_instrumented_decoder_compacts_raw_prefill_hidden_for_cut_context():
+    target = _Target()
+
+    class RecordingDraft(_Draft):
+        def __init__(self):
+            self.seen_lengths = []
+
+        def __call__(self, *args, **kwargs):
+            self.seen_lengths.append(int(kwargs["target_hidden"].shape[1]))
+            return super().__call__(*args, **kwargs)
+
+    draft = RecordingDraft()
+    decoder = InstrumentedDFlashDecoder(target, draft, device=torch.device("cpu"))
+
+    decoder.decode(
+        input_ids=torch.tensor([[1, 2, 3]]),
+        position_ids=torch.arange(3).view(1, -1),
+        target_kwargs=None,
+        max_new_tokens=1,
+        stop_token_ids=[],
+        prefill_target_context_keep_mask=torch.tensor([True, False, True]),
+    )
+
+    assert draft.seen_lengths == [2]
 
 
 def test_instrumented_decoder_trims_at_stop_token_after_full_budget():

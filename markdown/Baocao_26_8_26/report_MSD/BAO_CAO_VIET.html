@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Báo cáo Sparrow insight cho MSD</title>
+  <style>
+    body { max-width: 1100px; margin: 2rem auto; padding: 0 1rem; font: 16px/1.55 Arial, sans-serif; color: #202124; }
+    h1, h2 { color: #17365d; }
+    table { border-collapse: collapse; width: 100%; margin: 1rem 0 2rem; }
+    th, td { border: 1px solid #c8c8c8; padding: .45rem .6rem; text-align: left; }
+    th { background: #eef3f8; }
+    figure { margin: 1.5rem 0 2.5rem; }
+    figure img { display: block; width: 100%; height: auto; border: 1px solid #ddd; }
+    figcaption { margin-top: .5rem; font-weight: 600; }
+    .ok { color: #137333; font-weight: 700; }
+    .note { background: #fff8e1; border-left: 4px solid #f9ab00; padding: .7rem 1rem; }
+  </style>
+</head>
+<body>
+  <h1>Báo cáo thực nghiệm Sparrow insight cho MSD</h1>
+  <p>Figures 1/2/6 là local Qwen2-VL analogue trên VDC-50; Figure 3 đã được
+  cập nhật riêng bằng Qwen2.5-VL-3B trên cohort MVBench 1.000 mẫu.</p>
+
+  <table>
+    <tr><th>Hạng mục</th><th>Kết quả</th></tr>
+    <tr><td>Audit</td><td class="ok">valid=true</td></tr>
+    <tr><td>Coverage</td><td class="ok">valid=true; paired cohort=10</td></tr>
+    <tr><td>Evidence rows</td><td>2.659</td></tr>
+    <tr><td>Diagnostic rows</td><td>51, không dùng trong statistics</td></tr>
+    <tr><td>Test suite</td><td>48 passed, 1 skipped</td></tr>
+  </table>
+
+  <h2>Figure 1 — MSD acceptance và retention</h2>
+  <figure>
+    <img src="./figure1/figure1_insight_summary.png" alt="Figure 1: MSD acceptance và retention">
+    <figcaption>Figure 1(a/b)</figcaption>
+  </figure>
+
+  <h2>Figure 2 — Draft attention</h2>
+  <figure>
+    <img src="./figure2/figure2_insight_attention.png" alt="Figure 2: draft attention">
+    <figcaption>Figure 2</figcaption>
+  </figure>
+
+  <h2>Figure 3 — Qwen2.5-VL-3B visual flow và attention</h2>
+  <figure>
+    <img src="./figure3/figure3_insight_layer_analysis.png" alt="Figure 3: Qwen2.5-VL-3B visual KV ablation and all-layer visual attention">
+    <figcaption>Figure 3(a): visual KV layer ablation; Figure 3(b): all-layer visual attention</figcaption>
+  </figure>
+  <p>Hai panel dùng cùng Qwen2.5-VL-3B, cùng cohort MVBench 1.000 mẫu và preprocessing 8-frame. Panel (a) có 10.000 scored rows; panel (b) có 36.000 rows trên 36 layers và 16 heads, không có error record.</p>
+  <ul>
+    <li><a href="figure3/figure3a_qwen25vl3b_full_20260821.png">Panel (a) PNG</a></li>
+    <li><a href="figure3/figure3b_qwen25vl3b_visual_attention_20260822.png">Panel (b) PNG</a></li>
+    <li><a href="../figure3b_qwen25vl3b_visual_attention_20260822/visual_attention.summary.json">Panel (b) summary</a></li>
+    <li><a href="../figure3b_qwen25vl3b_visual_attention_20260822/visual_attention.jsonl">Panel (b) raw JSONL</a></li>
+  </ul>
+
+  <h2>Figure 6 / Appendix D — Layerwise retention</h2>
+  <figure>
+    <img src="./figure6/figure6_insight_retention.png" alt="Figure 6: layerwise retention">
+    <figcaption>Figure 6 / Appendix D</figcaption>
+  </figure>
+
+  <h2>Artifacts</h2>
+  <ul>
+    <li><a href="BAO_CAO_VIET.md">Báo cáo Markdown đầy đủ</a></li>
+    <li><a href="REPORT.md">Report kỹ thuật</a></li>
+    <li><a href="metadata/paper_statistics.json">paper_statistics.json</a></li>
+    <li><a href="audit/audit_full.json">audit_full.json</a></li>
+    <li><a href="figure2/audit_figure2_homogeneous.json">audit_figure2_homogeneous.json</a></li>
+    <li><a href="figure2/figure2_homogeneous_cohort.json">figure2_homogeneous_cohort.json</a></li>
+    <li><a href="figure3/figure3_insight_layer_analysis.png">Figure 3 composite</a></li>
+    <li><a href="../figure3b_qwen25vl3b_visual_attention_20260822/visual_attention.summary.json">Figure 3(b) summary</a></li>
+    <li><a href="figure3/figure3b_statistics.csv">Figure 3(b) canonical statistics CSV</a></li>
+    <li><a href="figure3/figure3b_qwen25vl3b_statistics_20260822.csv">Figure 3(b) dated statistics CSV</a></li>
+    <li><a href="../results.jsonl">results.jsonl</a></li>
+  </ul>
+
+  <p class="note">Đây là local analogue trên VDC-50, không phải reproduction exact số liệu hoặc task accuracy của paper Sparrow.</p>
+</body>
+</html>

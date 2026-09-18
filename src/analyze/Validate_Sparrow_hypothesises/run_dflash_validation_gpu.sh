@@ -6,7 +6,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../../../scripts/resolve_workspace.sh"
 TARGET_MODEL="${TARGET_MODEL:-Qwen/Qwen2.5-VL-3B-Instruct}"
-CHECKPOINT="${CHECKPOINT:-dataset/qwen25vl-3b-dflash-llava68k-latest/training_state.pt}"
+CHECKPOINT="${CHECKPOINT:-dataset/qwen25vl-3b-dflash-20e-llava68k-latest/training_state.pt}"
 DRAFT_CONFIG="${DRAFT_CONFIG:-src/train_Dflash_SpecForge/configs/qwen2.5-vl-3b-dflash.json}"
 MANIFEST="${MANIFEST:-dataset/VideoDetailCaption/test.jsonl}"
 VIDEO_ROOT="${VIDEO_ROOT:-dataset/VideoDetailCaption}"

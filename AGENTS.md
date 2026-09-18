@@ -36,3 +36,8 @@ Use short, imperative commit subjects such as `Add ...`, `Fix ...`, or `Update .
 ## Security & Configuration Tips
 
 Never commit access tokens, local model paths, raw datasets, checkpoints, or large generated caches. Use Hugging Face CLI authentication and variables such as `HF_HOME` for credentials and storage configuration. Before sharing results, check logs and configs for secrets or private dataset locations.
+
+## Workflow Memory
+
+See [WORKFLOW_NOTES.md](WORKFLOW_NOTES.md) for the persistent experiment,
+checkpoint, metric, report, and cleanup procedures used in this workspace.

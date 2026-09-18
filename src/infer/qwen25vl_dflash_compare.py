@@ -20,9 +20,17 @@ from typing import Any, Callable, Iterator
 
 import torch
 
-from src.analyze.Whether_they_are_appliable_for_dDrafter.compare_dflash_reference import (
-    score_pair,
-)
+try:
+    from src.analyze.Whether_they_are_appliable_for_dDrafter.compare_dflash_reference import (
+        score_pair,
+    )
+except ModuleNotFoundError as exc:
+    # The historical caption-scoring helper is not part of every checkout.
+    # DFlash decoding does not depend on it, so keep inference importable and
+    # provide the local overlap metric used by the validation reports.
+    if exc.name != "src.analyze.Whether_they_are_appliable_for_dDrafter":
+        raise
+    from src.analyze.Validate_Sparrow_hypothesises.metrics import score_pair
 from src.infer.qwen25vl_dflash_parallel import (
     build_qwen25vl_model_parallel_map,
     parse_max_memory,
@@ -326,17 +334,28 @@ def summarize_dflash_attention(
 
 
 @contextmanager
-def capture_dflash_attention(draft: Any):
-    """Capture eager DFlash self-attention weights without changing outputs."""
+def capture_dflash_attention(draft: Any, *, first_forward_only: bool = False):
+    """Capture eager DFlash self-attention weights without changing outputs.
+
+    ``first_forward_only`` is useful for context-region probes: the first
+    forward of each draft layer is the only call whose key prefix is exactly
+    the prompt context. Later decoding calls also contain generated-token
+    cache entries and can be much larger than the region under study.
+    """
 
     records: list[dict[str, Any]] = []
     handles = []
+    forward_counts: dict[int, int] = {}
     for layer_index, layer in enumerate(getattr(draft, "layers", ())):
         attention = getattr(layer, "self_attn", None)
         if attention is None or not hasattr(attention, "register_forward_hook"):
             continue
 
         def hook(_module, _inputs, output, *, _layer_index=layer_index):
+            forward_index = forward_counts.get(_layer_index, 0)
+            forward_counts[_layer_index] = forward_index + 1
+            if first_forward_only and forward_index != 0:
+                return
             if not isinstance(output, (tuple, list)) or len(output) < 2:
                 return
             weights = output[1]
@@ -344,6 +363,7 @@ def capture_dflash_attention(draft: Any):
                 records.append(
                     {
                         "layer_index": int(_layer_index),
+                        "forward_index": int(forward_index),
                         "context_length": int(weights.shape[-1] - weights.shape[-2]),
                         "weights": weights.detach().cpu(),
                     }
@@ -603,12 +623,21 @@ class InstrumentedDFlashDecoder:
                     "dimension"
             )
             target_hidden = transformed_hidden
-        if cut_context and target_hidden.shape[1] != int(
-            prefill_target_context_keep_mask.sum().item()
-        ):
-            raise ValueError(
-                "cut target hidden length must equal the number of kept context positions"
-            )
+        if cut_context:
+            keep_count = int(prefill_target_context_keep_mask.sum().item())
+            if target_hidden.shape[1] == prompt_length:
+                # The target hook returns one hidden vector per original
+                # prompt position.  Compact the DFlash context only after any
+                # optional value transform has been applied.
+                target_hidden = target_hidden[
+                    :, prefill_target_context_keep_mask.to(target_hidden.device), :
+                ]
+            elif target_hidden.shape[1] != keep_count:
+                raise ValueError(
+                    "cut target hidden length must equal the number of kept "
+                    f"context positions (hidden_shape={tuple(target_hidden.shape)}, "
+                    f"keep_count={keep_count}, prompt_length={prompt_length})"
+                )
         cut_prompt_positions = (
             all_positions[..., :prompt_length][..., prefill_target_context_keep_mask].to(
                 device=self.draft_device
@@ -702,6 +731,10 @@ class InstrumentedDFlashDecoder:
             proposal_matches = block_output_ids[:, 1:] == posterior[:, :-1]
             accepted = int(proposal_matches.cumprod(dim=1).sum(dim=1)[0].item())
             emitted = accepted + 1
+            proposal_position_start = start - prompt_length + 1
+            proposal_positions = list(
+                range(proposal_position_start, proposal_position_start + proposals.shape[1])
+            )
             output_ids[:, start : start + emitted] = block_output_ids[:, :emitted]
             output_ids[:, start + emitted] = posterior[:, accepted]
             draft_proposal_token_ids = proposals[0].detach().cpu().tolist()
@@ -723,6 +756,12 @@ class InstrumentedDFlashDecoder:
                     "proposal_count": int(proposals.shape[1]),
                     "matched_proposals": accepted,
                     "effective_emitted_tokens": emitted,
+                    # Position 0 is the target-generated anchor already
+                    # present before the first speculative block.  Proposal
+                    # positions therefore start at answer position 1.
+                    "answer_position_start": int(proposal_position_start),
+                    "proposal_positions": proposal_positions,
+                    "accepted_proposal_positions": proposal_positions[:accepted],
                     "draft_proposal_token_ids": draft_proposal_token_ids,
                     "draft_proposal_text": self._decode_token_ids(
                         draft_proposal_token_ids
@@ -1026,8 +1065,8 @@ DEFAULT_DRAFT_CONFIG = (
     workspace_path("src", "train_Dflash_SpecForge", "configs", "qwen2.5-vl-3b-dflash.json")
 )
 DEFAULT_CHECKPOINTS = (
-    workspace_path("dataset", "qwen25vl-3b-dflash-llava68k-latest"),
-    workspace_path("dataset", "qwen25vl-3b-dflash-sharegpt68k-latest"),
+    workspace_path("dataset", "qwen25vl-3b-dflash-20e-llava68k-latest"),
+    workspace_path("dataset", "qwen25vl-3b-dflash-20e-sharegpt68k-latest"),
 )
 DEFAULT_MANIFEST = workspace_path("dataset", "VideoDetailCaption", "test.jsonl")
 DEFAULT_VIDEO_ROOT = workspace_path("dataset", "VideoDetailCaption")
@@ -1111,10 +1150,16 @@ def _load_target(
     try:
         target = model_cls.from_pretrained(
             model_path,
-            dtype=dtype,
+            torch_dtype=dtype,
             **load_kwargs,
         )
     except (AttributeError, TypeError, ValueError):
+        # A failed constructor may have materialized checkpoint tensors before
+        # reporting an API incompatibility. Release those allocations before
+        # trying the compatibility class, otherwise the retry can OOM.
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         try:
             from transformers import AutoModelForVision2Seq as fallback_cls
         except ImportError:

@@ -1,0 +1,43 @@
+{
+  "coverage_gaps": {
+    "layer_cuts": [
+      0,
+      4,
+      8,
+      12,
+      16,
+      20,
+      24
+    ]
+  },
+  "coverage_valid": false,
+  "error_rows": [],
+  "experiment_counts": {
+    "dflash_context_attention": 40830,
+    "length_sweep": 200,
+    "target_hidden_visual_retention": 300
+  },
+  "invalid_rows": [],
+  "lossless_rows": 86,
+  "mismatch_rows": 413,
+  "result_rows": 41330,
+  "result_status_counts": {
+    "mismatch": 413,
+    "ok": 40916,
+    "unsupported": 1
+  },
+  "retention_fingerprint_errors": [],
+  "semantic_status_counts": {
+    "adapted": 41130,
+    "direct": 200
+  },
+  "unsupported_rows": [
+    {
+      "experiment": "length_sweep",
+      "index": 3,
+      "reason": "ValueError: nframes should in interval [2, 90], but got 128.",
+      "sample_id": "v_AwgGYaV1lT0"
+    }
+  ],
+  "valid_rows": 41329
+}

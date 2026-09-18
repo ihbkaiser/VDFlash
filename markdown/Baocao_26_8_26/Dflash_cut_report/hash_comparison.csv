@@ -1,0 +1,9 @@
+dataset,scenario,condition,device,same_device_as_full,target,qwen25vl-3b-dflash-llava68k-latest,qwen25vl-3b-dflash-sharegpt68k-latest
+mvbench,Full visual,full,cuda:0,True,0,0,0
+mvbench,"EXP2 zero (L25,33)",exp2_zero,cuda:0,True,10,11,11
+mvbench,"EXP1 zero (L1,9,17,25,33)",exp1_zero,cuda:0,True,0,0,0
+mvbench,"EXP1 cut (L1,9,17,25,33)",exp1_cut,cuda:0,True,0,0,0
+vdc50,Full visual,full,cuda:0,True,0,0,0
+vdc50,"EXP2 zero (L25,33)",exp2_zero,cuda:0,True,0,0,0
+vdc50,"EXP1 zero (L1,9,17,25,33)",exp1_zero,cuda:0,True,0,0,0
+vdc50,"EXP1 cut (L1,9,17,25,33)",exp1_cut,cuda:1,False,48,47,47

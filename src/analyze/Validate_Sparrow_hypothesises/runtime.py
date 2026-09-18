@@ -78,6 +78,37 @@ def model_device(model: Any) -> torch.device:
         raise RuntimeUnavailableError("model has no parameters") from exc
 
 
+def acceptance_round_record(
+    *,
+    prompt_length: int,
+    current_length: int,
+    accept_length: int,
+    round_index: int,
+) -> dict[str, Any]:
+    """Map one speculative round to absolute answer-token positions.
+
+    ``accept_length`` is the number of draft proposals accepted by the
+    vendored EAGLE loop.  The loop then emits one additional target token as
+    the fallback/next-token position, so that token is recorded separately
+    rather than being counted as a draft acceptance.
+    """
+
+    if prompt_length < 0 or current_length < prompt_length:
+        raise ValueError("current_length must be at least prompt_length")
+    if accept_length < 0 or round_index < 0:
+        raise ValueError("accept_length and round_index must be non-negative")
+    answer_start = current_length - prompt_length
+    return {
+        "round_index": int(round_index),
+        "answer_position_start": int(answer_start),
+        "accepted_proposal_count": int(accept_length),
+        "accepted_proposal_positions": list(range(answer_start, answer_start + accept_length)),
+        "fallback_position": int(answer_start + accept_length),
+        "absolute_position_start": int(current_length),
+        "emitted_token_count": int(accept_length + 1),
+    }
+
+
 def move_batch_to_device(batch: Any, device: torch.device | str) -> Any:
     """Move a processor batch without assuming it is a plain dictionary."""
 
@@ -724,6 +755,63 @@ def clear_msd_runtime_state(model: Any) -> None:
         pass
 
 
+@contextmanager
+def zero_msd_draft_visual_values(
+    model: Any,
+    visual_positions: Sequence[int],
+):
+    """Zero draft value-projection rows for visual tokens during prefill.
+
+    The Q/K paths and M-RoPE positions are untouched. The hook only fires when
+    a value projection receives the long initial context containing the
+    requested visual positions; tree-expansion calls with short generated
+    sequences are left unchanged.
+    """
+
+    positions = sorted({int(value) for value in visual_positions})
+    if any(value < 0 for value in positions):
+        raise ValueError("visual positions must be non-negative")
+    originals: list[tuple[Any, Any]] = []
+    debug_printed = [False]
+    for layer in model.ea_layer.layers:
+        module = layer.self_attn.v_proj
+        original = module.forward
+
+        def wrapped(
+            hidden_states: torch.Tensor,
+            *args: Any,
+            _original=original,
+            _positions=positions,
+            **kwargs: Any,
+        ):
+            result = _original(hidden_states, *args, **kwargs)
+            if (
+                _positions
+                and isinstance(result, torch.Tensor)
+                and result.ndim == 3
+                and max(_positions) < result.shape[1]
+            ):
+                if os.environ.get("HYPOTHESIS_DEBUG_VALUE") == "1" and not debug_printed[0]:
+                    print(
+                        f"[debug value] positions=0..{max(_positions)}"
+                        f" count={len(_positions)} result_shape={tuple(result.shape)}",
+                        flush=True,
+                    )
+                    debug_printed[0] = True
+                result = result.clone()
+                index = torch.as_tensor(_positions, dtype=torch.long, device=result.device)
+                result.index_fill_(1, index, 0.0)
+            return result
+
+        originals.append((module, original))
+        module.forward = wrapped
+    try:
+        yield
+    finally:
+        for module, original in originals:
+            module.forward = original
+
+
 def apply_chunked_video_vision(model: Any, chunk_frames: int = 8) -> None:
     """Run Qwen2-VL vision frames in bounded chunks.
 
@@ -957,6 +1045,7 @@ def patched_msd_video_path(model: Any, prepared: PreparedPrefill):
     lm_head_context.__enter__()
     capture: dict[str, Any] = {
         "trace": [],
+        "acceptance_by_position": [],
         "prefill_seconds": None,
         "verification_start": None,
         "verification_end": None,
@@ -966,6 +1055,23 @@ def patched_msd_video_path(model: Any, prepared: PreparedPrefill):
         result = old_evaluate(*args, **kwargs)
         capture["trace"].append(int(result[1]))
         return result
+
+    old_update = ea_module.update_inference_inputs
+
+    def update_with_position_trace(*args: Any, **kwargs: Any):
+        input_ids = kwargs.get("input_ids", args[0] if args else None)
+        accept_length = kwargs.get("accept_length", args[3] if len(args) > 3 else None)
+        if input_ids is None or accept_length is None:
+            raise ValueError("MSD update trace could not read input_ids/accept_length")
+        capture["acceptance_by_position"].append(
+            acceptance_round_record(
+                prompt_length=int(prepared.input_ids.shape[1]),
+                current_length=int(input_ids.shape[1]),
+                accept_length=int(accept_length),
+                round_index=len(capture["acceptance_by_position"]),
+            )
+        )
+        return old_update(*args, **kwargs)
 
     def initialize_with_timing(*args, **kwargs):
         if torch.cuda.is_available():
@@ -995,6 +1101,7 @@ def patched_msd_video_path(model: Any, prepared: PreparedPrefill):
     ea_module.initialize_tree = initialize_with_timing
     ea_module.tree_decoding = tree_decoding_with_timing
     ea_module.evaluate_posterior = evaluate_with_trace
+    ea_module.update_inference_inputs = update_with_position_trace
     try:
         yield capture
     finally:
@@ -1005,6 +1112,7 @@ def patched_msd_video_path(model: Any, prepared: PreparedPrefill):
         ea_module.initialize_tree = old_initialize
         ea_module.tree_decoding = old_tree
         ea_module.evaluate_posterior = old_evaluate
+        ea_module.update_inference_inputs = old_update
         # msdgenerate leaves tree_mask/tree_mode set on the base model after the
         # loop (reset_tree_mode only runs at the start). A following sample in
         # the same process would otherwise reuse the stale tree mask and corrupt
@@ -1025,6 +1133,7 @@ def generate_msd_full_video(
     model: Any,
     prepared: PreparedPrefill,
     max_new_tokens: int = 512,
+    zero_visual_values: bool = False,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Run the original MSD algorithm with the local native-video patch.
 
@@ -1045,15 +1154,21 @@ def generate_msd_full_video(
     # index error looks like a sequence-length/parity failure.  Force the
     # official allocator to size a fresh cache for every independent job.
     clear_msd_runtime_state(model)
-    with patched_msd_video_path(model, prepared) as capture:
-        output = model.msdgenerate(
-            prepared.input_ids,
-            inputs_embeds=prepared.inputs_embeds,
-            temperature=0.0,
-            max_new_tokens=max_new_tokens,
-            max_length=int(prepared.input_ids.shape[1] + max_new_tokens + 64),
-            log=False,
-        )
+    value_context = (
+        zero_msd_draft_visual_values(model, prepared.video_positions.tolist())
+        if zero_visual_values
+        else nullcontext()
+    )
+    with value_context:
+        with patched_msd_video_path(model, prepared) as capture:
+            output = model.msdgenerate(
+                prepared.input_ids,
+                inputs_embeds=prepared.inputs_embeds,
+                temperature=0.0,
+                max_new_tokens=max_new_tokens,
+                max_length=int(prepared.input_ids.shape[1] + max_new_tokens + 64),
+                log=False,
+            )
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
@@ -1072,6 +1187,7 @@ def generate_msd_full_video(
         "speculative_seconds": elapsed,
         "end_to_end_seconds": elapsed,
         "acceptance_trace": acceptance_trace,
+        "acceptance_by_position": capture["acceptance_by_position"],
         "accepted_prefix_tokens": (sum(acceptance_trace) / len(acceptance_trace)) if acceptance_trace else None,
         "verification_steps": len(acceptance_trace),
         "input_fingerprint": prepared.input_fingerprint,
@@ -1084,6 +1200,7 @@ def generate_msd_retention_video(
     prepared_full: PreparedPrefill,
     prepared_draft: PreparedPrefill,
     max_new_tokens: int = 512,
+    zero_visual_values: bool = False,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """MSD decode for the Figure 1(b) retention sweep.
 
@@ -1110,127 +1227,133 @@ def generate_msd_retention_video(
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     clear_msd_runtime_state(model)
-    with patched_msd_video_path(model, prepared_full) as capture:
-        model.ea_layer.reset_kv()
-        past_key_values, past_key_values_data, current_length_data = ea_module.initialize_past_key_values(
-            model.base_model,
-            max_position_embeddings=prepared_full.input_ids.shape[1] + max_new_tokens + 64,
-        )
-        ea_module.reset_tree_mode(model)
-        input_ids = prepared_full.input_ids.clone()
-        input_len = int(input_ids.shape[1])
-        max_length = input_len + max_new_tokens + 64 - model.ea_layer.total_tokens - 10
+    value_context = (
+        zero_msd_draft_visual_values(model, prepared_draft.video_positions.tolist())
+        if zero_visual_values
+        else nullcontext()
+    )
+    with value_context:
+        with patched_msd_video_path(model, prepared_full) as capture:
+            model.ea_layer.reset_kv()
+            past_key_values, past_key_values_data, current_length_data = ea_module.initialize_past_key_values(
+                model.base_model,
+                max_position_embeddings=prepared_full.input_ids.shape[1] + max_new_tokens + 64,
+            )
+            ea_module.reset_tree_mode(model)
+            input_ids = prepared_full.input_ids.clone()
+            input_len = int(input_ids.shape[1])
+            max_length = input_len + max_new_tokens + 64 - model.ea_layer.total_tokens - 10
 
-        # 1. Target prefill on the FULL context (full video + text).
-        _outputs, orig, hidden_states = model(
-            input_ids,
-            past_key_values=past_key_values,
-            output_orig=True,
-            inputs_embeds=prepared_full.inputs_embeds,
-            position_ids=prepared_full.position_ids,
-        )
-        token = torch.argmax(orig[:, -1], dim=-1, keepdim=True)
+            # 1. Target prefill on the FULL context (full video + text).
+            _outputs, orig, hidden_states = model(
+                input_ids,
+                past_key_values=past_key_values,
+                output_orig=True,
+                inputs_embeds=prepared_full.inputs_embeds,
+                position_ids=prepared_full.position_ids,
+            )
+            token = torch.argmax(orig[:, -1], dim=-1, keepdim=True)
 
-        # 2. Draft tree on the COMPACTED context: the kept target hidden states
-        #    and the kept input embeddings.  topK_genrate extends the embedding
-        #    sequence with the first sampled token itself, so the embeddings
-        #    must be aligned with the compacted hidden states (length C).
-        keep_gpu = keep.to(device=hidden_states.device)
-        compact_hidden = hidden_states[:, keep_gpu]
-        draft_input_ids = prepared_draft.input_ids
-        extended_compact_ids = torch.cat((draft_input_ids, token.to(draft_input_ids.device)), dim=1)
+            # 2. Draft tree on the COMPACTED context: the kept target hidden states
+            #    and the kept input embeddings.  topK_genrate extends the embedding
+            #    sequence with the first sampled token itself, so the embeddings
+            #    must be aligned with the compacted hidden states (length C).
+            keep_gpu = keep.to(device=hidden_states.device)
+            compact_hidden = hidden_states[:, keep_gpu]
+            draft_input_ids = prepared_draft.input_ids
+            extended_compact_ids = torch.cat((draft_input_ids, token.to(draft_input_ids.device)), dim=1)
 
         # Rebuild calls from update_inference_inputs pass the *full* growing
         # input_ids, but the draft's cached KV is the compacted one.  Remap
         # them to the compacted growing sequence: the initial compacted
         # context plus the accepted tokens that follow the full context.
-        full_len = int(input_ids.shape[1])
-        original_topk = model.ea_layer.topK_genrate
+            full_len = int(input_ids.shape[1])
+            original_topk = model.ea_layer.topK_genrate
 
-        def compacted_topk(*args: Any, **kwargs: Any):
-            inputs_embeds = kwargs.get("inputs_embeds", args[4] if len(args) > 4 else None)
-            if inputs_embeds is not None:
-                # First call: the compacted context (with real visual features).
+            def compacted_topk(*args: Any, **kwargs: Any):
+                inputs_embeds = kwargs.get("inputs_embeds", args[4] if len(args) > 4 else None)
+                if inputs_embeds is not None:
+                    # First call: the compacted context (with real visual features).
+                    return original_topk(*args, **kwargs)
+                ids = kwargs.get("input_ids", args[1] if len(args) > 1 else None)
+                if ids is None:
+                    raise ValueError("topK_genrate requires input_ids")
+                compacted_ids = torch.cat((draft_input_ids, ids[:, full_len:]), dim=1)
+                if "input_ids" in kwargs:
+                    kwargs["input_ids"] = compacted_ids
+                else:
+                    args = list(args)
+                    args[1] = compacted_ids
+                    args = tuple(args)
                 return original_topk(*args, **kwargs)
-            ids = kwargs.get("input_ids", args[1] if len(args) > 1 else None)
-            if ids is None:
-                raise ValueError("topK_genrate requires input_ids")
-            compacted_ids = torch.cat((draft_input_ids, ids[:, full_len:]), dim=1)
-            if "input_ids" in kwargs:
-                kwargs["input_ids"] = compacted_ids
-            else:
-                args = list(args)
-                args[1] = compacted_ids
-                args = tuple(args)
-            return original_topk(*args, **kwargs)
 
-        model.ea_layer.topK_genrate = compacted_topk
-        try:
-            draft_tokens, retrieve_indices, tree_mask, tree_position_ids = model.ea_layer.topK_genrate(
-                compact_hidden,
-                extended_compact_ids,
-                model.base_model.lm_head,
-                None,
-                prepared_draft.inputs_embeds,
-            )
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            capture["prefill_seconds"] = time.perf_counter() - start
-
-            # 3. Verification loop: identical to msdgenerate, the target KV is
-            #    the full-context cache and grows with the accepted tokens.
-            new_token = 0
-            for _idx in range(max_length):
-                model.base_model.model.tree_mask = tree_mask
-                draft_tokens = draft_tokens.to(input_ids.device)
-                logits, hidden_state_new, _outputs = ea_module.tree_decoding(
-                    model,
-                    draft_tokens,
-                    past_key_values,
-                    tree_position_ids,
-                    input_ids,
-                    retrieve_indices,
-                )
-                draft_tokens = torch.cat(
-                    (draft_tokens, torch.full((1, 1), -1, dtype=torch.long, device=input_ids.device)), dim=1
-                )
-                candidates = draft_tokens[0, retrieve_indices]
-                best_candidate, accept_length, sample_p = ea_module.evaluate_posterior(
-                    logits, candidates, None
-                )
-                (
-                    input_ids,
-                    draft_tokens,
-                    retrieve_indices,
-                    tree_mask,
-                    tree_position_ids,
-                    new_token,
-                    _hidden_state,
-                    _sample_token,
-                ) = ea_module.update_inference_inputs(
-                    input_ids,
-                    candidates,
-                    best_candidate,
-                    accept_length,
-                    retrieve_indices,
+            model.ea_layer.topK_genrate = compacted_topk
+            try:
+                draft_tokens, retrieve_indices, tree_mask, tree_position_ids = model.ea_layer.topK_genrate(
+                    compact_hidden,
+                    extended_compact_ids,
+                    model.base_model.lm_head,
                     None,
-                    new_token,
-                    past_key_values_data,
-                    current_length_data,
-                    model,
-                    hidden_state_new,
-                    sample_p,
+                    prepared_draft.inputs_embeds,
                 )
-                if model.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
-                    break
-                if hasattr(model.tokenizer, "eod_id") and model.tokenizer.eod_id in input_ids[0, input_len:].tolist():
-                    break
-                if new_token > max_new_tokens:
-                    break
-                if input_ids.shape[1] > max_length:
-                    break
-        finally:
-            model.ea_layer.topK_genrate = original_topk
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                capture["prefill_seconds"] = time.perf_counter() - start
+
+                # 3. Verification loop: identical to msdgenerate, the target KV is
+                #    the full-context cache and grows with the accepted tokens.
+                new_token = 0
+                for _idx in range(max_length):
+                    model.base_model.model.tree_mask = tree_mask
+                    draft_tokens = draft_tokens.to(input_ids.device)
+                    logits, hidden_state_new, _outputs = ea_module.tree_decoding(
+                        model,
+                        draft_tokens,
+                        past_key_values,
+                        tree_position_ids,
+                        input_ids,
+                        retrieve_indices,
+                    )
+                    draft_tokens = torch.cat(
+                        (draft_tokens, torch.full((1, 1), -1, dtype=torch.long, device=input_ids.device)), dim=1
+                    )
+                    candidates = draft_tokens[0, retrieve_indices]
+                    best_candidate, accept_length, sample_p = ea_module.evaluate_posterior(
+                        logits, candidates, None
+                    )
+                    (
+                        input_ids,
+                        draft_tokens,
+                        retrieve_indices,
+                        tree_mask,
+                        tree_position_ids,
+                        new_token,
+                        _hidden_state,
+                        _sample_token,
+                    ) = ea_module.update_inference_inputs(
+                        input_ids,
+                        candidates,
+                        best_candidate,
+                        accept_length,
+                        retrieve_indices,
+                        None,
+                        new_token,
+                        past_key_values_data,
+                        current_length_data,
+                        model,
+                        hidden_state_new,
+                        sample_p,
+                    )
+                    if model.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
+                        break
+                    if hasattr(model.tokenizer, "eod_id") and model.tokenizer.eod_id in input_ids[0, input_len:].tolist():
+                        break
+                    if new_token > max_new_tokens:
+                        break
+                    if input_ids.shape[1] > max_length:
+                        break
+            finally:
+                model.ea_layer.topK_genrate = original_topk
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
@@ -1249,6 +1372,7 @@ def generate_msd_retention_video(
         "speculative_seconds": elapsed,
         "end_to_end_seconds": elapsed,
         "acceptance_trace": acceptance_trace,
+        "acceptance_by_position": capture["acceptance_by_position"],
         "accepted_prefix_tokens": (sum(acceptance_trace) / len(acceptance_trace)) if acceptance_trace else None,
         "verification_steps": len(acceptance_trace),
         "input_fingerprint": prepared_draft.input_fingerprint,

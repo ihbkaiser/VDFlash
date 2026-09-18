@@ -1,0 +1,9 @@
+dataset,scenario,condition,mode,layers,device,same_device_as_full,summary_consistent,total,completed,lossless,mismatch,runtime_errors,target_accuracy,target_bleu,target_rouge_l
+mvbench,Full visual,full,full,,cuda:0,True,True,500,500,499,1,0,0.582,0.5930780208959591,0.22394219375395846
+mvbench,"EXP2 zero (L25,33)",exp2_zero,zero,"25,33",cuda:0,True,True,500,500,500,0,0,0.58,0.5974724434823305,0.2188671354789002
+mvbench,"EXP1 zero (L1,9,17,25,33)",exp1_zero,zero,"1,9,17,25,33",cuda:0,True,True,500,500,499,1,0,0.582,0.5930780208959591,0.22394219375395846
+mvbench,"EXP1 cut (L1,9,17,25,33)",exp1_cut,cut,"1,9,17,25,33",cuda:0,True,True,500,500,499,1,0,0.582,0.5930780208959591,0.22394219375395846
+vdc50,Full visual,full,full,,cuda:0,True,True,50,50,2,48,0,,0.050477462055103534,0.23755470685105975
+vdc50,"EXP2 zero (L25,33)",exp2_zero,zero,"25,33",cuda:0,True,True,50,50,2,48,0,,0.050477462055103534,0.23755470685105975
+vdc50,"EXP1 zero (L1,9,17,25,33)",exp1_zero,zero,"1,9,17,25,33",cuda:0,True,True,50,50,2,48,0,,0.050477462055103534,0.23755470685105975
+vdc50,"EXP1 cut (L1,9,17,25,33)",exp1_cut,cut,"1,9,17,25,33",cuda:1,False,True,50,50,6,44,0,,0.047628367823058806,0.23465670148382992

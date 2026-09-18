@@ -10,7 +10,7 @@ from datetime import date
 from dataclasses import asdict
 from pathlib import Path
 from collections.abc import Callable, Iterator, Mapping
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 
@@ -34,7 +34,7 @@ from src.workspace import resolve_workspace_path, workspace_path
 
 DFLASH_STAGE_ORDER = ("length", "retention", "attention", "layers", "report")
 DEFAULT_TARGET_MODEL = "Qwen/Qwen2.5-VL-3B-Instruct"
-DEFAULT_CHECKPOINT = "dataset/qwen25vl-3b-dflash-llava68k-latest/training_state.pt"
+DEFAULT_CHECKPOINT = "dataset/qwen25vl-3b-dflash-20e-llava68k-latest/training_state.pt"
 DEFAULT_DRAFT_CONFIG = str(
     workspace_path(
         "src", "train_Dflash_SpecForge", "configs", "qwen2.5-vl-3b-dflash.json"
@@ -404,7 +404,11 @@ def _decode_prompt(
     draft_device: torch.device | None,
     max_new_tokens: int,
     prefill_transform=None,
+    prefill_target_context_keep_mask: torch.Tensor | None = None,
     capture_attention: bool = False,
+    capture_first_attention_only: bool = False,
+    target_output_ids: Sequence[int] | None = None,
+    target_timing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     from src.infer.qwen25vl_dflash_compare import (
         InstrumentedDFlashDecoder,
@@ -413,20 +417,34 @@ def _decode_prompt(
         capture_dflash_attention,
     )
 
-    target_output, target_timing = _target_greedy(
-        target,
-        prompt,
-        max_new_tokens=max_new_tokens,
-        stop_token_ids=_eos_token_ids(processor, target),
-        device=device,
-    )
+    target_output = None
+    if target_output_ids is None:
+        target_output, target_timing = _target_greedy(
+            target,
+            prompt,
+            max_new_tokens=max_new_tokens,
+            stop_token_ids=_eos_token_ids(processor, target),
+            device=device,
+        )
+        prompt_length = int(prompt.inputs["input_ids"].shape[1])
+        resolved_target_ids = target_output[0, prompt_length:].detach().cpu().tolist()
+    else:
+        resolved_target_ids = [int(value) for value in target_output_ids]
+        target_timing = dict(target_timing or {})
     decoder = InstrumentedDFlashDecoder(
         target,
         draft,
         device=device,
         draft_device=draft_device or device,
     )
-    capture_context = capture_dflash_attention(draft) if capture_attention else None
+    capture_context = (
+        capture_dflash_attention(
+            draft,
+            first_forward_only=capture_first_attention_only,
+        )
+        if capture_attention
+        else None
+    )
     if capture_context is None:
         context_manager = _null_capture()
     else:
@@ -439,9 +457,10 @@ def _decode_prompt(
             max_new_tokens=max_new_tokens,
             stop_token_ids=_eos_token_ids(processor, target),
             prefill_target_hidden_transform=prefill_transform,
+            prefill_target_context_keep_mask=prefill_target_context_keep_mask,
         )
     prompt_length = int(prompt.inputs["input_ids"].shape[1])
-    target_ids = target_output[0, prompt_length:].detach().cpu().tolist()
+    target_ids = resolved_target_ids
     speculative_ids = speculative.output_ids[0, prompt_length:].detach().cpu().tolist()
     result = {
         "status": "ok" if target_ids == speculative_ids else "mismatch",
@@ -466,7 +485,9 @@ def _decode_prompt(
         "end_to_end": target_timing["end_to_end_s"]
         / max(speculative.end_to_end_s, 1e-12)
     }
-    del decoder, speculative, target_output
+    del decoder, speculative
+    if target_output is not None:
+        del target_output
     gc.collect()
     return result
 

@@ -6,7 +6,12 @@ from types import SimpleNamespace
 
 import torch
 
-from src.analyze.Validate_Sparrow_hypothesises.run_draft_attention import _rows_for_policy
+from src.analyze.Validate_Sparrow_hypothesises.run_draft_attention import (
+    _attention_density_metrics,
+    _logit_kl,
+    _remap_instruction_masks,
+    _rows_for_policy,
+)
 
 
 def _fake_captured(query_count: int = 1) -> dict[int, torch.Tensor]:
@@ -124,3 +129,86 @@ def test_draft_rows_reject_empty_capture():
         assert "no layers" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("expected RuntimeError for empty capture")
+
+
+def test_remap_instruction_masks_preserves_modalities_after_visual_deletion():
+    masks = _remap_instruction_masks(
+        {
+            "visual_positions": [1, 2],
+            "instruction_positions": [4, 5],
+            "text_positions": [0, 3],
+            "query_index": 5,
+            "assistant_marker_start": 6,
+        },
+        [True, False, True, True, True, True, False],
+    )
+
+    assert masks["visual_positions"] == [1]
+    assert masks["instruction_positions"] == [3, 4]
+    assert masks["text_positions"] == [0, 2]
+    assert masks["query_index"] == 4
+    assert masks["assistant_marker_start"] is None
+
+
+def test_logit_kl_is_zero_for_identical_logits_and_positive_for_shift():
+    logits = torch.tensor([2.0, 0.0, -1.0])
+    assert abs(_logit_kl(logits, logits)) < 1e-8
+    assert _logit_kl(logits, torch.tensor([-1.0, 0.0, 2.0])) > 0.0
+
+
+def test_attention_density_normalizes_mass_by_eligible_preceding_keys():
+    attention = torch.tensor([0.10, 0.20, 0.30, 0.40])
+    groups = {
+        "visual": torch.tensor([0, 1]),
+        "text": torch.tensor([2]),
+        "instruction": torch.tensor([3]),
+    }
+    metrics = _attention_density_metrics(
+        attention=attention,
+        groups=groups,
+        query_positions=[4],
+    )
+
+    assert metrics["visual_effective_key_count"] == 2.0
+    assert metrics["text_effective_key_count"] == 1.0
+    assert metrics["instruction_effective_key_count"] == 1.0
+    assert abs(metrics["visual_attention_density"] - 0.15) < 1e-6
+    assert abs(metrics["text_attention_density"] - 0.30) < 1e-6
+    assert abs(metrics["instruction_attention_density"] - 0.40) < 1e-6
+    # Under uniform attention over four strict-preceding keys, each key has .25.
+    assert abs(metrics["visual_density_ratio"] - 0.6) < 1e-6
+    assert abs(metrics["text_density_ratio"] - 1.2) < 1e-6
+    assert abs(metrics["instruction_density_ratio"] - 1.6) < 1e-6
+
+
+def test_attention_density_handles_deleted_visual_group():
+    metrics = _attention_density_metrics(
+        attention=torch.tensor([0.5, 0.5]),
+        groups={
+            "visual": torch.tensor([], dtype=torch.long),
+            "text": torch.tensor([0]),
+            "instruction": torch.tensor([1]),
+        },
+        query_positions=[2],
+    )
+
+    assert metrics["visual_effective_key_count"] == 0.0
+    assert metrics["visual_attention_density"] == 0.0
+    assert metrics["visual_density_ratio"] == 0.0
+
+
+def test_attention_density_uniform_reference_is_conditioned_on_group_eligibility():
+    metrics = _attention_density_metrics(
+        attention=torch.tensor([0.0, 0.0, 0.5, 0.5]),
+        groups={
+            "visual": torch.tensor([2]),
+            "text": torch.tensor([0]),
+            "instruction": torch.tensor([1]),
+        },
+        query_positions=[1, 4],
+    )
+
+    # The visual key is eligible only for q=4.  Its uniform reference is 1/4,
+    # not the unconditioned average of 1/1 and 1/4.
+    assert abs(metrics["visual_effective_key_count"] - 0.5) < 1e-6
+    assert abs(metrics["visual_density_ratio"] - 4.0) < 1e-6

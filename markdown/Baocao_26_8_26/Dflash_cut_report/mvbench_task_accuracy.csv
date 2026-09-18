@@ -1,0 +1,21 @@
+dataset,scenario,condition,task,target,qwen25vl-3b-dflash-llava68k-latest,qwen25vl-3b-dflash-sharegpt68k-latest
+mvbench,Full visual,full,action_prediction,0.45,0.45,0.45
+mvbench,Full visual,full,action_sequence,0.58,0.58,0.58
+mvbench,Full visual,full,moving_attribute,0.87,0.87,0.87
+mvbench,Full visual,full,moving_direction,0.35,0.35,0.35
+mvbench,Full visual,full,object_interaction,0.66,0.66,0.66
+mvbench,"EXP2 zero (L25,33)",exp2_zero,action_prediction,0.45,0.45,0.45
+mvbench,"EXP2 zero (L25,33)",exp2_zero,action_sequence,0.58,0.58,0.58
+mvbench,"EXP2 zero (L25,33)",exp2_zero,moving_attribute,0.86,0.86,0.86
+mvbench,"EXP2 zero (L25,33)",exp2_zero,moving_direction,0.35,0.35,0.35
+mvbench,"EXP2 zero (L25,33)",exp2_zero,object_interaction,0.66,0.66,0.66
+mvbench,"EXP1 zero (L1,9,17,25,33)",exp1_zero,action_prediction,0.45,0.45,0.45
+mvbench,"EXP1 zero (L1,9,17,25,33)",exp1_zero,action_sequence,0.58,0.58,0.58
+mvbench,"EXP1 zero (L1,9,17,25,33)",exp1_zero,moving_attribute,0.87,0.87,0.87
+mvbench,"EXP1 zero (L1,9,17,25,33)",exp1_zero,moving_direction,0.35,0.35,0.35
+mvbench,"EXP1 zero (L1,9,17,25,33)",exp1_zero,object_interaction,0.66,0.66,0.66
+mvbench,"EXP1 cut (L1,9,17,25,33)",exp1_cut,action_prediction,0.45,0.45,0.45
+mvbench,"EXP1 cut (L1,9,17,25,33)",exp1_cut,action_sequence,0.58,0.58,0.58
+mvbench,"EXP1 cut (L1,9,17,25,33)",exp1_cut,moving_attribute,0.87,0.87,0.87
+mvbench,"EXP1 cut (L1,9,17,25,33)",exp1_cut,moving_direction,0.35,0.35,0.35
+mvbench,"EXP1 cut (L1,9,17,25,33)",exp1_cut,object_interaction,0.66,0.66,0.66

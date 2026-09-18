@@ -13,6 +13,15 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 
+_MVBENCH_TASKS = (
+    "action_prediction",
+    "action_sequence",
+    "moving_attribute",
+    "moving_direction",
+    "object_interaction",
+)
+
+
 @dataclass(frozen=True)
 class VideoSample:
     video_name: str
@@ -23,6 +32,7 @@ class VideoSample:
     total_frames: int | None = None
     width: int | None = None
     height: int | None = None
+    task: str | None = None
 
     @property
     def sample_id(self) -> str:
@@ -35,6 +45,33 @@ class VideoSample:
     def fingerprint(self) -> str:
         payload = json.dumps(asdict(self), sort_keys=True, ensure_ascii=False).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def build_prompt_question(sample: Any, prompt_variant: str = "natural") -> str:
+    """Return the controlled question variant used by prompt-ablation runs."""
+
+    if prompt_variant == "natural":
+        return str(sample.question)
+    if prompt_variant == "answer_hint":
+        return (
+            f"{sample.question}\n\n"
+            f"Reference information (oracle hint): {sample.answer}"
+        )
+    raise ValueError(f"unknown prompt variant: {prompt_variant}")
+
+
+def build_mvbench_prompt(row: dict[str, Any]) -> str:
+    """Build the canonical multiple-choice prompt used by MVBench."""
+
+    question = str(row["question"])
+    candidates = list(row.get("candidates", []))
+    if not candidates:
+        raise ValueError("MVBench record has no candidates")
+    options = "".join(
+        f"({chr(ord('A') + index)}) {candidate}\n"
+        for index, candidate in enumerate(candidates)
+    )
+    return f"Question:{question}\nOption:\n{options}Only give the best option.\n"
 
 
 @dataclass(frozen=True)
@@ -92,6 +129,63 @@ def load_vdc_manifest(path: str | Path, dataset_root: str | Path | None = None) 
         samples.append(sample)
     if not samples:
         raise ValueError(f"Manifest is empty: {path}")
+    return samples
+
+
+def load_mvbench_manifest(
+    path: str | Path,
+    dataset_root: str | Path | None = None,
+    limit_per_task: int | None = None,
+) -> list[VideoSample]:
+    """Load the deterministic MVBench manifest as the common video schema."""
+
+    if limit_per_task is not None and limit_per_task <= 0:
+        raise ValueError("limit_per_task must be positive")
+    path = Path(path)
+    root = Path(dataset_root) if dataset_root is not None else path.parent
+    rows_by_task: dict[str, list[dict[str, Any]]] = {task: [] for task in _MVBENCH_TASKS}
+    for row in _read_jsonl(path):
+        task = str(row.get("task", ""))
+        if task not in rows_by_task:
+            continue
+        rows_by_task[task].append(row)
+
+    samples: list[VideoSample] = []
+    seen: set[str] = set()
+    for task in _MVBENCH_TASKS:
+        rows = rows_by_task[task]
+        if limit_per_task is not None:
+            rows = rows[:limit_per_task]
+        for row in rows:
+            required = ("sample_id", "question", "candidates", "answer", "video_path")
+            missing = [key for key in required if key not in row]
+            if missing:
+                raise ValueError(f"{path}: missing fields {missing}")
+            sample_id = str(row["sample_id"])
+            if sample_id in seen:
+                raise ValueError(f"Duplicate sample_id in manifest: {sample_id}")
+            video_path = Path(str(row["video_path"]))
+            if not video_path.is_absolute():
+                video_path = root / video_path
+            if not video_path.exists():
+                raise FileNotFoundError(video_path)
+            samples.append(
+                VideoSample(
+                    video_name=sample_id,
+                    question=build_mvbench_prompt(row),
+                    answer=str(row["answer"]),
+                    local_video_path=str(video_path),
+                    duration_sec=(
+                        float(row["end"]) - float(row["start"])
+                        if row.get("start") is not None and row.get("end") is not None
+                        else None
+                    ),
+                    task=task,
+                )
+            )
+            seen.add(sample_id)
+    if not samples:
+        raise ValueError(f"Manifest has no supported MVBench records: {path}")
     return samples
 
 

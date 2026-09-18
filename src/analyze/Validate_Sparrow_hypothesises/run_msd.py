@@ -15,7 +15,7 @@ import torch
 
 from src.workspace import resolve_namespace_paths
 
-from .dataset import load_vdc_manifest, write_jsonl
+from .dataset import build_prompt_question, load_vdc_manifest, write_jsonl
 from .paper_contract import load_contract
 from .runtime import (
     RuntimeUnavailableError,
@@ -391,9 +391,10 @@ def _run_job(
     batch = process_video(
         processor,
         sample.resolved_path(args.dataset_root),
-        sample.question,
+        build_prompt_question(sample, args.prompt_variant),
         fps,
         max_pixels=max_pixels,
+        max_frames=args.max_frames,
     )
     batch = move_batch_to_device(batch, device)
     prepared = prepare_qwen2vl_prefill(base_model, batch, device)
@@ -422,12 +423,21 @@ def _run_job(
                     )
             draft = prepared if condition == "full" else compact_qwen2vl_prefill(prepared, percentage, scores)
             if condition == "full":
-                speculative_ids, trace = generate_msd_full_video(model, draft, args.max_new_tokens)
+                speculative_ids, trace = generate_msd_full_video(
+                    model,
+                    draft,
+                    args.max_new_tokens,
+                    zero_visual_values=args.visual_value_mode == "zero",
+                )
             else:
                 # The target keeps the full video; only the draft context is
                 # compacted (paper Figure 1(b) setup).
                 speculative_ids, trace = generate_msd_retention_video(
-                    model, prepared, draft, args.max_new_tokens
+                    model,
+                    prepared,
+                    draft,
+                    args.max_new_tokens,
+                    zero_visual_values=args.visual_value_mode == "zero",
                 )
             # The decoded sequence always starts from the full target
             # context, so new tokens are sliced from the full length.
@@ -462,6 +472,8 @@ def _run_job(
                 "paper_figure": paper_figure,
                 "series_id": length_series if paper_figure == "Figure 1(a)" else f"vdc_{args.selection}",
                 "sample_id": sample.sample_id,
+                "prompt_variant": args.prompt_variant,
+                "visual_value_mode": args.visual_value_mode,
                 "target_model": args.base_model,
                 "temperature": 0.0,
                 "target_visual_tokens": int(prepared.video_positions.numel()),
@@ -478,6 +490,7 @@ def _run_job(
                 "speculative_output_hash": _hash_tokens(speculative_tokens),
                 "accepted_prefix_tokens": trace["accepted_prefix_tokens"],
                 "acceptance_trace": trace["acceptance_trace"],
+                "acceptance_by_position": trace.get("acceptance_by_position", []),
                 "verification_steps": trace["verification_steps"],
                 "prefill_seconds": trace["prefill_seconds"],
                 "decode_seconds": trace["decode_seconds"],
@@ -508,6 +521,7 @@ def _run_job(
                 "calibration_candidate_id": point.get("candidate_id") if point else None,
                 "fps": fps,
                 "max_pixels": max_pixels,
+                "max_frames": args.max_frames,
             }
             rows.append(row)
             if lossless:
@@ -561,8 +575,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fps", type=float, default=8.0)
     parser.add_argument("--min-pixels", type=int, default=256 * 28 * 28)
     parser.add_argument("--max-pixels", type=int, default=1024 * 28 * 28)
+    parser.add_argument(
+        "--max-frames",
+        type=int,
+        help="Optional hard cap on decoded video frames for long-video fallback runs.",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--limit", type=int)
+    parser.add_argument(
+        "--prompt-variant",
+        choices=("natural", "answer_hint"),
+        default="natural",
+        help="Use the natural VDC question or append the reference as an oracle hint.",
+    )
+    parser.add_argument(
+        "--visual-value-mode",
+        choices=("real", "zero"),
+        default="real",
+        help="Keep real draft visual values or zero value projections at visual positions.",
+    )
     parser.add_argument(
         "--calibration",
         help="Measured calibration JSONL. With this flag, one job is run for each requested milestone.",

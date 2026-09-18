@@ -1,0 +1,33 @@
+{
+  "valid": true,
+  "target_visual_tokens": [
+    400,
+    3000
+  ],
+  "actual_visual_tokens": [
+    572,
+    2912
+  ],
+  "sample_ids": [
+    "v_7bwruwic1CI",
+    "v_7gaC3b5nJqs",
+    "v_9InwA-ajB2M",
+    "v_Erje-PwY9hE",
+    "v_QN-4aLiDhiQ",
+    "v_SEVVSei-r6w",
+    "v_Y16uL6dYDzQ",
+    "v_aYxni8ohTfU",
+    "v_dN8LBey17O8",
+    "v_syfyM1Pble8",
+    "v_tXUssW4vT3o",
+    "v_wFVukrQfQhI",
+    "v_zxpQHLwZCug",
+    "v_zxr6UZKPDh4"
+  ],
+  "sample_count": 14,
+  "minimum_samples": 10,
+  "selection": "largest_exact_actual_visual_token_signature",
+  "source_results": "results/sparrow_validation_qwen2vl_final_20260819/results.jsonl.pre_homogeneous_20260820",
+  "selected_results": "results/sparrow_validation_qwen2vl_figure2_homogeneous_20260820/results.jsonl",
+  "selection_reason": "Exact actual visual-token signature per target; removes absolute-position boundary mixing."
+}

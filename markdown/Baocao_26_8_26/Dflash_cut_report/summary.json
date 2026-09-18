@@ -1,0 +1,950 @@
+{
+  "report": "DFlash inference benchmark report",
+  "datasets": [
+    "mvbench",
+    "vdc50"
+  ],
+  "runs": [
+    {
+      "dataset": "mvbench",
+      "display_name": "Full visual",
+      "condition": "full",
+      "path": "results/infer/mvbench100_full_20260823",
+      "config": {
+        "dataset": "mvbench",
+        "condition": "full",
+        "mode": "full",
+        "layers": [],
+        "device": "cuda:0",
+        "dtype": "torch.bfloat16",
+        "num_frames": 8,
+        "video_min_pixels": 50176,
+        "video_max_pixels": 50176,
+        "max_new_tokens": 16
+      },
+      "coverage": {
+        "total": 500,
+        "completed": 500,
+        "lossless": 499,
+        "mismatch": 1,
+        "runtime_errors": 0,
+        "lossless_by_checkpoint": {
+          "qwen25vl-3b-dflash-llava68k-latest": 499,
+          "qwen25vl-3b-dflash-sharegpt68k-latest": 499
+        },
+        "sample_file_count": 500,
+        "sample_ids_unique": true,
+        "sample_indices_contiguous": true,
+        "summary_consistent": true,
+        "source_summary_total": 500,
+        "source_summary_completed": 500,
+        "source_summary_lossless": 499,
+        "source_summary_mismatch": 1,
+        "source_summary_runtime_errors": 0,
+        "source_summary_run_completed": true
+      },
+      "target": {
+        "accuracy": 0.582,
+        "bleu": 0.5930780208959591,
+        "rouge_l": 0.22394219375395846,
+        "coverage": 0.2723333333333333,
+        "end_to_end_s": 0.16341705376654864
+      },
+      "checkpoints": {
+        "qwen25vl-3b-dflash-llava68k-latest": {
+          "n": 500,
+          "status_counts": {
+            "mismatch": 1,
+            "ok": 499
+          },
+          "lossless_count": 499,
+          "lossless_rate": 0.998,
+          "accuracy": 0.582,
+          "bleu": 0.5917544180427261,
+          "rouge_l": 0.22494219375395846,
+          "coverage": 0.2743333333333333,
+          "performance": {
+            "tau": 2.2475,
+            "esr": 1.0933546475028564,
+            "dsr": 1.0516106195204935,
+            "tokens_per_second": 26.209255740220602,
+            "end_to_end_s": 0.14895280852913856,
+            "speedup_vs_target": 1.0933546475028564
+          }
+        },
+        "qwen25vl-3b-dflash-sharegpt68k-latest": {
+          "n": 500,
+          "status_counts": {
+            "mismatch": 1,
+            "ok": 499
+          },
+          "lossless_count": 499,
+          "lossless_rate": 0.998,
+          "accuracy": 0.582,
+          "bleu": 0.5917544180427261,
+          "rouge_l": 0.22494219375395846,
+          "coverage": 0.2743333333333333,
+          "performance": {
+            "tau": 2.494818652849741,
+            "esr": 1.1072387225986402,
+            "dsr": 1.0926479256892392,
+            "tokens_per_second": 26.630998036485035,
+            "end_to_end_s": 0.1469474914111197,
+            "speedup_vs_target": 1.1072387225986402
+          }
+        }
+      },
+      "task_accuracy": {
+        "target": {
+          "action_prediction": 0.45,
+          "action_sequence": 0.58,
+          "moving_attribute": 0.87,
+          "moving_direction": 0.35,
+          "object_interaction": 0.66
+        },
+        "qwen25vl-3b-dflash-llava68k-latest": {
+          "action_prediction": 0.45,
+          "action_sequence": 0.58,
+          "moving_attribute": 0.87,
+          "moving_direction": 0.35,
+          "object_interaction": 0.66
+        },
+        "qwen25vl-3b-dflash-sharegpt68k-latest": {
+          "action_prediction": 0.45,
+          "action_sequence": 0.58,
+          "moving_attribute": 0.87,
+          "moving_direction": 0.35,
+          "object_interaction": 0.66
+        }
+      },
+      "comparability": {
+        "same_device_as_full": true,
+        "same_dtype_as_full": true,
+        "note": "same-device comparison"
+      },
+      "hash_changes_vs_full": {
+        "target": 0,
+        "qwen25vl-3b-dflash-llava68k-latest": 0,
+        "qwen25vl-3b-dflash-sharegpt68k-latest": 0
+      }
+    },
+    {
+      "dataset": "mvbench",
+      "display_name": "EXP2 zero (L25,33)",
+      "condition": "exp2_zero",
+      "path": "results/infer/mvbench100_exp2_zero_20260823",
+      "config": {
+        "dataset": "mvbench",
+        "condition": "exp2_zero",
+        "mode": "zero",
+        "layers": [
+          25,
+          33
+        ],
+        "device": "cuda:0",
+        "dtype": "torch.bfloat16",
+        "num_frames": 8,
+        "video_min_pixels": 50176,
+        "video_max_pixels": 50176,
+        "max_new_tokens": 16
+      },
+      "coverage": {
+        "total": 500,
+        "completed": 500,
+        "lossless": 500,
+        "mismatch": 0,
+        "runtime_errors": 0,
+        "lossless_by_checkpoint": {
+          "qwen25vl-3b-dflash-llava68k-latest": 500,
+          "qwen25vl-3b-dflash-sharegpt68k-latest": 500
+        },
+        "sample_file_count": 500,
+        "sample_ids_unique": true,
+        "sample_indices_contiguous": true,
+        "summary_consistent": true,
+        "source_summary_total": 500,
+        "source_summary_completed": 500,
+        "source_summary_lossless": 500,
+        "source_summary_mismatch": 0,
+        "source_summary_runtime_errors": 0,
+        "source_summary_run_completed": true
+      },
+      "target": {
+        "accuracy": 0.58,
+        "bleu": 0.5974724434823305,
+        "rouge_l": 0.2188671354789002,
+        "coverage": 0.2663333333333333,
+        "end_to_end_s": 0.19396452765539288
+      },
+      "checkpoints": {
+        "qwen25vl-3b-dflash-llava68k-latest": {
+          "n": 500,
+          "status_counts": {
+            "ok": 500
+          },
+          "lossless_count": 500,
+          "lossless_rate": 1.0,
+          "accuracy": 0.58,
+          "bleu": 0.5974724434823305,
+          "rouge_l": 0.2188671354789002,
+          "coverage": 0.2663333333333333,
+          "performance": {
+            "tau": 2.211340206185567,
+            "esr": 1.1279862183003762,
+            "dsr": 1.1674457064071886,
+            "tokens_per_second": 22.75692801901107,
+            "end_to_end_s": 0.16974406948313117,
+            "speedup_vs_target": 1.1279862183003762
+          }
+        },
+        "qwen25vl-3b-dflash-sharegpt68k-latest": {
+          "n": 500,
+          "status_counts": {
+            "ok": 500
+          },
+          "lossless_count": 500,
+          "lossless_rate": 1.0,
+          "accuracy": 0.58,
+          "bleu": 0.5974724434823305,
+          "rouge_l": 0.2188671354789002,
+          "coverage": 0.2663333333333333,
+          "performance": {
+            "tau": 2.484848484848485,
+            "esr": 1.1382367435595904,
+            "dsr": 1.211385723123904,
+            "tokens_per_second": 22.901090574546625,
+            "end_to_end_s": 0.16914792102575302,
+            "speedup_vs_target": 1.1382367435595904
+          }
+        }
+      },
+      "task_accuracy": {
+        "target": {
+          "action_prediction": 0.45,
+          "action_sequence": 0.58,
+          "moving_attribute": 0.86,
+          "moving_direction": 0.35,
+          "object_interaction": 0.66
+        },
+        "qwen25vl-3b-dflash-llava68k-latest": {
+          "action_prediction": 0.45,
+          "action_sequence": 0.58,
+          "moving_attribute": 0.86,
+          "moving_direction": 0.35,
+          "object_interaction": 0.66
+        },
+        "qwen25vl-3b-dflash-sharegpt68k-latest": {
+          "action_prediction": 0.45,
+          "action_sequence": 0.58,
+          "moving_attribute": 0.86,
+          "moving_direction": 0.35,
+          "object_interaction": 0.66
+        }
+      },
+      "comparability": {
+        "same_device_as_full": true,
+        "same_dtype_as_full": true,
+        "note": "same-device comparison"
+      },
+      "hash_changes_vs_full": {
+        "target": 10,
+        "qwen25vl-3b-dflash-llava68k-latest": 11,
+        "qwen25vl-3b-dflash-sharegpt68k-latest": 11
+      }
+    },
+    {
+      "dataset": "mvbench",
+      "display_name": "EXP1 zero (L1,9,17,25,33)",
+      "condition": "exp1_zero",
+      "path": "results/infer/mvbench100_exp1_zero_20260823",
+      "config": {
+        "dataset": "mvbench",
+        "condition": "exp1_zero",
+        "mode": "zero",
+        "layers": [
+          1,
+          9,
+          17,
+          25,
+          33
+        ],
+        "device": "cuda:0",
+        "dtype": "torch.bfloat16",
+        "num_frames": 8,
+        "video_min_pixels": 50176,
+        "video_max_pixels": 50176,
+        "max_new_tokens": 16
+      },
+      "coverage": {
+        "total": 500,
+        "completed": 500,
+        "lossless": 499,
+        "mismatch": 1,
+        "runtime_errors": 0,
+        "lossless_by_checkpoint": {
+          "qwen25vl-3b-dflash-llava68k-latest": 499,
+          "qwen25vl-3b-dflash-sharegpt68k-latest": 499
+        },
+        "sample_file_count": 500,
+        "sample_ids_unique": true,
+        "sample_indices_contiguous": true,
+        "summary_consistent": true,
+        "source_summary_total": 500,
+        "source_summary_completed": 500,
+        "source_summary_lossless": 499,
+        "source_summary_mismatch": 1,
+        "source_summary_runtime_errors": 0,
+        "source_summary_run_completed": true
+      },
+      "target": {
+        "accuracy": 0.582,
+        "bleu": 0.5930780208959591,
+        "rouge_l": 0.22394219375395846,
+        "coverage": 0.2723333333333333,
+        "end_to_end_s": 0.15439739676192402
+      },
+      "checkpoints": {
+        "qwen25vl-3b-dflash-llava68k-latest": {
+          "n": 500,
+          "status_counts": {
+            "mismatch": 1,
+            "ok": 499
+          },
+          "lossless_count": 499,
+          "lossless_rate": 0.998,
+          "accuracy": 0.582,
+          "bleu": 0.5917544180427261,
+          "rouge_l": 0.22494219375395846,
+          "coverage": 0.2743333333333333,
+          "performance": {
+            "tau": 2.2763819095477387,
+            "esr": 1.0598140791017827,
+            "dsr": 1.0491826014762762,
+            "tokens_per_second": 26.909104122213865,
+            "end_to_end_s": 0.1441983054727316,
+            "speedup_vs_target": 1.0598140791017827
+          }
+        },
+        "qwen25vl-3b-dflash-sharegpt68k-latest": {
+          "n": 500,
+          "status_counts": {
+            "mismatch": 1,
+            "ok": 499
+          },
+          "lossless_count": 499,
+          "lossless_rate": 0.998,
+          "accuracy": 0.582,
+          "bleu": 0.5917544180427261,
+          "rouge_l": 0.22494219375395846,
+          "coverage": 0.2743333333333333,
+          "performance": {
+            "tau": 2.568306010928962,
+            "esr": 1.076503045774653,
+            "dsr": 1.1184501100148534,
+            "tokens_per_second": 27.449696317259516,
+            "end_to_end_s": 0.1420947592072189,
+            "speedup_vs_target": 1.076503045774653
+          }
+        }
+      },
+      "task_accuracy": {
+        "target": {
+          "action_prediction": 0.45,
+          "action_sequence": 0.58,
+          "moving_attribute": 0.87,
+          "moving_direction": 0.35,
+          "object_interaction": 0.66
+        },
+        "qwen25vl-3b-dflash-llava68k-latest": {
+          "action_prediction": 0.45,
+          "action_sequence": 0.58,
+          "moving_attribute": 0.87,
+          "moving_direction": 0.35,
+          "object_interaction": 0.66
+        },
+        "qwen25vl-3b-dflash-sharegpt68k-latest": {
+          "action_prediction": 0.45,
+          "action_sequence": 0.58,
+          "moving_attribute": 0.87,
+          "moving_direction": 0.35,
+          "object_interaction": 0.66
+        }
+      },
+      "comparability": {
+        "same_device_as_full": true,
+        "same_dtype_as_full": true,
+        "note": "same-device comparison"
+      },
+      "hash_changes_vs_full": {
+        "target": 0,
+        "qwen25vl-3b-dflash-llava68k-latest": 0,
+        "qwen25vl-3b-dflash-sharegpt68k-latest": 0
+      }
+    },
+    {
+      "dataset": "mvbench",
+      "display_name": "EXP1 cut (L1,9,17,25,33)",
+      "condition": "exp1_cut",
+      "path": "results/infer/mvbench100_exp1_cut_20260823",
+      "config": {
+        "dataset": "mvbench",
+        "condition": "exp1_cut",
+        "mode": "cut",
+        "layers": [
+          1,
+          9,
+          17,
+          25,
+          33
+        ],
+        "device": "cuda:0",
+        "dtype": "torch.bfloat16",
+        "num_frames": 8,
+        "video_min_pixels": 50176,
+        "video_max_pixels": 50176,
+        "max_new_tokens": 16
+      },
+      "coverage": {
+        "total": 500,
+        "completed": 500,
+        "lossless": 499,
+        "mismatch": 1,
+        "runtime_errors": 0,
+        "lossless_by_checkpoint": {
+          "qwen25vl-3b-dflash-llava68k-latest": 499,
+          "qwen25vl-3b-dflash-sharegpt68k-latest": 499
+        },
+        "sample_file_count": 500,
+        "sample_ids_unique": true,
+        "sample_indices_contiguous": true,
+        "summary_consistent": true,
+        "source_summary_total": 500,
+        "source_summary_completed": 500,
+        "source_summary_lossless": 499,
+        "source_summary_mismatch": 1,
+        "source_summary_runtime_errors": 0,
+        "source_summary_run_completed": true
+      },
+      "target": {
+        "accuracy": 0.582,
+        "bleu": 0.5930780208959591,
+        "rouge_l": 0.22394219375395846,
+        "coverage": 0.2723333333333333,
+        "end_to_end_s": 0.15204730481281878
+      },
+      "checkpoints": {
+        "qwen25vl-3b-dflash-llava68k-latest": {
+          "n": 500,
+          "status_counts": {
+            "mismatch": 1,
+            "ok": 499
+          },
+          "lossless_count": 499,
+          "lossless_rate": 0.998,
+          "accuracy": 0.582,
+          "bleu": 0.5917544180427261,
+          "rouge_l": 0.22494219375395846,
+          "coverage": 0.2743333333333333,
+          "performance": {
+            "tau": 2.2562814070351758,
+            "esr": 1.0406422315281225,
+            "dsr": 1.0370290459902656,
+            "tokens_per_second": 26.833444108777563,
+            "end_to_end_s": 0.1445678949430585,
+            "speedup_vs_target": 1.0406422315281225
+          }
+        },
+        "qwen25vl-3b-dflash-sharegpt68k-latest": {
+          "n": 500,
+          "status_counts": {
+            "mismatch": 1,
+            "ok": 499
+          },
+          "lossless_count": 499,
+          "lossless_rate": 0.998,
+          "accuracy": 0.582,
+          "bleu": 0.5917544180427261,
+          "rouge_l": 0.22494219375395846,
+          "coverage": 0.2743333333333333,
+          "performance": {
+            "tau": 2.5386740331491713,
+            "esr": 1.0583534188312307,
+            "dsr": 1.1109463934419905,
+            "tokens_per_second": 27.394293994458344,
+            "end_to_end_s": 0.1422192253433168,
+            "speedup_vs_target": 1.0583534188312307
+          }
+        }
+      },
+      "task_accuracy": {
+        "target": {
+          "action_prediction": 0.45,
+          "action_sequence": 0.58,
+          "moving_attribute": 0.87,
+          "moving_direction": 0.35,
+          "object_interaction": 0.66
+        },
+        "qwen25vl-3b-dflash-llava68k-latest": {
+          "action_prediction": 0.45,
+          "action_sequence": 0.58,
+          "moving_attribute": 0.87,
+          "moving_direction": 0.35,
+          "object_interaction": 0.66
+        },
+        "qwen25vl-3b-dflash-sharegpt68k-latest": {
+          "action_prediction": 0.45,
+          "action_sequence": 0.58,
+          "moving_attribute": 0.87,
+          "moving_direction": 0.35,
+          "object_interaction": 0.66
+        }
+      },
+      "comparability": {
+        "same_device_as_full": true,
+        "same_dtype_as_full": true,
+        "note": "same-device comparison"
+      },
+      "hash_changes_vs_full": {
+        "target": 0,
+        "qwen25vl-3b-dflash-llava68k-latest": 0,
+        "qwen25vl-3b-dflash-sharegpt68k-latest": 0
+      }
+    },
+    {
+      "dataset": "vdc50",
+      "display_name": "Full visual",
+      "condition": "full",
+      "path": "results/infer/vdc50_exp_full_dflash_20260823",
+      "config": {
+        "dataset": "vdc50",
+        "condition": "full",
+        "mode": "full",
+        "layers": [],
+        "device": "cuda:0",
+        "dtype": "torch.bfloat16",
+        "num_frames": 8,
+        "video_min_pixels": 50176,
+        "video_max_pixels": 50176,
+        "max_new_tokens": 256
+      },
+      "coverage": {
+        "total": 50,
+        "completed": 50,
+        "lossless": 2,
+        "mismatch": 48,
+        "runtime_errors": 0,
+        "lossless_by_checkpoint": {
+          "qwen25vl-3b-dflash-llava68k-latest": 2,
+          "qwen25vl-3b-dflash-sharegpt68k-latest": 2
+        },
+        "sample_file_count": 50,
+        "sample_ids_unique": true,
+        "sample_indices_contiguous": true,
+        "summary_consistent": true,
+        "source_summary_total": 50,
+        "source_summary_completed": 50,
+        "source_summary_lossless": 2,
+        "source_summary_mismatch": 48,
+        "source_summary_runtime_errors": 0,
+        "source_summary_run_completed": true
+      },
+      "target": {
+        "accuracy": null,
+        "bleu": 0.050477462055103534,
+        "rouge_l": 0.23755470685105975,
+        "coverage": 0.283655515416257,
+        "end_to_end_s": 2.5979649506509306
+      },
+      "checkpoints": {
+        "qwen25vl-3b-dflash-llava68k-latest": {
+          "n": 50,
+          "status_counts": {
+            "mismatch": 48,
+            "ok": 2
+          },
+          "lossless_count": 2,
+          "lossless_rate": 0.04,
+          "accuracy": null,
+          "bleu": 0.050095111907734864,
+          "rouge_l": 0.24125253234247485,
+          "coverage": 0.28056358850657814,
+          "performance": {
+            "tau": 2.474175617991637,
+            "esr": 1.520523013660723,
+            "dsr": 1.5519667216453226,
+            "tokens_per_second": 113.82705232610074,
+            "end_to_end_s": 1.7371881955862045,
+            "speedup_vs_target": 1.520523013660723
+          }
+        },
+        "qwen25vl-3b-dflash-sharegpt68k-latest": {
+          "n": 50,
+          "status_counts": {
+            "mismatch": 48,
+            "ok": 2
+          },
+          "lossless_count": 2,
+          "lossless_rate": 0.04,
+          "accuracy": null,
+          "bleu": 0.050095111907734864,
+          "rouge_l": 0.24125253234247485,
+          "coverage": 0.28056358850657814,
+          "performance": {
+            "tau": 1.6500536736641518,
+            "esr": 1.0407524385693747,
+            "dsr": 1.0361550364537762,
+            "tokens_per_second": 77.75026417965898,
+            "end_to_end_s": 2.535597232580185,
+            "speedup_vs_target": 1.0407524385693747
+          }
+        }
+      },
+      "task_accuracy": {
+        "target": {},
+        "qwen25vl-3b-dflash-llava68k-latest": {},
+        "qwen25vl-3b-dflash-sharegpt68k-latest": {}
+      },
+      "comparability": {
+        "same_device_as_full": true,
+        "same_dtype_as_full": true,
+        "note": "same-device comparison"
+      },
+      "hash_changes_vs_full": {
+        "target": 0,
+        "qwen25vl-3b-dflash-llava68k-latest": 0,
+        "qwen25vl-3b-dflash-sharegpt68k-latest": 0
+      }
+    },
+    {
+      "dataset": "vdc50",
+      "display_name": "EXP2 zero (L25,33)",
+      "condition": "exp2_zero",
+      "path": "results/infer/vdc50_exp2_high_zero_20260823",
+      "config": {
+        "dataset": "vdc50",
+        "condition": "exp2_zero",
+        "mode": "zero",
+        "layers": [
+          25,
+          33
+        ],
+        "device": "cuda:0",
+        "dtype": "torch.bfloat16",
+        "num_frames": 8,
+        "video_min_pixels": 50176,
+        "video_max_pixels": 50176,
+        "max_new_tokens": 256
+      },
+      "coverage": {
+        "total": 50,
+        "completed": 50,
+        "lossless": 2,
+        "mismatch": 48,
+        "runtime_errors": 0,
+        "lossless_by_checkpoint": {
+          "qwen25vl-3b-dflash-llava68k-latest": 2,
+          "qwen25vl-3b-dflash-sharegpt68k-latest": 2
+        },
+        "sample_file_count": 50,
+        "sample_ids_unique": true,
+        "sample_indices_contiguous": true,
+        "summary_consistent": true,
+        "source_summary_total": 50,
+        "source_summary_completed": 50,
+        "source_summary_lossless": 2,
+        "source_summary_mismatch": 48,
+        "source_summary_runtime_errors": 0,
+        "source_summary_run_completed": true
+      },
+      "target": {
+        "accuracy": null,
+        "bleu": 0.050477462055103534,
+        "rouge_l": 0.23755470685105975,
+        "coverage": 0.283655515416257,
+        "end_to_end_s": 2.598263471312821
+      },
+      "checkpoints": {
+        "qwen25vl-3b-dflash-llava68k-latest": {
+          "n": 50,
+          "status_counts": {
+            "mismatch": 48,
+            "ok": 2
+          },
+          "lossless_count": 2,
+          "lossless_rate": 0.04,
+          "accuracy": null,
+          "bleu": 0.050095111907734864,
+          "rouge_l": 0.24125253234247485,
+          "coverage": 0.28056358850657814,
+          "performance": {
+            "tau": 2.460499069061379,
+            "esr": 1.5086487301933105,
+            "dsr": 1.53888251664025,
+            "tokens_per_second": 113.02029269045424,
+            "end_to_end_s": 1.7494327940791845,
+            "speedup_vs_target": 1.5086487301933105
+          }
+        },
+        "qwen25vl-3b-dflash-sharegpt68k-latest": {
+          "n": 50,
+          "status_counts": {
+            "mismatch": 48,
+            "ok": 2
+          },
+          "lossless_count": 2,
+          "lossless_rate": 0.04,
+          "accuracy": null,
+          "bleu": 0.050095111907734864,
+          "rouge_l": 0.24125253234247485,
+          "coverage": 0.28056358850657814,
+          "performance": {
+            "tau": 1.6515005289571645,
+            "esr": 1.0423092247805377,
+            "dsr": 1.037726891321062,
+            "tokens_per_second": 77.87130578578265,
+            "end_to_end_s": 2.531144822575152,
+            "speedup_vs_target": 1.0423092247805377
+          }
+        }
+      },
+      "task_accuracy": {
+        "target": {},
+        "qwen25vl-3b-dflash-llava68k-latest": {},
+        "qwen25vl-3b-dflash-sharegpt68k-latest": {}
+      },
+      "comparability": {
+        "same_device_as_full": true,
+        "same_dtype_as_full": true,
+        "note": "same-device comparison"
+      },
+      "hash_changes_vs_full": {
+        "target": 0,
+        "qwen25vl-3b-dflash-llava68k-latest": 0,
+        "qwen25vl-3b-dflash-sharegpt68k-latest": 0
+      }
+    },
+    {
+      "dataset": "vdc50",
+      "display_name": "EXP1 zero (L1,9,17,25,33)",
+      "condition": "exp1_zero",
+      "path": "results/infer/vdc50_exp1_all_zero_20260823",
+      "config": {
+        "dataset": "vdc50",
+        "condition": "exp1_zero",
+        "mode": "zero",
+        "layers": [
+          1,
+          9,
+          17,
+          25,
+          33
+        ],
+        "device": "cuda:0",
+        "dtype": "torch.bfloat16",
+        "num_frames": 8,
+        "video_min_pixels": 50176,
+        "video_max_pixels": 50176,
+        "max_new_tokens": 256
+      },
+      "coverage": {
+        "total": 50,
+        "completed": 50,
+        "lossless": 2,
+        "mismatch": 48,
+        "runtime_errors": 0,
+        "lossless_by_checkpoint": {
+          "qwen25vl-3b-dflash-llava68k-latest": 2,
+          "qwen25vl-3b-dflash-sharegpt68k-latest": 2
+        },
+        "sample_file_count": 50,
+        "sample_ids_unique": true,
+        "sample_indices_contiguous": true,
+        "summary_consistent": true,
+        "source_summary_total": 50,
+        "source_summary_completed": 50,
+        "source_summary_lossless": 2,
+        "source_summary_mismatch": 48,
+        "source_summary_runtime_errors": 0,
+        "source_summary_run_completed": true
+      },
+      "target": {
+        "accuracy": null,
+        "bleu": 0.050477462055103534,
+        "rouge_l": 0.23755470685105975,
+        "coverage": 0.283655515416257,
+        "end_to_end_s": 2.6112233842909336
+      },
+      "checkpoints": {
+        "qwen25vl-3b-dflash-llava68k-latest": {
+          "n": 50,
+          "status_counts": {
+            "mismatch": 48,
+            "ok": 2
+          },
+          "lossless_count": 2,
+          "lossless_rate": 0.04,
+          "accuracy": null,
+          "bleu": 0.050095111907734864,
+          "rouge_l": 0.24125253234247485,
+          "coverage": 0.28056358850657814,
+          "performance": {
+            "tau": 2.404785095151671,
+            "esr": 1.4854705064027243,
+            "dsr": 1.5083489874475893,
+            "tokens_per_second": 110.74053571561183,
+            "end_to_end_s": 1.7846771235391499,
+            "speedup_vs_target": 1.4854705064027243
+          }
+        },
+        "qwen25vl-3b-dflash-sharegpt68k-latest": {
+          "n": 50,
+          "status_counts": {
+            "mismatch": 48,
+            "ok": 2
+          },
+          "lossless_count": 2,
+          "lossless_rate": 0.04,
+          "accuracy": null,
+          "bleu": 0.050095111907734864,
+          "rouge_l": 0.24125253234247485,
+          "coverage": 0.28056358850657814,
+          "performance": {
+            "tau": 1.657722641536055,
+            "esr": 1.048232605987355,
+            "dsr": 1.0416579586153463,
+            "tokens_per_second": 77.99578297826123,
+            "end_to_end_s": 2.531680098734796,
+            "speedup_vs_target": 1.048232605987355
+          }
+        }
+      },
+      "task_accuracy": {
+        "target": {},
+        "qwen25vl-3b-dflash-llava68k-latest": {},
+        "qwen25vl-3b-dflash-sharegpt68k-latest": {}
+      },
+      "comparability": {
+        "same_device_as_full": true,
+        "same_dtype_as_full": true,
+        "note": "same-device comparison"
+      },
+      "hash_changes_vs_full": {
+        "target": 0,
+        "qwen25vl-3b-dflash-llava68k-latest": 0,
+        "qwen25vl-3b-dflash-sharegpt68k-latest": 0
+      }
+    },
+    {
+      "dataset": "vdc50",
+      "display_name": "EXP1 cut (L1,9,17,25,33)",
+      "condition": "exp1_cut",
+      "path": "results/infer/vdc50_exp1_all_cut_20260823",
+      "config": {
+        "dataset": "vdc50",
+        "condition": "exp1_cut",
+        "mode": "cut",
+        "layers": [
+          1,
+          9,
+          17,
+          25,
+          33
+        ],
+        "device": "cuda:1",
+        "dtype": "torch.bfloat16",
+        "num_frames": 8,
+        "video_min_pixels": 50176,
+        "video_max_pixels": 50176,
+        "max_new_tokens": 256
+      },
+      "coverage": {
+        "total": 50,
+        "completed": 50,
+        "lossless": 6,
+        "mismatch": 44,
+        "runtime_errors": 0,
+        "lossless_by_checkpoint": {
+          "qwen25vl-3b-dflash-llava68k-latest": 6,
+          "qwen25vl-3b-dflash-sharegpt68k-latest": 6
+        },
+        "sample_file_count": 50,
+        "sample_ids_unique": true,
+        "sample_indices_contiguous": true,
+        "summary_consistent": true,
+        "source_summary_total": 50,
+        "source_summary_completed": 50,
+        "source_summary_lossless": 6,
+        "source_summary_mismatch": 44,
+        "source_summary_runtime_errors": 0,
+        "source_summary_run_completed": true
+      },
+      "target": {
+        "accuracy": null,
+        "bleu": 0.047628367823058806,
+        "rouge_l": 0.23465670148382992,
+        "coverage": 0.2745298428901118,
+        "end_to_end_s": 4.343313160575926
+      },
+      "checkpoints": {
+        "qwen25vl-3b-dflash-llava68k-latest": {
+          "n": 50,
+          "status_counts": {
+            "mismatch": 44,
+            "ok": 6
+          },
+          "lossless_count": 6,
+          "lossless_rate": 0.12,
+          "accuracy": null,
+          "bleu": 0.04662268758208787,
+          "rouge_l": 0.23781423823280498,
+          "coverage": 0.27634653796925385,
+          "performance": {
+            "tau": 2.40350734077264,
+            "esr": 1.7903385661913447,
+            "dsr": 1.8393331412864393,
+            "tokens_per_second": 78.40809839343065,
+            "end_to_end_s": 2.486046678945422,
+            "speedup_vs_target": 1.7903385661913447
+          }
+        },
+        "qwen25vl-3b-dflash-sharegpt68k-latest": {
+          "n": 50,
+          "status_counts": {
+            "mismatch": 44,
+            "ok": 6
+          },
+          "lossless_count": 6,
+          "lossless_rate": 0.12,
+          "accuracy": null,
+          "bleu": 0.04662268758208787,
+          "rouge_l": 0.23781423823280498,
+          "coverage": 0.27634653796925385,
+          "performance": {
+            "tau": 1.6347727163374761,
+            "esr": 1.242112265833384,
+            "dsr": 1.249277595536354,
+            "tokens_per_second": 54.550389984197956,
+            "end_to_end_s": 3.5381486938521265,
+            "speedup_vs_target": 1.242112265833384
+          }
+        }
+      },
+      "task_accuracy": {
+        "target": {},
+        "qwen25vl-3b-dflash-llava68k-latest": {},
+        "qwen25vl-3b-dflash-sharegpt68k-latest": {}
+      },
+      "comparability": {
+        "same_device_as_full": false,
+        "same_dtype_as_full": true,
+        "note": "cross-device or dtype comparison; exploratory only"
+      },
+      "hash_changes_vs_full": {
+        "target": 48,
+        "qwen25vl-3b-dflash-llava68k-latest": 47,
+        "qwen25vl-3b-dflash-sharegpt68k-latest": 47
+      }
+    }
+  ],
+  "source_policy": "completed per-sample inference artifacts; no GPU rerun"
+}

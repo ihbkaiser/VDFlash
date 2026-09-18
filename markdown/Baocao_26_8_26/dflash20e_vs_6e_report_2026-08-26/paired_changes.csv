@@ -1,0 +1,7 @@
+dataset,comparison,changed,unchanged,changed_rate
+mvbench,llava68k,0,500,0.0
+mvbench,sharegpt68k,0,500,0.0
+mvbench,target_hash_changes,0,500,0.0
+vdc50,llava68k,47,3,0.94
+vdc50,sharegpt68k,47,3,0.94
+vdc50,target_hash_changes,48,2,0.96
