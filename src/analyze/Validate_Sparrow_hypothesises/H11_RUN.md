@@ -16,6 +16,11 @@ The supplied checkpoint, cache, model paths and two-GPU settings (target on
 bash scripts/run_h11_3b_20e.sh
 ```
 
+This profile captures 1,000 Full training references and 200 paired Full/Cut
+cache examples. The earlier 200/2 setting was only a smoke test. Allow a new
+timestamped output directory for each run; an already-running job keeps the
+sample counts with which it started.
+
 The prefilled profile uses `scripts/h11_full_dflash_3b.json` (five trained
 draft layers). Before loading the target model, the runner checks that the
 Phase 2 checkpoint actually has layers `0..4`. A checkpoint trained with only
