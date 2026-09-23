@@ -12,6 +12,7 @@ import gc
 import hashlib
 import json
 import re
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -241,11 +242,18 @@ def _paths(args):
 
 
 def run_reference(args):
+    started = time.monotonic()
+
+    def progress(message: str):
+        print(f"[H1.1 reference +{time.monotonic() - started:.1f}s] {message}", flush=True)
+
     _ensure_specforge_importable()
     from specforge.runtime.data_plane.offline_reader import list_feature_files
     from specforge.hidden_state import validate_hidden_state_metadata
 
+    progress("Scanning Phase 2 feature filenames on storage")
     paths = [Path(p) for p in list_feature_files(str(args.feature_root))]
+    progress(f"Found {len(paths)} feature files; checking metadata")
     if len(paths) < args.reference_samples:
         raise ValueError(f"only {len(paths)} feature files, requested {args.reference_samples}")
     with Path(args.draft_config).open(encoding="utf-8") as handle:
@@ -255,6 +263,7 @@ def run_reference(args):
         target_layer_ids=config["dflash_config"]["target_layer_ids"],
         hidden_size=int(config["hidden_size"]), expected_phase="phase2",
     )
+    progress("Feature metadata matches; reading training_state.pt on CPU")
     rng = np.random.default_rng(args.seed)
     chosen = [paths[int(i)] for i in rng.permutation(len(paths))]
     dtype = _resolve_dtype(args.dtype, torch.device(args.device))
@@ -264,6 +273,7 @@ def run_reference(args):
     from specforge.export.checkpoint_io import materialize_draft, resolve_training_state
 
     state = resolve_training_state(str(args.checkpoint))
+    progress("Checkpoint read; checking draft depth and building draft")
     expected_layers = int(config["num_hidden_layers"])
     trained_layers = {
         int(match.group(1))
@@ -278,11 +288,12 @@ def run_reference(args):
     draft = materialize_draft(state, str(args.draft_config))
     del state
     draft.to(device=torch.device(args.draft_device), dtype=dtype).eval()
-    print(f"[H1.1] checkpoint/config loaded {expected_layers} draft layers", flush=True)
+    progress(f"Draft ready on {args.draft_device} ({expected_layers} layers); loading target")
     _processor, target, _ = _load_target(
         args.target_model, device=torch.device(args.device), dtype=dtype,
         attention=args.target_attention, device_map=args.device_map, max_memory=args.max_memory,
     )
+    progress(f"Target ready on {args.device}; capturing {args.reference_samples} references")
     draft.config._attn_implementation = "eager"
     vectors, metadata = [], []
     skipped = 0
@@ -299,8 +310,8 @@ def run_reference(args):
             continue
         vectors.append(captured["vectors"])
         metadata.append({"feature_file": str(path), "anchor": captured["anchor"]})
-        if len(vectors) % 25 == 0:
-            print(f"[H1.1 reference] {len(vectors)}/{args.reference_samples}", flush=True)
+        if len(vectors) == 1 or len(vectors) % 25 == 0:
+            progress(f"Captured {len(vectors)}/{args.reference_samples} references")
         if len(vectors) == args.reference_samples:
             break
     if len(vectors) != args.reference_samples:
@@ -310,6 +321,11 @@ def run_reference(args):
 
 
 def run_evaluate_cache(args):
+    started = time.monotonic()
+
+    def progress(message: str):
+        print(f"[H1.1 cache +{time.monotonic() - started:.1f}s] {message}", flush=True)
+
     _ensure_specforge_importable()
     from specforge.runtime.data_plane.offline_reader import list_feature_files
 
@@ -320,8 +336,10 @@ def run_evaluate_cache(args):
         str(Path(row["feature_file"]).resolve())
         for row in json.loads(metadata_path.read_text(encoding="utf-8"))
     }
+    progress("Scanning remaining feature filenames on storage")
     candidates = [Path(path) for path in list_feature_files(str(args.feature_root))
                   if str(Path(path).resolve()) not in training_files]
+    progress(f"Found {len(candidates)} candidate files; loading target")
     if len(candidates) < args.limit:
         raise ValueError("not enough held-out feature files after reference selection")
     rng = np.random.default_rng(args.seed + 1)
@@ -331,9 +349,11 @@ def run_evaluate_cache(args):
         args.target_model, device=torch.device(args.device), dtype=dtype,
         attention=args.target_attention, device_map=args.device_map, max_memory=args.max_memory,
     )
+    progress(f"Target ready on {args.device}; loading draft on {args.draft_device}")
     draft, _ = _load_draft(
         str(args.checkpoint), str(args.draft_config), device=torch.device(args.draft_device), dtype=dtype,
     )
+    progress(f"Draft ready; evaluating {args.limit} Full/Cut pairs")
     draft.config._attn_implementation = "eager"
     visual_ids = _visual_token_ids(target)
     full_vectors, cut_vectors, sample_ids, reports = [], [], [], []
