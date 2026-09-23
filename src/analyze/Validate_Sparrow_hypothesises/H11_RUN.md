@@ -16,6 +16,12 @@ If you already have that local profile, run:
 bash scripts/run_h11_3b_20e.sh
 ```
 
+The tracked env example uses 200 Full training references and 2 paired Full/Cut
+cache examples as a smoke test. For a larger cache run, set
+`H11_REFERENCE_SAMPLES=1000` and `H11_LIMIT=200` in your private env file. Use
+a new timestamped output directory for each run; an already-running job keeps
+the sample counts with which it started.
+
 The prefilled profile uses `scripts/h11_full_dflash_3b.json` (five trained
 draft layers). Before loading the target model, the runner checks that the
 Phase 2 checkpoint actually has layers `0..4`. A checkpoint trained with only
