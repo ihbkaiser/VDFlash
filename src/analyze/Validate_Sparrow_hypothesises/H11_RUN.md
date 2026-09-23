@@ -8,8 +8,9 @@ trains a model or writes into the checkpoint/cache.
 
 ## One-command launcher
 
-The supplied checkpoint, cache, model paths and one-GPU settings are already
-filled in `scripts/h11_3b_20e_cache.env`. From the repository root, run:
+The supplied checkpoint, cache, model paths and two-GPU settings (target on
+`cuda:0`, draft on `cuda:1`) are already filled in
+`scripts/h11_3b_20e_cache.env`. From the repository root, run:
 
 ```bash
 bash scripts/run_h11_3b_20e.sh
