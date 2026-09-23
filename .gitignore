@@ -35,6 +35,7 @@ env/
 
 # Private Phase 2 machine paths (copy from the tracked .env.example).
 /qwen25vl_llava_phase2.env
+/scripts/h11_3b_20e_cache.env
 
 # Downloaded evaluation data (large, reproducible from the Hugging Face source)
 dataset/VideoDetailCaption/
