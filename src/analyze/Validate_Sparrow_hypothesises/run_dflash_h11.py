@@ -96,7 +96,8 @@ def first_valid_anchor(loss_mask: torch.Tensor) -> int:
 def _cached_forward(path: Path, *, draft: Any, target: Any, device: torch.device,
                     max_length: int, cut: bool = False,
                     visual_token_ids: set[int] | None = None,
-                    score_proposals: bool = True):
+                    score_proposals: bool = True,
+                    drop_positions: list[int] | None = None):
     from specforge.runtime.data_plane.feature_store import load_feature_file
     from specforge.algorithms.common.dflash_family_model import create_dflash_sdpa_mask
 
@@ -122,11 +123,24 @@ def _cached_forward(path: Path, *, draft: Any, target: Any, device: torch.device
     ]
     if cut and not visual_positions:
         raise ValueError(f"no visual tokens before supervised anchor: {path}")
-    if cut and draft.sliding_window:
-        raise NotImplementedError("cache-only Cut for sliding-window drafts needs position-aware masking")
+    if cut and drop_positions is not None:
+        raise ValueError("choose full visual Cut or explicit drop_positions, not both")
+    if (cut or drop_positions is not None) and draft.sliding_window:
+        raise NotImplementedError("cache-only token deletion for sliding-window drafts needs position-aware masking")
     keep = torch.ones(anchor, dtype=torch.bool)
     if cut:
         keep[visual_positions] = False
+    if drop_positions is not None:
+        if len(set(drop_positions)) != len(drop_positions) or any(
+            not isinstance(index, int) or index < 0 or index >= anchor
+            for index in drop_positions
+        ):
+            raise ValueError("drop_positions must be distinct prompt-token indices")
+        keep[drop_positions] = False
+    compacted_indices = keep.to(torch.long).cumsum(0) - 1
+    compacted_visual_positions = [
+        int(compacted_indices[index]) for index in visual_positions if bool(keep[index])
+    ]
     context_length = int(keep.sum())
     if context_length == 0:
         raise ValueError(f"cut removed the complete draft context: {path}")
@@ -179,7 +193,7 @@ def _cached_forward(path: Path, *, draft: Any, target: Any, device: torch.device
     return {
         "vectors": stack_vectors(vectors, len(draft.layers)),
         "weights": weights, "anchor": anchor,
-        "visual_positions": visual_positions if not cut else [],
+        "visual_positions": compacted_visual_positions,
         "visual_count": len(visual_positions),
         "accepted": accepted, "proposal_count": comparable,
         "target_input_fingerprint": prompt_hash,

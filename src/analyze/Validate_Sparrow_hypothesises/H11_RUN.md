@@ -119,3 +119,32 @@ rho` also accounts for visual-token count and anchor position. Bootstrapped
 units, so compare their signs and OOD rates, not the magnitudes of their deltas.
 These associations across layers are exploratory and do not establish
 causality, and the cache-mode outcome is not runtime video acceptance.
+
+## Follow-up: equal-budget visual versus text deletion
+
+From the repository root on the **two-GPU machine**, run on the completed H1.1
+cache results:
+
+```bash
+bash scripts/run_h11_matched.sh results/h11_20260923T192807Z
+```
+
+The script reuses the same 200 cached samples, checkpoint, teacher tokens, and
+first supervised query. It deletes eight randomly selected visual-token keys
+in one draft pass and eight ordinary (non-special) text-token keys in another;
+both contexts have the same number of keys. Samples with fewer than eight
+eligible tokens of either kind are skipped, and the report shows the eligible
+count. Set `H11_MATCHED_BUDGET=4` before the command to use a smaller fixed
+budget if too few samples qualify. This reruns **draft inference**, not training;
+the frozen target is only used for embeddings, the LM head, and identification
+of visual token IDs. It does not require original images or videos.
+
+Read `matched_k8_<timestamp>/summary.txt` inside the source run directory.
+Negative `visual minus text` teacher-token matches means visual deletion was
+worse at the same deletion budget; positive distance delta means visual
+deletion shifted draft representations farther from the Full training
+reference. Bootstrapped intervals resample complete sample pairs. The original
+Full/all-visual-Cut match counts are shown on this **eligible subset** for
+context. The control deletes only eight visual tokens, so its outcome cannot
+be equated with deleting every visual token; it tests modality specificity at
+a matched budget, and teacher-token matches remain a cache proxy.
