@@ -8,9 +8,8 @@ trains a model or writes into the checkpoint/cache.
 
 ## One-command launcher
 
-Keep machine-specific paths in the ignored `scripts/h11_3b_20e_cache.env`
-(copy `scripts/h11.env.example` and set the checkpoint, cache, and target paths).
-If you already have that local profile, run:
+The supplied checkpoint, cache, model paths and one-GPU settings are already
+filled in `scripts/h11_3b_20e_cache.env`. From the repository root, run:
 
 ```bash
 bash scripts/run_h11_3b_20e.sh
