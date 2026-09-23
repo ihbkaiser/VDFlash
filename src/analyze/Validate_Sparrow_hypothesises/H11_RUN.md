@@ -97,3 +97,25 @@ Acceptance measures draft–target agreement, not caption quality.
 Set `--train-max-length` to the Phase 2 training config's `data.max_length` if
 it differs from 3072. Files without a supervised anchor inside that boundary
 are skipped and recorded by the reference job's progress count.
+
+## Follow-up: representation shifts outside the 32 PCA directions
+
+After the H1.1 cache run finishes, compare the old PCA distance with the
+distance **outside** those training directions, using its existing NPZ/JSONL
+files. This is CPU-only and does not load either model or rerun inference:
+
+```bash
+python3 -m src.analyze.Validate_Sparrow_hypothesises.analyze_dflash_h11_deep \
+  --run-dir results/h11_20260923T192807Z
+```
+
+The command prints a layer-by-layer table and writes `analysis_deep/summary.txt`,
+`summary.json`, and `paired_residuals.jsonl` under that run directory. Positive
+`Residual delta` means Cut deviates from the Full training reference in
+directions the original PCA score omitted. `rho` compares each sample's
+residual shift with its loss of first-block teacher-token matches; `adjusted
+rho` also accounts for visual-token count and anchor position. Bootstrapped
+95% intervals show sampling variation. PCA and residual distance use different
+units, so compare their signs and OOD rates, not the magnitudes of their deltas.
+These associations across layers are exploratory and do not establish
+causality, and the cache-mode outcome is not runtime video acceptance.
