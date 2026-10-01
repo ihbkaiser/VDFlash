@@ -194,3 +194,59 @@ def prepare_qwen_messages(
         frame_counts=tuple(frame_counts),
         video_grid_thw=grid_values,
     )
+
+
+def prepare_qwen_message_batch(
+    processor: Any,
+    messages_batch: list[list[dict[str, Any]]],
+    *,
+    processor_kwargs: dict[str, Any] | None = None,
+    video_reader: str = "torchvision",
+    image_min_pixels: int | None = None,
+    image_max_pixels: int | None = None,
+    video_num_frames: int | None = None,
+    video_min_pixels: int | None = None,
+    video_max_pixels: int | None = None,
+) -> dict[str, Any]:
+    """Prepare a padded Qwen batch with image/video tensors for HF generate."""
+    if not messages_batch:
+        raise ValueError("messages_batch must not be empty")
+    materialized = [
+        _apply_media_defaults(
+            messages,
+            image_min_pixels=image_min_pixels,
+            image_max_pixels=image_max_pixels,
+            video_num_frames=video_num_frames,
+            video_min_pixels=video_min_pixels,
+            video_max_pixels=video_max_pixels,
+        )
+        for messages in messages_batch
+    ]
+    if any(not messages_have_visual_content(messages) for messages in materialized):
+        raise ValueError("batched Qwen VLM preparation expects visual content in every example")
+    try:
+        from qwen_vl_utils import process_vision_info
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError("qwen-vl-utils is required for Qwen2.5-VL image/video batches") from exc
+
+    os.environ.setdefault("FORCE_QWENVL_VIDEO_READER", video_reader)
+    rendered = [
+        processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        for messages in materialized
+    ]
+    image_inputs, video_inputs, video_kwargs = process_vision_info(
+        materialized, return_video_kwargs=True
+    )
+    if video_inputs is None or len(video_inputs) == 0:
+        video_kwargs = {}
+    call_kwargs = _merge_processor_kwargs(dict(video_kwargs or {}), processor_kwargs)
+    return dict(
+        processor(
+            text=rendered,
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+            **call_kwargs,
+        )
+    )
