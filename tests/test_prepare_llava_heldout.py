@@ -4,9 +4,27 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.train_VLM.prepare_llava_heldout import build_heldout_manifest
+from src.train_VLM.prepare_responses_vllm import _chat_for_record, _image_path
 
 
 class HeldoutManifestTests(unittest.TestCase):
+    def test_vllm_chat_conversion_preserves_image_and_prompt_order(self):
+        image = object()
+        record = {
+            "id": "heldout-1",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": "file:///tmp/sample.jpg"},
+                    {"type": "text", "text": "Describe the picture."},
+                ],
+            }],
+        }
+        converted = _chat_for_record(record, image)
+        self.assertIs(converted[0]["content"][0]["image_pil"], image)
+        self.assertEqual(converted[0]["content"][1], {"type": "text", "text": "Describe the picture."})
+        self.assertEqual(_image_path("file:///tmp/a%20b.jpg"), Path("/tmp/a b.jpg"))
+
     def test_excludes_seen_ids_and_images_and_uses_train_prompt(self):
         from tempfile import TemporaryDirectory
 

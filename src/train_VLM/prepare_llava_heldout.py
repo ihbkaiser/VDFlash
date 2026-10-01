@@ -13,6 +13,7 @@ from tqdm.auto import tqdm
 
 from .config import DFlashTrainConfig
 from .prepare_responses import prepare_responses
+from .prepare_responses_vllm import prepare_responses_vllm
 from .real_data import _iter_json_array
 from .target import Qwen25VLTargetAdapter
 
@@ -211,7 +212,9 @@ def build_heldout_manifest(
     return summary
 
 
-def _write_flat_responses(target_manifest: Path, flat_output: Path, teacher_model: str, tokenizer: Any) -> int:
+def _write_flat_responses(
+    target_manifest: Path, flat_output: Path, teacher_model: str, tokenizer: Any | None
+) -> int:
     rows = 0
     flat_output.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = flat_output.with_name(flat_output.name + ".tmp")
@@ -238,7 +241,11 @@ def _write_flat_responses(target_manifest: Path, flat_output: Path, teacher_mode
                     "id": str(row["id"]),
                     "image": image,
                     "prompt": prompt_text,
-                    "response": tokenizer.decode(target.get("token_ids", []), skip_special_tokens=True),
+                    "response": (
+                        tokenizer.decode(target.get("token_ids", []), skip_special_tokens=True)
+                        if tokenizer is not None
+                        else target.get("text", "")
+                    ),
                     "_teacher_model": teacher_model,
                 }
                 writer.write(json.dumps(item, ensure_ascii=False) + "\n")
@@ -270,38 +277,89 @@ def main() -> None:  # pragma: no cover - exercised through component tests
     parser.add_argument("--manifest", required=True, help="selected held-out input manifest")
     parser.add_argument("--target-output", required=True, help="full target manifest with exact token IDs")
     parser.add_argument("--flat-output", required=True, help="JSONL in the same id/image/prompt/response format as 68K")
+    parser.add_argument("--backend", choices=("hf", "vllm"), default="hf")
+    parser.add_argument("--vllm-batch-size", type=int, default=64,
+                        help="host-side images per vLLM call; engine batches continuously within this chunk")
+    parser.add_argument("--vllm-max-num-seqs", type=int, default=32)
+    parser.add_argument("--vllm-max-num-batched-tokens", type=int, default=16384)
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.90)
+    parser.add_argument("--vllm-dtype", choices=("auto", "half", "bfloat16", "float16", "float32"), default="auto")
+    parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--resume-output", action="store_true",
+                        help="reuse an existing input manifest and continue vLLM output by completed ID")
     parser.add_argument("--overwrite-output", action="store_true")
     args = parser.parse_args()
 
     manifest = Path(args.manifest).expanduser().resolve()
     target_output = Path(args.target_output).expanduser().resolve()
     flat_output = Path(args.flat_output).expanduser().resolve()
+    if args.overwrite_output and args.resume_output:
+        parser.error("--overwrite-output and --resume-output cannot be used together")
+    if args.resume_output and args.backend != "vllm":
+        parser.error("--resume-output is currently supported only with --backend vllm")
     for path in (target_output, flat_output):
-        if path.exists() and not args.overwrite_output:
-            raise FileExistsError(f"output exists: {path}; pass --overwrite-output to replace it")
-    summary = build_heldout_manifest(
-        args.source_json, args.train_jsonl, args.image_root, manifest,
-        num_samples=args.num_samples, seed=args.seed, prompt=args.prompt,
-        overwrite=args.overwrite_output,
-        candidate_pool_multiplier=args.candidate_pool_multiplier,
-    )
+        if path.exists() and not (args.overwrite_output or args.resume_output):
+            raise FileExistsError(f"output exists: {path}; pass --resume-output or --overwrite-output")
+    if args.resume_output and manifest.exists():
+        manifest_rows = [line for line in manifest.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if len(manifest_rows) != args.num_samples:
+            raise ValueError(
+                f"existing manifest has {len(manifest_rows)} records, but --num-samples={args.num_samples}"
+            )
+        print(f"[heldout manifest] reusing existing {len(manifest_rows)} records from {manifest}", flush=True)
+        summary = {"manifest": str(manifest), "selected": len(manifest_rows), "reused": True}
+    else:
+        summary = build_heldout_manifest(
+            args.source_json, args.train_jsonl, args.image_root, manifest,
+            num_samples=args.num_samples, seed=args.seed, prompt=args.prompt,
+            overwrite=args.overwrite_output,
+            candidate_pool_multiplier=args.candidate_pool_multiplier,
+        )
     config = DFlashTrainConfig.from_file(args.config)
     if config.stage != "multimodal":
         raise ValueError("held-out LLaVA generation requires a multimodal config")
-    print(f"[model] loading {config.target_model} on {config.device}", flush=True)
-    # Honor the configured device explicitly; otherwise the adapter defaults to
-    # the process's generic "cuda" device and can follow a different device map.
-    adapter = Qwen25VLTargetAdapter.from_pretrained(config, device=config.device)
-    print(f"[generation] samples={args.num_samples} max_new_tokens={config.response_max_new_tokens}", flush=True)
-    prepare_responses(
-        adapter,
-        [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines() if line.strip()],
-        max_new_tokens=config.response_max_new_tokens,
-        max_seq_length=config.max_seq_length,
-        output_path=target_output,
-    )
+    records = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines() if line.strip()]
+    print(f"[generation] backend={args.backend} samples={len(records)} max_new_tokens={config.response_max_new_tokens}", flush=True)
+    adapter = None
+    if args.backend == "vllm":
+        if args.overwrite_output:
+            target_output.unlink(missing_ok=True)
+        prepare_responses_vllm(
+            records,
+            model=config.target_model,
+            output_path=target_output,
+            max_new_tokens=config.response_max_new_tokens,
+            max_seq_length=config.max_seq_length,
+            batch_size=args.vllm_batch_size,
+            max_num_seqs=args.vllm_max_num_seqs,
+            max_num_batched_tokens=args.vllm_max_num_batched_tokens,
+            gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+            dtype=args.vllm_dtype,
+            tensor_parallel_size=args.vllm_tensor_parallel_size,
+            image_min_pixels=config.image_min_pixels,
+            image_max_pixels=config.image_max_pixels,
+            processor_kwargs=config.processor_kwargs,
+            resume=args.resume_output,
+        )
+    else:
+        print(f"[model] loading {config.target_model} on {config.device}", flush=True)
+        # Honor the configured device explicitly; otherwise the adapter defaults to
+        # the process's generic "cuda" device and can follow a different device map.
+        adapter = Qwen25VLTargetAdapter.from_pretrained(config, device=config.device)
+        prepare_responses(
+            adapter,
+            records,
+            max_new_tokens=config.response_max_new_tokens,
+            max_seq_length=config.max_seq_length,
+            output_path=target_output,
+        )
     _, _, _, teacher_model = _read_training_exclusions(Path(args.train_jsonl).expanduser().resolve())
-    _write_flat_responses(target_output, flat_output, teacher_model, adapter.processor.tokenizer)
+    _write_flat_responses(
+        target_output,
+        flat_output,
+        teacher_model,
+        adapter.processor.tokenizer if adapter is not None else None,
+    )
     metadata_path = flat_output.with_suffix(flat_output.suffix + ".meta.json")
     metadata_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
