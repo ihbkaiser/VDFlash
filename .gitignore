@@ -58,6 +58,7 @@ findings.md
 progress.md
 task_plan.md
 docs/superpowers/
+.worktrees/
 .venv-msd
 .jspace/
 data/
