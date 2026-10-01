@@ -23,6 +23,7 @@ safetensors==0.8.0
 huggingface-hub==0.36.2
 fsspec[http]>=2023.1
 ijson==3.5.1
+tqdm>=4.66,<5
 PyYAML==6.0.3
 av==17.1.0
 Pillow==12.2.0
