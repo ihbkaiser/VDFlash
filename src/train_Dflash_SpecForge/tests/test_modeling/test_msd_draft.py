@@ -29,6 +29,7 @@ def test_msd_supports_exact_depth_sweep(depth: int) -> None:
     assert len(model.layers) == depth
     assert model.config.architectures == ["MSDDraftModel"]
     assert not model.embed_tokens.weight.requires_grad
+    assert not hasattr(model, "norm")
 
 
 @pytest.mark.parametrize("depth", [0, 2, 4, 6])

@@ -33,6 +33,7 @@ def test_msd_launcher_declares_exact_static_sweep_contract() -> None:
         "TOTAL_EPOCHS=40",
         "GLOBAL_BATCH_SIZE=4",
         "LEARNING_RATE=5e-5",
+        "SHAREGPT_JSONL=${SHAREGPT_JSONL-/data/msd/manifests/sharegpt_train.jsonl}",
         "--phase",
         "--resume",
         "--print-config",

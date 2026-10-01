@@ -22,14 +22,14 @@ from specforge.algorithms.common.providers import (
 from specforge.algorithms.contracts import AlgorithmSpec, FeatureMode
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-BUILTINS = ("dflash", "domino", "dspark", "eagle3", "peagle")
+BUILTINS = ("dflash", "domino", "dspark", "eagle3", "msd", "peagle")
 
 
 class BuiltinProviderContractTest(unittest.TestCase):
     def setUp(self):
         self.registry = builtin_algorithm_registry()
 
-    def test_five_builtins_are_explicit_and_instance_owned(self):
+    def test_six_builtins_are_explicit_and_instance_owned(self):
         self.assertEqual(BUILTINS, self.registry.names)
         self.assertIsNot(builtin_algorithm_registry(), self.registry)
 
@@ -93,7 +93,10 @@ class BuiltinProviderContractTest(unittest.TestCase):
         for registration in self.registry:
             with self.subTest(algorithm=registration.name):
                 providers = registration.providers
-                self.assertGreaterEqual(len(providers.server_streaming), 1)
+                if registration.spec.supports_online:
+                    self.assertGreaterEqual(len(providers.server_streaming), 1)
+                else:
+                    self.assertEqual(0, len(providers.server_streaming))
                 self.assertFalse(hasattr(providers, "colocated"))
                 self.assertFalse(hasattr(providers, "target_backend"))
                 self.assertFalse(hasattr(providers, "deployment"))
@@ -155,13 +158,19 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 self.assertIsNone(policy.target_defaults)
                 self.assertIsNone(policy.apply_overrides)
 
-    def test_qwen25vl_is_registered_only_for_offline_dflash(self):
+        msd = self.registry.resolve("msd").providers.model.draft_config
+        self.assertIsNone(msd.target_defaults)
+        self.assertIsNotNone(msd.apply_overrides)
+
+    def test_qwen25vl_and_msd_modalities_are_explicit(self):
         for registration in self.registry:
             modalities = {
                 contract.modality for contract in registration.spec.feature_contracts
             }
             if registration.name == "dflash":
                 self.assertEqual({"text", "qwen2_5_vl"}, modalities)
+            elif registration.name == "msd":
+                self.assertEqual({"multimodal"}, modalities)
             else:
                 self.assertEqual({"text"}, modalities, registration.name)
 
@@ -172,10 +181,19 @@ class BuiltinProviderContractTest(unittest.TestCase):
             compact_teacher_chunk_size=1024,
             lambda_base_start=0.75,
             lambda_base_decay_ratio=0.25,
+            msd_feature_loss_weight=1.0,
+            msd_soft_loss_weight=0.1,
+            msd_noise_width=0.2,
+            msd_total_epochs=40,
+            msd_curriculum_seed=0,
         )
         config = SimpleNamespace(training=training)
         draft = SimpleNamespace(
-            config=SimpleNamespace(num_hidden_layers=2),
+            config=SimpleNamespace(
+                num_hidden_layers=2,
+                hidden_size=64,
+                vocab_size=128,
+            ),
             layers=[object(), object()],
             norm_before_residual=True,
             target_layer_ids=[3, 7],
@@ -211,6 +229,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             "dflash": dflash_family,
             "domino": dflash_family,
             "dspark": dflash_family,
+            "msd": draft,
         }
         expected_keys = {
             "eagle3": {
@@ -244,6 +263,14 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 "dspark_ce_loss_alpha",
                 "dspark_l1_loss_alpha",
                 "dspark_confidence_head_alpha",
+            },
+            "msd": {
+                "msd_draft_num_hidden_layers",
+                "msd_feature_loss_weight",
+                "msd_soft_loss_weight",
+                "msd_noise_width",
+                "msd_total_epochs",
+                "msd_curriculum_version",
             },
         }
 
@@ -429,7 +456,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
         code = (
             "import sys; "
             "from specforge.algorithms.builtin import builtin_algorithm_registry; "
-            "r=builtin_algorithm_registry(); assert len(r)==5; "
+            "r=builtin_algorithm_registry(); assert len(r)==6; "
             "assert 'torch' not in sys.modules; "
             "assert 'specforge.training.strategies.registry' not in sys.modules"
         )

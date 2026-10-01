@@ -153,15 +153,18 @@ def normalize_offline_sample(
     visual_mask = visual_mask[:, :sequence_length].to(torch.bool)
     position_ids = position_ids[:, :, :sequence_length]
     loss_mask[:, -1] = 0
+    # The public MSD loader feeds token t+1 (including post-vision embeddings)
+    # beside target hidden state t, so the visual bypass mask shifts with it.
+    next_token_embeddings = _shift_left_with_zeros(input_embeddings)
 
     return {
         "input_ids": _shift_left_with_zeros(input_ids),
         "loss_mask": loss_mask,
         "target_hidden_state": _shift_left_with_zeros(target_hidden),
         "conditioning_hidden_state": target_hidden,
-        "next_token_embeddings": _shift_left_with_zeros(input_embeddings),
-        "visual_embeddings": input_embeddings,
-        "visual_token_mask": visual_mask,
+        "next_token_embeddings": next_token_embeddings,
+        "visual_embeddings": next_token_embeddings,
+        "visual_token_mask": _shift_left_with_zeros(visual_mask),
         "position_ids": position_ids,
         "attention_mask": torch.ones_like(input_ids, dtype=torch.bool),
     }

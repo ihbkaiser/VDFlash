@@ -5,12 +5,6 @@ from __future__ import annotations
 from functools import partial
 
 from specforge.algorithms.common.defaults import no_missing_checkpoint_keys
-from specforge.algorithms.common.dflash_family_data import (
-    NORMALIZER_ID,
-    build_collator,
-    build_offline_normalizer,
-    build_offline_reader,
-)
 from specforge.algorithms.common.providers import (
     AlgorithmProviders,
     DraftConfigProvider,
@@ -34,6 +28,27 @@ from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 ALGORITHM_NAME = "domino"
 DRAFT_ARCHITECTURE = "DominoDraftModel"
+NORMALIZER_ID = "dflash_family_offline_v1"
+
+
+def build_collator(*args, **kwargs):
+    from specforge.algorithms.common.dflash_family_data import build_collator as impl
+
+    return impl(*args, **kwargs)
+
+
+def build_offline_normalizer(*args, **kwargs):
+    from specforge.algorithms.common.dflash_family_data import (
+        build_offline_normalizer as impl,
+    )
+
+    return impl(*args, **kwargs)
+
+
+def build_offline_reader(*args, **kwargs):
+    from specforge.algorithms.common.dflash_family_data import build_offline_reader as impl
+
+    return impl(*args, **kwargs)
 
 
 def build_step(

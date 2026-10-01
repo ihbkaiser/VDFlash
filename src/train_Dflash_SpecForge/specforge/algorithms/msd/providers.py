@@ -24,17 +24,46 @@ from specforge.algorithms.contracts import (
     OfflineStorageContract,
 )
 from specforge.algorithms.msd.curriculum import MSD_CURRICULUM_VERSION
-from specforge.algorithms.msd.data import (
-    NORMALIZER_ID,
-    RAW_FEATURE_KEYS,
-    build_offline_collator,
-    build_offline_normalizer,
-    build_offline_reader,
-    validate_msd_capture_record,
-)
 
 ALGORITHM_NAME = "msd"
 DRAFT_ARCHITECTURE = "MSDDraftModel"
+NORMALIZER_ID = "msd_qwen25vl_offline_v1"
+RAW_FEATURE_KEYS = (
+    "input_ids",
+    "loss_mask",
+    "target_hidden_state",
+    "input_embeddings",
+    "visual_token_mask",
+    "position_ids",
+)
+
+
+def build_offline_reader(*args, **kwargs):
+    from specforge.algorithms.msd.data import build_offline_reader as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def build_offline_normalizer(*args, **kwargs):
+    from specforge.algorithms.msd.data import (
+        build_offline_normalizer as implementation,
+    )
+
+    return implementation(*args, **kwargs)
+
+
+def build_offline_collator(*args, **kwargs):
+    from specforge.algorithms.msd.data import build_offline_collator as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def validate_msd_capture_record(*args, **kwargs):
+    from specforge.algorithms.msd.data import (
+        validate_msd_capture_record as implementation,
+    )
+
+    return implementation(*args, **kwargs)
 
 
 def build_step(wrapped_model, *, target_head=None, **options):

@@ -146,7 +146,7 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
             for path in EXAMPLE_CONFIG_DIR.glob("*.yaml")
             if not path.name.startswith(".")
         )
-        self.assertEqual(len(paths), 68)
+        self.assertEqual(len(paths), 69)
 
         resolved_runs = {
             path.name: resolve_run(Config.from_file(str(path))) for path in paths
@@ -174,7 +174,10 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
                     filename, 20 if is_eagle else 30
                 )
                 self.assertEqual(config.training.dist_timeout, expected_timeout)
-                self.assertEqual(config.training.seed, 0 if is_eagle else 42)
+                uses_zero_seed = is_eagle or filename == (
+                    "qwen2.5-vl-3b-msd-68k-offline.yaml"
+                )
+                self.assertEqual(config.training.seed, 0 if uses_zero_seed else 42)
 
         for filename, epochs in LEGACY_EPOCH_OVERRIDES.items():
             with self.subTest(config=filename, contract="legacy epochs"):

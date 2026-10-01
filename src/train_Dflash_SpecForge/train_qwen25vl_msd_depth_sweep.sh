@@ -21,7 +21,7 @@ PRINT_CONFIG=0
 
 TARGET_MODEL_PATH=${TARGET_MODEL_PATH-/models/qwen25-vl-3b}
 SHAREGPT_SOURCE=${SHAREGPT_SOURCE-/data/sharegpt68k.json}
-SHAREGPT_JSONL=${SHAREGPT_JSONL-/data/msd/manifests/sharegpt68k.jsonl}
+SHAREGPT_JSONL=${SHAREGPT_JSONL-/data/msd/manifests/sharegpt_train.jsonl}
 LLAVA_MANIFEST=${LLAVA_MANIFEST-/data/msd/manifests/llava68k.jsonl}
 IMAGE_ROOT=${IMAGE_ROOT-/data/images}
 TEXT_FEATURE_ROOT=${TEXT_FEATURE_ROOT-/data/msd/features/sharegpt68k}

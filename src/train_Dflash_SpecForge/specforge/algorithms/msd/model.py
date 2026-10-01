@@ -97,9 +97,10 @@ def msd_loss(
         raise ValueError("MSD loss weights must be non-negative")
 
     mask = loss_mask.to(dtype=torch.float32)
-    denominator = mask.sum()
-    if denominator.item() <= 0:
+    valid_tokens = mask.sum()
+    if valid_tokens.item() <= 0:
         raise ValueError("loss_mask must contain at least one valid token")
+    denominator = valid_tokens + 1e-5
 
     predicted = predicted_hidden_state.float()
     target = target_hidden_state.detach().float()
@@ -115,7 +116,7 @@ def msd_loss(
     ).sum(-1)
     soft_target_loss = (soft_per_token * mask).sum() / denominator
     correct = predicted_logits.argmax(-1).eq(target_logits.argmax(-1)).float()
-    accuracy = (correct * mask).sum() / denominator
+    accuracy = (correct * mask).sum() / valid_tokens
     total = feature_weight * feature_loss + soft_target_weight * soft_target_loss
     return MSDLossOutput(total, feature_loss, soft_target_loss, accuracy)
 
