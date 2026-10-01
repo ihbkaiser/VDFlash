@@ -630,6 +630,9 @@ def build_training_run(
     try:
         trainer = build_offline_runtime(
             hidden_states_path=cfg.data.hidden_states_path,
+            msd_visual_hidden_states_path=(
+                cfg.data.msd_visual_hidden_states_path or None
+            ),
             hidden_state_phase=cfg.data.hidden_state_phase,
             eval_hidden_states_path=cfg.data.eval_hidden_states_path or None,
             draft_model=bundle.model,
@@ -639,6 +642,8 @@ def build_training_run(
             num_epochs=t.num_epochs,
             use_usp_preprocess=(t.attention_backend == "usp"),
             seed=t.seed,
+            msd_curriculum_seed=t.msd_curriculum_seed,
+            msd_total_epochs=t.msd_total_epochs,
             resume_from=t.resume_from,
             **_common_launch_kwargs(
                 cfg,

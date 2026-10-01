@@ -412,6 +412,95 @@ class PEagleTrainStrategy(DraftTrainStrategy):
         }
 
 
+class MSDTrainStrategy(DraftTrainStrategy):
+    """Original MSD hidden-state regression plus frozen-head soft targets."""
+
+    name = "msd"
+    required_features = {
+        "input_ids",
+        "loss_mask",
+        "target_hidden_state",
+        "conditioning_hidden_state",
+        "next_token_embeddings",
+        "visual_embeddings",
+        "visual_token_mask",
+        "position_ids",
+        "attention_mask",
+    }
+
+    def __init__(
+        self,
+        msd_model: nn.Module,
+        *,
+        target_head: nn.Module,
+        feature_loss_weight: float = 1.0,
+        soft_loss_weight: float = 0.1,
+        noise_width: float = 0.2,
+    ) -> None:
+        if target_head is None:
+            raise ValueError("MSD requires the frozen target language-model head")
+        self.msd_model = msd_model
+        self.target_head = target_head
+        self.feature_loss_weight = float(feature_loss_weight)
+        self.soft_loss_weight = float(soft_loss_weight)
+        self.noise_width = float(noise_width)
+        self.target_head.requires_grad_(False)
+
+    def trainable_module(self) -> nn.Module:
+        return self.msd_model
+
+    def _device(self) -> torch.device:
+        return next(self.msd_model.parameters()).device
+
+    def forward_loss(
+        self, batch: TrainBatch, ctx: Optional[StepContext] = None
+    ) -> StepOutput:
+        del ctx
+        self.validate_batch(batch)
+        from specforge.algorithms.msd.model import (
+            add_reference_uniform_noise,
+            msd_loss,
+        )
+
+        tensors = batch.tensors
+        device = self._device()
+        conditioning = add_reference_uniform_noise(
+            tensors["conditioning_hidden_state"].to(device),
+            width=self.noise_width,
+        )
+        predicted = self.msd_model(
+            conditioning_hidden_state=conditioning,
+            next_token_embeddings=tensors["next_token_embeddings"].to(device),
+            visual_embeddings=tensors["visual_embeddings"].to(device),
+            visual_token_mask=tensors["visual_token_mask"].to(device),
+            attention_mask=tensors["attention_mask"].to(device),
+            position_ids=tensors["position_ids"].to(device),
+        )
+        objective = msd_loss(
+            predicted,
+            tensors["target_hidden_state"].to(device),
+            tensors["loss_mask"].to(device),
+            self.target_head.to(device),
+            self.feature_loss_weight,
+            self.soft_loss_weight,
+        )
+        return StepOutput(
+            loss=objective.loss.reshape(()),
+            metrics={
+                "feature_loss": objective.feature_loss.detach(),
+                "soft_target_loss": objective.soft_target_loss.detach(),
+                "accuracy": objective.accuracy.detach(),
+            },
+        )
+
+    def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            key.replace("draft_model.", ""): value
+            for key, value in state_dict.items()
+            if "embed_tokens" not in key and "target_head" not in key
+        }
+
+
 class DFlashTrainStrategy(DraftTrainStrategy):
     """DFlash block-parallel strategy wrapping the existing ``OnlineDFlashModel``.
 
@@ -599,6 +688,7 @@ __all__ = [
     "DraftTrainStrategy",
     "Eagle3TrainStrategy",
     "PEagleTrainStrategy",
+    "MSDTrainStrategy",
     "DFlashTrainStrategy",
     "DSparkTrainStrategy",
     "DominoTrainStrategy",

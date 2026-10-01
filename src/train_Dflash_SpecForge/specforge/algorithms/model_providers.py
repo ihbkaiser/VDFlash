@@ -173,6 +173,54 @@ def build_registered_draft(cfg: Config, draft_config: PretrainedConfig):
     return _finish_registered_draft(cfg, draft_config, draft_model)
 
 
+def apply_msd_overrides(cfg: Config, draft_config: Any) -> None:
+    depth = cfg.model.draft_num_hidden_layers
+    if depth is None:
+        depth = int(draft_config.num_hidden_layers)
+    if depth not in {1, 3, 5}:
+        raise ValueError("MSD draft depth must be 1, 3, or 5")
+    draft_config.num_hidden_layers = depth
+
+
+def resolve_msd_capture_layers(
+    _cfg: Config, _draft_config: Any, target_config: Any
+) -> List[int]:
+    target_config = getattr(target_config, "text_config", target_config)
+    depth = getattr(target_config, "num_hidden_layers", None)
+    if not isinstance(depth, int) or depth < 1:
+        raise ValueError("MSD capture requires target num_hidden_layers")
+    return [depth - 1]
+
+
+def build_msd_model(
+    cfg: Config,
+    draft_model: Any,
+    _draft_config: Any,
+    _target_config: Any,
+    _tokenizer: Any,
+) -> AlgorithmModelParts:
+    from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
+
+    target = TargetEmbeddingsAndHead.from_pretrained(
+        cfg.model.target_model_path,
+        embed_key=cfg.model.embedding_key,
+        lm_head_key=cfg.model.lm_head_key,
+        cache_dir=cfg.model.cache_dir,
+        device=_device().type,
+        dtype=_torch_dtype(cfg),
+        trust_remote_code=cfg.model.trust_remote_code,
+    )
+    if draft_model.embed_tokens.weight.shape != target.embed_tokens.weight.shape:
+        raise ValueError(
+            "MSD draft embedding shape must match the Qwen2.5-VL target embedding"
+        )
+    with __import__("torch").no_grad():
+        draft_model.embed_tokens.weight.copy_(target.embed_tokens.weight)
+    draft_model.embed_tokens.weight.requires_grad_(False)
+    target.lm_head.requires_grad_(False)
+    return AlgorithmModelParts(model=draft_model, target_head=target.lm_head)
+
+
 def build_dflash_draft(
     cfg: Config,
     draft_config: PretrainedConfig,
@@ -513,11 +561,13 @@ def apply_dflash_overrides(cfg: Config, draft_config: Any) -> None:
 __all__ = [
     "AlgorithmModelParts",
     "apply_dflash_overrides",
+    "apply_msd_overrides",
     "build_dflash_model",
     "build_domino_model",
     "build_dspark_model",
     "build_eagle3_draft",
     "build_eagle3_model",
+    "build_msd_model",
     "build_peagle_draft",
     "peagle_resume_contract",
     "build_peagle_model",
@@ -529,4 +579,5 @@ __all__ = [
     "populate_dflash_generated_config",
     "resolve_dflash_capture_layers",
     "resolve_eagle_capture_layers",
+    "resolve_msd_capture_layers",
 ]
