@@ -5,6 +5,7 @@ import torch
 
 from specforge.modeling.draft.msd import MSDConfig, MSDDraftModel
 from specforge.modeling.draft.registry import resolve_draft
+from specforge.modeling.auto import AutoDraftModelConfig
 
 
 def tiny_config(depth: int) -> MSDConfig:
@@ -100,3 +101,14 @@ def test_msd_config_matches_qwen25vl_3b_replication_shape() -> None:
     assert config.num_key_value_heads == 2
     assert config.head_dim == 128
     assert config.mrope_section == [16, 24, 24]
+
+
+def test_checked_in_msd_config_loads_through_specforge_registry() -> None:
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[2] / "configs" / "qwen2.5-vl-3b-msd.json"
+    config = AutoDraftModelConfig.from_file(str(path))
+
+    assert isinstance(config, MSDConfig)
+    assert config.architectures == ["MSDDraftModel"]
+    assert config.num_hidden_layers == 1
