@@ -60,6 +60,7 @@ task_plan.md
 docs/superpowers/
 .worktrees/
 .venv-msd
+.venv-msd-static/
 .jspace/
 data/
 .serena/
