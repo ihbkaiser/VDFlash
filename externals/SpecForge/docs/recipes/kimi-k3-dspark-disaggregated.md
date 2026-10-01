@@ -72,7 +72,7 @@ export MOONCAKE_LOCAL_BUFFER_SIZE=1073741824
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m sglang.launch_server \
   --host 0.0.0.0 \
   --port 30000 \
-  --model-path /workspace/models/Kimi-K3-cdd2e49a \
+  --model-path /path/to/local-resource \
   --trust-remote-code \
   --skip-tokenizer-init \
   --tp-size 8 \
@@ -130,7 +130,7 @@ specforge train \
   -c examples/configs/kimi-k3-dspark-disaggregated.yaml \
   --role both \
   data.train_data_path= \
-  data.prompts_path=/workspace/k3_dspark/data/longest-smoke-pretokenized-4rows-65536.jsonl \
+  data.prompts_path=/path/to/local-resource \
   training.num_epochs=1 \
   training.max_steps=1 \
   training.accumulation_steps=1 \

@@ -1,9 +1,9 @@
 model:
-  target_model_path: /workspace/models/Kimi-K3-cdd2e49a
+  target_model_path: /path/to/local-resource
   draft_model_config: configs/kimi-k3-dspark.json
   # Weights-only initialization: optimizer, scheduler, counters, and RNG start
   # fresh for the regenerated agentic data.
-  draft_checkpoint_path: /workspace/k3_dspark/checkpoints/kimi-k3-dspark/epoch_0_step_0
+  draft_checkpoint_path: /path/to/local-resource
   target_backend: sglang
   trust_remote_code: true
   embedding_key: language_model.model.embed_tokens.weight
@@ -20,10 +20,10 @@ model:
   sglang_max_mamba_cache_size: 5
 
 data:
-  train_data_path: /workspace/k3_dspark/data/kimi-k3-agentic-regen.jsonl
+  train_data_path: /path/to/local-resource
   max_length: 65536
   chat_template: kimi-k3-thinking
-  cache_dir: /workspace/k3_dspark/cache
+  cache_dir: /path/to/local-resource
   build_dataset_num_proc: 64
   dataloader_num_workers: 0
 
@@ -55,7 +55,7 @@ tracking:
   report_to: wandb
   wandb_project: specforge-dspark
   wandb_name: kimi-k3-dspark-specforge-disaggregated
-  wandb_dir: /workspace/k3_dspark/runs/kimi-k3-specforge/wandb
+  wandb_dir: /path/to/local-resource
 
 runtime:
   producer_lease: 1
@@ -72,7 +72,7 @@ runtime:
   feature_store_max_resident_bytes: 966367641600
 
 run_id: kimi-k3-dspark-specforge-disaggregated
-output_dir: /workspace/k3_dspark/runs/kimi-k3-specforge/output
+output_dir: /path/to/local-resource
 
 deployment:
   mode: disaggregated
@@ -80,8 +80,8 @@ deployment:
     nnodes: 1
     nproc_per_node: 4
   disaggregated:
-    control_dir: /workspace/k3_dspark/runs/kimi-k3-specforge/control
-    consumer_state_dir: /workspace/k3_dspark/runs/kimi-k3-specforge/consumer-state
+    control_dir: /path/to/local-resource
+    consumer_state_dir: /path/to/local-resource
     backend: mooncake
     store_id: kimi-k3-dspark-specforge-disaggregated
     server_urls:

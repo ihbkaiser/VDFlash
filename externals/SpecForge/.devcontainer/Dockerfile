@@ -14,12 +14,12 @@ RUN apt-get update && apt-get install -y sudo && \
     apt-get clean
 
 # Set up oh-my-zsh for devuser
-RUN cp -r /root/.oh-my-zsh /home/devuser/.oh-my-zsh && \
-    cp /root/.zshrc /home/devuser/.zshrc && \
-    cp /root/.vimrc /home/devuser/.vimrc && \
-    cp /root/.tmux.conf /home/devuser/.tmux.conf && \
-    sed -i 's|/root/.oh-my-zsh|/home/devuser/.oh-my-zsh|g' /home/devuser/.zshrc && \
-    chown -R devuser:devuser /home/devuser/
+RUN cp -r /root/.oh-my-zsh /path/to/local-resource && \
+    cp /root/.zshrc /path/to/local-resource && \
+    cp /root/.vimrc /path/to/local-resource && \
+    cp /root/.tmux.conf /path/to/local-resource && \
+    sed -i 's|/root/.oh-my-zsh|/path/to/local-resource|g' /path/to/local-resource && \
+    chown -R devuser:devuser /path/to/local-resource/
 
 # Set workspace directory and ownership
 WORKDIR /sgl-workspace/sglang

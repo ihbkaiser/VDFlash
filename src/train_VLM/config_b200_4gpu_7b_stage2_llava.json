@@ -1,5 +1,5 @@
 {
-  "target_model": "/workspace/storage-shared/nlp/tungdd11/tungdecoder/models/qwen25-vl-7b",
+  "target_model": "/path/to/local-resource",
   "stage": "multimodal",
   "dataset_repo": "liuhaotian/LLaVA-Pretrain",
   "dataset_revision": "70f9d1e5e1a697fe35830875cfc7de1dd590d727",

@@ -35,7 +35,7 @@ Preserve existing user work and write derived artifacts under
 | Error | Attempt | Resolution |
 |---|---:|---|
 | Shell sandbox failed before command execution with `mountinfo path is not absolute` | 1 | Used approved escalated local shell for read-only workspace inspection and artifact generation. |
-| Initial skill alias path included nonexistent `/r0` directory | 1 | Resolved the installed filesystem path to `/home/hust/.codex/skills/<skill>`. |
+| Initial skill alias path included nonexistent `/r0` directory | 1 | Resolved the installed filesystem path to `/path/to/local-resource/<skill>`. |
 | Generic H2.1 progress code expects DFlash `matched_proposals` | 1 | Use MSD-specific `accepted_proposal_count` from `acceptance_rounds`. |
 
 ## Next

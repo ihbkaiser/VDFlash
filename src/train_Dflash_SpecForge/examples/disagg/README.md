@@ -105,7 +105,7 @@ checkpoint directory on each node:
 ```bash
 # Trainer node 0 (ranks 0-7)
 python examples/disagg/sync_distributed_checkpoints.py \
-  --run-root /workspace/runs/$RUN_ID \
+  --run-root /path/to/local-resource/$RUN_ID \
   --run-id "$RUN_ID" \
   --local-ranks 0-7 --peer-ranks 8-15 \
   --serve-host 10.0.0.3 --serve-port 35914 \
@@ -114,7 +114,7 @@ python examples/disagg/sync_distributed_checkpoints.py \
 
 # Trainer node 1 (ranks 8-15)
 python examples/disagg/sync_distributed_checkpoints.py \
-  --run-root /workspace/runs/$RUN_ID \
+  --run-root /path/to/local-resource/$RUN_ID \
   --run-id "$RUN_ID" \
   --local-ranks 8-15 --peer-ranks 0-7 \
   --serve-host 10.0.0.4 --serve-port 35915 \

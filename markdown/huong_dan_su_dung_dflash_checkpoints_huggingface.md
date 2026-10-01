@@ -37,11 +37,11 @@ Tài liệu chính thức: [Hugging Face authentication](https://huggingface.co/
 
 ## 2. Tải một checkpoint cần dùng
 
-Nên tải checkpoint vào ổ đĩa ngoài codebase, ví dụ `/mnt/fast-storage/vdflash_checkpoints`. Có thể thay đường dẫn này bằng ổ local khác còn đủ dung lượng.
+Nên tải checkpoint vào ổ đĩa ngoài codebase, ví dụ `/path/to/local-resource`. Có thể thay đường dẫn này bằng ổ local khác còn đủ dung lượng.
 
 ```bash
 export HF_REPO="Tphuc15/vdflash-qwen25vl-3b-checkpoints"
-export DFLASH_CHECKPOINT_ROOT="/mnt/fast-storage/vdflash_checkpoints"
+export DFLASH_CHECKPOINT_ROOT="/path/to/local-resource"
 
 mkdir -p "$DFLASH_CHECKPOINT_ROOT"
 
@@ -54,7 +54,7 @@ hf download "$HF_REPO" \
 File sẽ được đặt tại:
 
 ```text
-/mnt/fast-storage/vdflash_checkpoints/qwen25vl-3b-dflash-20e-llava68k-latest/training_state.pt
+/path/to/local-resource
 ```
 
 Đổi phần path trong lệnh để lấy biến thể khác:
@@ -83,7 +83,7 @@ Không dùng `hf download "$HF_REPO" --repo-type dataset --local-dir dataset` v�
 Các tuỳ chọn cache là độc lập với nơi lưu checkpoint. Nếu cần chuyển cache Hugging Face sang ổ lớn hơn, đặt biến riêng trước khi chạy:
 
 ```bash
-export HF_HOME="/mnt/fast-storage/huggingface"
+export HF_HOME="/path/to/local-resource"
 export HF_XET_HIGH_PERFORMANCE=1  # tuỳ chọn, hữu ích khi đường truyền/ổ đĩa đủ nhanh
 ```
 
@@ -172,7 +172,7 @@ Sau khi thực nghiệm xong, có thể giữ checkpoint trên ổ ngoài để 
 Ví dụ khôi phục checkpoint 20e/ShareGPT:
 
 ```bash
-export DFLASH_CHECKPOINT_ROOT="/mnt/fast-storage/vdflash_checkpoints"
+export DFLASH_CHECKPOINT_ROOT="/path/to/local-resource"
 
 hf download Tphuc15/vdflash-qwen25vl-3b-checkpoints \
   qwen25vl-3b-dflash-20e-sharegpt68k-latest/training_state.pt \

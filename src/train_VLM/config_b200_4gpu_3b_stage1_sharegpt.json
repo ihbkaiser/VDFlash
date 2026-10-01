@@ -1,9 +1,9 @@
 {
-  "target_model": "/workspace/storage-shared/nlp/tungdd11/tungdecoder/models/qwen25-vl-3b",
+  "target_model": "/path/to/local-resource",
   "stage": "text",
   "dataset_repo": "anon8231489123/ShareGPT_Vicuna_unfiltered",
   "dataset_revision": "192ab2185289094fc556ec8ce5ce1e8e587154ca",
-  "data_path": "/workspace/storage-shared/nlp/tungdd11/tungdecoder/ShareGPT/ShareGPT_V3_unfiltered_cleaned_split.json",
+  "data_path": "/path/to/local-resource",
   "split": "train",
   "max_samples": 68000,
   "prepared_manifest": "artifacts/video_dflash_b200_dual/shared/stage1_sharegpt/manifest.jsonl",

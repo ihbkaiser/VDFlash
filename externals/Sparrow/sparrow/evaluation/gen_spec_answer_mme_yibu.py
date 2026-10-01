@@ -461,13 +461,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--base-model-path",
         type=str,
-        default="/home/lyh/weights/hf/llama2chat/70B/",
+        default="/path/to/local-resource/",
         help="1",
     )
     parser.add_argument(
         "--mlp-model-path",
         type=str,
-        default="/home/lyh/weights/hf/llama2chat/70B/",
+        default="/path/to/local-resource/",
         help="1",
     )
     parser.add_argument(

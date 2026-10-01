@@ -243,7 +243,7 @@ Nếu muốn đo answer quality của drafter, cần chạy thêm một thí ngh
 | Acceptance thay đổi nhưng attention không giải thích được | Có thể do positional shift, KV-cache mismatch hoặc thay đổi representation khác |
 | Hidden shift tăng nhưng acceptance không giảm | “Out-of-distribution” chưa phải mediator của acceptance trong thí nghiệm này |
 
-Trong repo, runner `draft_attention` hiện đã ghi `visual_mass`, `text_mass`, `instruction_mass` và `visual_entropy` [tại đây](/home/hust/Phuc/VDFlash/src/analyze/Validate_Sparrow_hypothesises/run_draft_attention.py:262). Tuy nhiên, để kiểm tra Hypothesis 1 đầy đủ cần bổ sung hidden/logit statistics và kiểm soát key-value intervention.
+Trong repo, runner `draft_attention` hiện đã ghi `visual_mass`, `text_mass`, `instruction_mass` và `visual_entropy` [tại đây](/path/to/local-resource:262). Tuy nhiên, để kiểm tra Hypothesis 1 đầy đủ cần bổ sung hidden/logit statistics và kiểm soát key-value intervention.
 
 ## 5. Hypothesis 2: Vì sao VDC không cải thiện khi giảm visual tokens?
 
@@ -365,7 +365,7 @@ Sau đó tính acceptance rate theo:
 - các bin 0–10%, 10–25%, 25–50%, 50–75%, 75–100%;
 - nhóm task hoặc loại câu trả lời.
 
-`acceptance_trace` hiện đã được ghi trong runtime [tại đây](/home/hust/Phuc/VDFlash/src/analyze/Validate_Sparrow_hypothesises/runtime.py:1074), nhưng trace hiện tại chủ yếu là số accepted proposals theo round. Để kiểm tra Hypothesis 3.1 cần thêm vị trí bắt đầu của từng round.
+`acceptance_trace` hiện đã được ghi trong runtime [tại đây](/path/to/local-resource:1074), nhưng trace hiện tại chủ yếu là số accepted proposals theo round. Để kiểm tra Hypothesis 3.1 cần thêm vị trí bắt đầu của từng round.
 
 ### Kết quả kỳ vọng
 

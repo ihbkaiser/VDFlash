@@ -55,17 +55,17 @@ jobs:
 
       - name: Restore cache
         run: |
-          if [ -d /github/home/cache ] && [ ! -z "$(ls -A /github/home/cache/)" ]; then
-            cp -p -r /github/home/cache ./
+          if [ -d /github/path/to/local-resource ] && [ ! -z "$(ls -A /github/path/to/local-resource/)" ]; then
+            cp -p -r /github/path/to/local-resource ./
           fi
 
-          if [ -d /github/home/sf ] && [ ! -z "$(ls -A /github/home/sf/)" ]; then
-            cp -p -r /github/home/sf ./
+          if [ -d /github/path/to/local-resource ] && [ ! -z "$(ls -A /github/path/to/local-resource/)" ]; then
+            cp -p -r /github/path/to/local-resource ./
           fi
 
       - name: Remove flashinfer # this is needed to avoid flashinfer jit compilation makes the program hang
         run: |
-          rm -rf /github/home/.cache/flashinfer
+          rm -rf /github/path/to/local-resource
 
       - name: Install dependencies
         shell: bash

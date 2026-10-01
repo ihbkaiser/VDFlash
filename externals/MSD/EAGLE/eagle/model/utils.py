@@ -8,7 +8,7 @@ import torch
 
 # TODO
 # from transformers import LlamaTokenizer
-# tokenizer=LlamaTokenizer.from_pretrained("/home/lyh/weights/hf/vicuna_v13/7B/")
+# tokenizer=LlamaTokenizer.from_pretrained("/path/to/local-resource/")
 
 TOPK = 10  # topk for sparse tree
 

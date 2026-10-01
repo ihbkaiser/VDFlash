@@ -14,8 +14,8 @@ export PYTHONUNBUFFERED=1
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd "$SCRIPT_DIR"
 
-SOURCE_DATA=/workspace/storage-shared/nlp/tungdd11/tungdecoder/ShareGPT/ShareGPT_V3_unfiltered_cleaned_split.json \
-TARGET_MODEL_PATH=/workspace/storage-shared/nlp/tungdd11/tungdecoder/models/qwen25-vl-3b \
+SOURCE_DATA=/path/to/local-resource \
+TARGET_MODEL_PATH=/path/to/local-resource \
 ARTIFACT_ROOT=/data/artifacts/qwen25vl_eagle3_text \
 bash train_qwen25vl_eagle3_text.sh \
   --config examples/configs/qwen2.5-vl-3b-eagle3-text-offline.yaml \

@@ -29,7 +29,7 @@ grep -qF 'resolve_workspace.sh' "${ROOT_DIR}/externals/SpecVLM/run_qwenvl.sh"
 grep -qF 'resolve_workspace.sh' "${ROOT_DIR}/externals/SpecVLM/run_llava.sh"
 ! grep -qF '/ycji/' "${ROOT_DIR}/externals/SpecVLM/utils/utils.py"
 
-! grep -qF '/home/hust/Phuc/VDFlash' "${ROOT_DIR}/scripts/run_mvbench100_ablation.sh"
+! grep -qF '/path/to/local-resource' "${ROOT_DIR}/scripts/run_mvbench100_ablation.sh"
 ! grep -qF 'exec python ' "${ROOT_DIR}/src/infer/run_qwen25vl_3b_dflash_vdc_compare.sh"
 ! grep -qF '/root/autodl-tmp' "${ROOT_DIR}/externals/Sparrow/run_videodetailcaption_baseline.sh"
 grep -qF 'run_videodetailcaption_baseline.sh' "${ROOT_DIR}/externals/Sparrow/run_all_videodetailcaption_qwen2_5_vl.sh"

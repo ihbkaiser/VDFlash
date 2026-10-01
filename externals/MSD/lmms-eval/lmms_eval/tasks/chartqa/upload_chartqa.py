@@ -86,9 +86,9 @@ class ChartQA(datasets.GeneratorBasedBuilder):
         # dl_manager is a datasets.download.DownloadManager that can be used to download and extract URLS
         # It can accept any type or nested list/dict and will give back the same structure with the url replaced with path to local files.
         # By default the archives will be extracted and a path to a cached folder where they are extracted is returned instead of the archive
-        image_path = "/home/yhzhang/ChartQA/ChartQA Dataset/test/png/"
-        human_annotation_path = "/home/yhzhang/ChartQA/ChartQA Dataset/test/test_human.json"
-        augmented_annotation_path = "/home/yhzhang/ChartQA/ChartQA Dataset/test/test_augmented.json"
+        image_path = "/path/to/local-resource Dataset/test/png/"
+        human_annotation_path = "/path/to/local-resource Dataset/test/test_human.json"
+        augmented_annotation_path = "/path/to/local-resource Dataset/test/test_augmented.json"
         return [
             datasets.SplitGenerator(
                 name=datasets.Split.TEST,
@@ -124,6 +124,6 @@ if __name__ == "__main__":
     from datasets import load_dataset
 
     data = load_dataset(
-        "/home/yhzhang/lmms-eval/lmms_eval/tasks/chartqa/upload_chartqa.py",
+        "/path/to/local-resource",
     )
     data.push_to_hub("lmms-lab/chartqa", private=True)

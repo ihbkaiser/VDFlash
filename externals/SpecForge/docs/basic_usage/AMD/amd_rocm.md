@@ -52,12 +52,12 @@ memory. Re-enter the running container later with `docker exec -it specforge bas
 
 ### Step 3: Clone and install SpecForge
 
-Inside the container, clone SpecForge into `/workspace/SpecForge` and register it
+Inside the container, clone SpecForge into `/path/to/local-resource` and register it
 in editable mode without touching the image's torch/sglang:
 
 ```bash
-git clone https://github.com/sgl-project/SpecForge.git /workspace/SpecForge
-cd /workspace/SpecForge
+git clone https://github.com/sgl-project/SpecForge.git /path/to/local-resource
+cd /path/to/local-resource
 python -m pip install -e . --no-deps
 ```
 
@@ -74,8 +74,8 @@ offline training, which reads features from disk and needs no capture service:
 
 ```bash
 cd /sgl-workspace/sglang
-git apply /workspace/SpecForge/patches/sglang/v0.5.14/spec-capture.patch
-cd /workspace/SpecForge
+git apply /path/to/local-resource
+cd /path/to/local-resource
 ```
 
 The patch adds the `--enable-spec-capture`, `--spec-capture-method`, and

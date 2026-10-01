@@ -25,14 +25,14 @@ while true; do
     fi
 
     echo "Starting/resuming H3.1: ${row_count}/${EXPECTED_ROWS} rows"
-    HF_HOME=/home/hust/.cache/huggingface \
+    HF_HOME=/path/to/local-resource \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     MSD_VISION_CHUNK_FRAMES=4 \
     MSD_MODEL_PARALLEL_VISUAL_DEVICE=1 \
     MSD_MODEL_PARALLEL_SPLIT_LAYER=26 \
     .venv-msd/bin/python -u -m src.analyze.Validate_Sparrow_hypothesises.run_msd \
-        --base-model /home/hust/.cache/huggingface/hub/models--Qwen--Qwen2-VL-7B-Instruct/snapshots/eed13092ef92e448dd6875b2a00151bd3f7db0ac \
-        --msd-model /home/hust/.cache/huggingface/hub/models--lucylyn--MSD-Qwen2VL-7B-Instruct/snapshots/c764d2ebd9b45d86dbf7960bffc918806c015234 \
+        --base-model /path/to/local-resource \
+        --msd-model /path/to/local-resource \
         --manifest dataset/VideoDetailCaption/subset_manifest.jsonl \
         --dataset-root dataset/VideoDetailCaption \
         --calibration dataset/VideoDetailCaption/calibration_complete_20260823_currentenv.jsonl \

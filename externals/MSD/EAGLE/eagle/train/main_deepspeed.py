@@ -84,9 +84,9 @@ def main():
     parser = argparse.ArgumentParser(description='sp')
     parser.add_argument('--basepath', type=str, default=None)
     parser.add_argument('--tmpdir_v', type=str,
-                        default='/home/llx/spd/eagle_data', help="visual instruction-tuning dataset")
+                        default='/path/to/local-resource', help="visual instruction-tuning dataset")
     parser.add_argument('--tmpdir_t', type=str,
-                        default='/home/llx/spd/eagle_data', help="text_only instruction-tuning dataset")
+                        default='/path/to/local-resource', help="text_only instruction-tuning dataset")
     parser.add_argument('--config', type=str, default='llava_v15_7B_config.json')
     parser.add_argument('--cpdir', type=str, default="", help="The path to save the model")
     parser.add_argument("--local_rank", type=int, default=-1, help="local_rank for distributed training on gpus")

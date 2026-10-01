@@ -1,7 +1,7 @@
 import json
 
-input_file_path = "/home/llx/models/datasets--liuhaotian--LLaVA-Instruct-150K/llava_v1_5_mix665k.json"
-output_file_path = "/home/llx/models/datasets--liuhaotian--LLaVA-Instruct-150K/llava_v1_5_mix665k_fixed.json"
+input_file_path = "/path/to/local-resource"
+output_file_path = "/path/to/local-resource"
 
 def convert_id_to_string(data):
     """

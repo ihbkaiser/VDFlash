@@ -3,9 +3,9 @@ set -euo pipefail
 
 SPECFORGE_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PYTHON_BIN=${PYTHON_BIN:-python3}
-SOURCE_DATA=${SOURCE_DATA:-"/workspace/storage-shared/nlp/tungdd11/tungdecoder/ShareGPT/ShareGPT_V3_unfiltered_cleaned_split.json"}
-MODEL_3B=${MODEL_3B:-"/workspace/storage-shared/nlp/tungdd11/tungdecoder/models/qwen25-vl-3b"}
-MODEL_7B=${MODEL_7B:-"/workspace/storage-shared/nlp/tungdd11/tungdecoder/models/qwen25-vl-7b"}
+SOURCE_DATA=${SOURCE_DATA:-"/path/to/local-resource"}
+MODEL_3B=${MODEL_3B:-"/path/to/local-resource"}
+MODEL_7B=${MODEL_7B:-"/path/to/local-resource"}
 ARTIFACT_ROOT=${ARTIFACT_ROOT:-"$SPECFORGE_DIR/artifacts/qwen25vl_dflash_sharegpt68k"}
 OUTPUT_ROOT=${OUTPUT_ROOT:-"$SPECFORGE_DIR/outputs"}
 

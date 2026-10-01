@@ -103,7 +103,7 @@ python -m pytest -q
 Có thể đặt Hugging Face cache lên ổ dung lượng lớn trước khi download:
 
 ```bash
-export HF_HOME=/mnt/fast-storage/huggingface
+export HF_HOME=/path/to/local-resource
 hf auth login  # chỉ cần nếu Hub yêu cầu token
 ```
 

@@ -42,8 +42,8 @@ not pull CUDA wheels over the working ROCm stack:
 
 ```bash
 # Inside the ROCm SGLang container
-git clone https://github.com/sgl-project/SpecForge.git /workspace/SpecForge
-cd /workspace/SpecForge
+git clone https://github.com/sgl-project/SpecForge.git /path/to/local-resource
+cd /path/to/local-resource
 python -m pip install -e . --no-deps
 ```
 

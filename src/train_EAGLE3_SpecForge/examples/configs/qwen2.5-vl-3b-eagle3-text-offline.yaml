@@ -1,5 +1,5 @@
 model:
-  target_model_path: /workspace/storage-shared/nlp/tungdd11/tungdecoder/models/qwen25-vl-3b
+  target_model_path: /path/to/local-resource
   draft_model_config: configs/qwen2.5-vl-3b-eagle3.json
   target_backend: sglang
   input_modality: text
