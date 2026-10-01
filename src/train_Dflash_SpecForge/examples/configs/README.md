@@ -36,7 +36,8 @@ The filename is the index: `*-online.yaml` performs SGLang server capture while
 training, `*-offline.yaml` consumes precomputed features, and
 `*-disaggregated.yaml` highlights a producer/consumer topology. Every online
 recipe is disaggregated even when its historical filename only says `online`.
-VLM training is not supported, so the catalog contains text-only recipes.
+The catalog includes offline Qwen2.5-VL DFlash and MSD recipes. Online capture
+remains text-only.
 
 The `qwen3-8b-dflash-1server-dp7-disaggregated.yaml`,
 `qwen3-8b-domino-1server-dp7-disaggregated.yaml`,
@@ -147,6 +148,7 @@ should make their training strategy and topology explicit.
 | `model.target_model_path` | required | Local target directory or Hugging Face repository ID. |
 | `model.draft_model_config` | `null` | Draft JSON, model directory containing `config.json`, or Hugging Face repository. EAGLE3, P-EAGLE, and DFlash may omit it and derive a fresh config; Domino and DSpark require one. |
 | `model.draft_checkpoint_path` | `null` | Weights-only warm start for a new run. Do not combine it with `training.resume_from`. |
+| `model.draft_warm_start_mode` | `auto` | Weights-only warm-start compatibility policy: `auto`, `strict`, `reset_projection`, or `none`. |
 | `model.draft_num_hidden_layers` | `null` | Positive fresh-architecture override where the strategy permits it. EAGLE3 remains one layer; P-EAGLE and DFlash may override their generated defaults. |
 | `model.draft_block_size` | `null` | Positive DFlash block-size override; generated DFlash configs default to 16. |
 | `model.target_backend` | `sglang` | `sglang` is the only accepted value; retired `hf`/`custom` names fail at config load. Offline feature consumers do not instantiate a target inference backend. |
@@ -195,8 +197,10 @@ Exactly one of the first three fields must be non-empty:
 | `data.train_data_path` | `""` | Raw conversation/preformatted JSON or JSONL sent to the online capture producer. |
 | `data.prompts_path` | `""` | Pre-tokenized online JSONL with `input_ids` and `loss_mask`. |
 | `data.hidden_states_path` | `""` | Directory of precomputed offline feature `.ckpt` files. Selecting it makes the run offline. |
+| `data.msd_visual_hidden_states_path` | `""` | MSD's matched LLaVA feature root; `hidden_states_path` remains the ShareGPT root. |
 | `data.eval_data_path` | `""` | Reserved migration field. Online evaluation is unsupported; leave it empty. |
 | `data.eval_hidden_states_path` | `""` | Offline evaluation features; configure them together with a positive `training.eval_interval`. |
+| `data.hidden_state_phase` | `null` | Optional `phase1`/`phase2` provenance for compatible offline feature caches. |
 | `data.max_length` | `2048` | Maximum token length used by preparation, capture, and training. |
 | `data.chat_template` | `llama3` | Template name used to format conversations and locate assistant loss spans. |
 | `data.is_preformatted` | `false` | Treat each record's text as already formatted by `chat_template`. |
@@ -217,7 +221,7 @@ Common fields:
 
 | Field | Default | What to write |
 | --- | --- | --- |
-| `training.strategy` | `eagle3` | `eagle3`, `peagle`, `dflash`, `domino`, or `dspark`. |
+| `training.strategy` | `eagle3` | `eagle3`, `peagle`, `dflash`, `domino`, `dspark`, or offline `msd`. |
 | `training.num_epochs` | `1` | Positive passes over a finite source. |
 | `training.max_steps` | `null` | Positive hard stop in optimizer steps. If it is set while `total_steps` is omitted, it is also the fallback schedule horizon. |
 | `training.total_steps` | `null` | Positive optimizer/loss schedule horizon; it does not itself stop an online stream. A finite online disaggregated run may omit both fields: the producer publishes the exact horizon derived from prepared prompts, epochs, DP size, batch size, and accumulation. |
@@ -253,6 +257,7 @@ Strategy-specific fields should be written only when tuning that objective:
 | DFlash / Domino / D-PACE | `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`), `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), `training.loss_type` (`dflash`), `training.dpace_alpha` (`0.5`), `training.lambda_base_start` (`1.0`), `training.lambda_base_decay_ratio` (`0.5`) |
 | DSpark | Token-pooled objective with valid-first-target anchors and distributed ratio telemetry. Configure the shared `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`; production recipes use `4.0`), and `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), plus `training.dspark_ce_loss_alpha` (`0.1`), `training.dspark_l1_loss_alpha` (`0.9`), and `training.dspark_confidence_head_alpha` (`1.0`). |
 | P-EAGLE | `training.num_depths` (`8`), `training.down_sample_ratio` (`0.8`), `training.down_sample_ratio_min` (`0.2`), `training.norm_before_residual` (`null`) |
+| MSD | `training.msd_feature_loss_weight` (`1.0`), `training.msd_soft_loss_weight` (`0.1`), `training.msd_noise_width` (`0.2`), fixed `training.msd_total_epochs` (`40`), and `training.msd_curriculum_seed` (`0`) |
 
 New recipes must not write the loader-only migration fields
 `training.deployment_mode`, `training.server_urls`, or
@@ -423,8 +428,8 @@ unless tuning throughput or memory pressure.
   `sp_ulysses_size * sp_ring_size > 1`. Non-USP runs keep both SP sizes at 1.
 - P-EAGLE reuses the EAGLE3 server feature schema, uses `flex_attention`, and
   requires batch size 1.
-- VLM training, including Qwen2.5-VL, is not supported. Online capture accepts
-  text inputs only.
+- Qwen2.5-VL DFlash and MSD are offline-only. Online capture accepts text
+  inputs only.
 - `training.compact_teacher` is offline text EAGLE3 only.
 - Online evaluation is not supported. Offline `data.eval_hidden_states_path`
   and `training.eval_interval` must be configured together.
@@ -457,6 +462,7 @@ For deeper lifecycle and recovery semantics, see the
 | Domino | consumer DP | DP | consumer DP |
 | DSpark | consumer DP | DP | consumer DP |
 | P-EAGLE | consumer DP, batch size 1 | No | No |
+| MSD | No | DP, Qwen2.5-VL only | No |
 
 `qwen3-8b-dpace-online.yaml` is the D-PACE recipe. It deliberately uses the
 shared DFlash strategy with `training.loss_type: dpace`; D-PACE is an objective

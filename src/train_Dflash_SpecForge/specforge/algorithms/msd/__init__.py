@@ -1,14 +1,7 @@
-"""Multimodal Speculative Decoding algorithm support."""
+"""Multimodal Speculative Decoding algorithm package.
 
-from .curriculum import choose_visual_sample, visual_ratio_for_epoch
-from .data import normalize_offline_sample
-from .model import add_reference_uniform_noise, decouple_msd_inputs, msd_loss
+Tensor-heavy APIs live in ``msd.data`` and ``msd.model`` so importing the
+built-in algorithm catalog remains dependency-light.
+"""
 
-__all__ = [
-    "add_reference_uniform_noise",
-    "choose_visual_sample",
-    "decouple_msd_inputs",
-    "msd_loss",
-    "normalize_offline_sample",
-    "visual_ratio_for_epoch",
-]
+__all__: list[str] = []

@@ -66,7 +66,7 @@ class MSDConfig(PretrainedConfig):
         if self.num_hidden_layers not in {1, 3, 5}:
             raise ValueError("MSD replication depth must be 1, 3, or 5")
         if self.num_attention_heads % self.num_key_value_heads:
-            raise ValueError("num_attention_heads must divide num_key_value_heads")
+            raise ValueError("num_key_value_heads must divide num_attention_heads")
         if self.num_attention_heads * self.head_dim != self.hidden_size:
             raise ValueError("num_attention_heads * head_dim must equal hidden_size")
         if len(self.mrope_section) != 3:
@@ -252,7 +252,6 @@ class MSDDraftModel(PreTrainedModel):
         self.layers = nn.ModuleList(
             [MSDDecoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
-        self.norm = MSDRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_init()
         self.embed_tokens.weight.requires_grad_(False)
 
@@ -309,7 +308,7 @@ class MSDDraftModel(PreTrainedModel):
             position_ids = base.unsqueeze(0).expand(3, -1, -1)
         for layer in self.layers:
             hidden_states = layer(hidden_states, attention_mask, position_ids)
-        return self.norm(hidden_states)
+        return hidden_states
 
 
 __all__ = ["MSDConfig", "MSDDraftModel", "MSDMultiModalRotaryEmbedding"]

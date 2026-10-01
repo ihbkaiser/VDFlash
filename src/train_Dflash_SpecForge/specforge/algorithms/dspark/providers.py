@@ -8,12 +8,6 @@ from specforge.algorithms.common.defaults import (
     empty_options,
     no_missing_checkpoint_keys,
 )
-from specforge.algorithms.common.dflash_family_data import (
-    DSPARK_NORMALIZER_ID,
-    build_dspark_collator,
-    build_dspark_offline_normalizer,
-    build_dspark_offline_reader,
-)
 from specforge.algorithms.common.providers import (
     AlgorithmProviders,
     DraftConfigProvider,
@@ -38,6 +32,31 @@ from specforge.data.loss_mask import has_consecutive_supervised_tokens
 ALGORITHM_NAME = "dspark"
 DRAFT_ARCHITECTURE = "DSparkDraftModel"
 COMPATIBLE_DRAFT_ARCHITECTURES = frozenset({DRAFT_ARCHITECTURE})
+DSPARK_NORMALIZER_ID = "dspark_offline_v1"
+
+
+def build_dspark_collator(*args, **kwargs):
+    from specforge.algorithms.common.dflash_family_data import (
+        build_dspark_collator as impl,
+    )
+
+    return impl(*args, **kwargs)
+
+
+def build_dspark_offline_normalizer(*args, **kwargs):
+    from specforge.algorithms.common.dflash_family_data import (
+        build_dspark_offline_normalizer as impl,
+    )
+
+    return impl(*args, **kwargs)
+
+
+def build_dspark_offline_reader(*args, **kwargs):
+    from specforge.algorithms.common.dflash_family_data import (
+        build_dspark_offline_reader as impl,
+    )
+
+    return impl(*args, **kwargs)
 
 
 def build_step(wrapped_model, *, target_head=None, **_options):

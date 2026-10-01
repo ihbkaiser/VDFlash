@@ -84,6 +84,8 @@ class ExampleDraftConfigWiringTest(unittest.TestCase):
         self.assertEqual(
             {path.name for path in checked_in - referenced},
             {
+                "qwen2.5-vl-3b-dflash-h32-depth1.json",
+                "qwen2.5-vl-3b-dflash-h32-depth3.json",
                 "qwen2-5-vl-7b-eagle3.json",
                 "qwen2.5-vl-32b-eagle3.json",
             },

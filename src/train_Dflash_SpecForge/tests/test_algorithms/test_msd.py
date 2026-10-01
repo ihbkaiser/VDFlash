@@ -106,8 +106,10 @@ def test_msd_normalizer_reproduces_next_token_shift() -> None:
     assert torch.equal(
         normalized["conditioning_hidden_state"], raw["target_hidden_state"]
     )
-    assert torch.equal(normalized["visual_embeddings"], raw["input_embeddings"])
-    assert normalized["visual_token_mask"].tolist() == [[False, True, True, False]]
+    assert normalized["visual_embeddings"].tolist() == [
+        [[30.0, 40.0], [50.0, 60.0], [70.0, 80.0], [0.0, 0.0]]
+    ]
+    assert normalized["visual_token_mask"].tolist() == [[True, True, False, False]]
     assert tuple(normalized["position_ids"].shape) == (3, 1, 4)
 
 
@@ -180,13 +182,16 @@ def test_msd_loss_matches_literal_reference_and_masks_padding() -> None:
 
     result = msd_loss(predicted, target, mask, head, 1.0, 0.1)
 
-    expected_feature = torch.nn.functional.smooth_l1_loss(
-        predicted[:, :1], target[:, :1], reduction="mean"
-    )
+    denominator = mask.sum() + 1e-5
+    feature_per_token = torch.nn.functional.smooth_l1_loss(
+        predicted, target, reduction="none"
+    ).mean(-1)
+    expected_feature = (feature_per_token * mask).sum() / denominator
     target_probs = head(target[:, :1]).softmax(-1)
-    expected_soft = -(
+    soft_per_token = -(
         target_probs * head(predicted[:, :1]).log_softmax(-1)
-    ).sum(-1).mean()
+    ).sum(-1)
+    expected_soft = soft_per_token.sum() / denominator
     assert torch.allclose(result.feature_loss, expected_feature)
     assert torch.allclose(result.soft_target_loss, expected_soft)
     assert torch.allclose(result.loss, expected_feature + 0.1 * expected_soft)
