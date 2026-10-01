@@ -40,6 +40,7 @@ class MSDConfig(PretrainedConfig):
         **kwargs,
     ) -> None:
         architectures = kwargs.pop("architectures", None)
+        kwargs.pop("tie_word_embeddings", None)
         super().__init__(
             architectures=architectures or ["MSDDraftModel"],
             tie_word_embeddings=False,
