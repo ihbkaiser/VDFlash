@@ -1,0 +1,51 @@
+model:
+  target_model_path: /models/qwen25-vl-3b
+  draft_model_config: configs/qwen2.5-vl-3b-msd.json
+  draft_num_hidden_layers: 1
+  target_backend: sglang
+  input_modality: multimodal
+  embedding_key: model.language_model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+  torch_dtype: bfloat16
+
+data:
+  hidden_states_path: /data/msd/features/sharegpt68k
+  msd_visual_hidden_states_path: /data/msd/features/llava68k
+  max_length: 2048
+  chat_template: qwen
+  train_only_last_turn: true
+  dataloader_num_workers: 4
+  cache_dir: ./cache/msd
+
+training:
+  strategy: msd
+  num_epochs: 40
+  batch_size: 1
+  accumulation_steps: 1
+  fsdp_sharding: FULL_SHARD
+  learning_rate: 5.0e-5
+  lr_scheduler: cosine
+  warmup_ratio: 0.015
+  max_grad_norm: 0.5
+  attention_backend: sdpa
+  msd_feature_loss_weight: 1.0
+  msd_soft_loss_weight: 0.1
+  msd_noise_width: 0.2
+  msd_total_epochs: 40
+  msd_curriculum_seed: 0
+  save_interval: 1000
+  max_checkpoints: 3
+  log_interval: 50
+  seed: 0
+
+tracking:
+  report_to: none
+
+run_id: qwen25vl-3b-msd-depth1
+output_dir: outputs/qwen25vl-3b-msd/depth1/output
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 4
