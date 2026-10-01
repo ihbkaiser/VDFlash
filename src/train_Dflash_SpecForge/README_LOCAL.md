@@ -107,6 +107,58 @@ SpecForge upstream currently requires its own environment (`torch==2.11.0`,
 root VLM environment, which has separate versions in the repository-level
 `requirements.txt`.
 
+## Original MSD depth sweep on Qwen2.5-VL-3B
+
+The dedicated `msd` backend reproduces the public `externals/MSD` objective
+instead of aliasing EAGLE3 or DFlash. It trains homogeneous 1-, 3-, and 5-layer
+draft transformers against one frozen Qwen2.5-VL-3B target. Text positions use
+the projected concatenation of the current target hidden state and next-token
+embedding; visual positions bypass that projection with the post-vision input
+embedding. The loss is SmoothL1 with weight 1.0 plus frozen-LM-head soft-target
+cross entropy with weight 0.1. Uniform feature noise uses width 0.2 scaled by
+`512 / sequence_length`.
+
+The 40-epoch run is continuous and does not reset the optimizer. Epochs 1-20
+select ShareGPT only. Epochs 21-39 select LLaVA with probability
+`(epoch - 20) / 40 * 2`, and epoch 40 selects LLaVA only. Corpus selection is
+hash-based on seed, epoch, and logical sample index, so checkpoint resume
+reconstructs the same mixture.
+
+Inspect the complete sweep without touching data or GPUs:
+
+```bash
+bash train_qwen25vl_msd_depth_sweep.sh --print-config
+```
+
+Run phases separately or together after overriding the machine paths shown by
+the dry run:
+
+```bash
+bash train_qwen25vl_msd_depth_sweep.sh --phase data
+bash train_qwen25vl_msd_depth_sweep.sh --phase capture
+bash train_qwen25vl_msd_depth_sweep.sh --phase train --resume
+```
+
+The immutable text and visual feature caches are shared across all depths.
+Generated configs and checkpoints remain isolated:
+
+```text
+outputs/qwen25vl-3b-msd/generated/depth{1,3,5}/
+outputs/qwen25vl-3b-msd/depth{1,3,5}/output/
+```
+
+Each raw MSD feature record contains `input_ids`, `loss_mask`, the target final
+hidden state, the language-model input embeddings after visual replacement, an
+explicit visual-token mask, and Qwen2.5-VL three-axis position IDs. Resume
+metadata records the depth, objective weights, noise width, target dimensions,
+curriculum seed, and curriculum formula version.
+
+The current implementation has been verified only with static/config tests and
+a tiny CPU forward/backward step (verification rung R2). It has not downloaded
+the 68k datasets or target weights, run a CUDA capture, completed 40 epochs, or
+reproduced the paper's acceptance/speed results. Perform a tiny real-cache
+overfit and GPU capture smoke test before launching the full sweep.
+
 ## Qwen2.5-VL LLaVA caption Phase 2
 
 The LLaVA caption workflow uses the offline SpecForge DFlash trainer with a
