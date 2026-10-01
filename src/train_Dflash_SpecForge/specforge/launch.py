@@ -541,6 +541,7 @@ def build_offline_runtime(
     algorithm: AlgorithmRegistration,
     modality: str = "text",
     hidden_states_path: str,
+    msd_visual_hidden_states_path: Optional[str] = None,
     hidden_state_phase: Optional[str] = None,
     draft_model,
     target_head,
@@ -563,6 +564,8 @@ def build_offline_runtime(
     sp_ring_size: int = 1,
     use_usp_preprocess: bool = False,
     seed: int = 0,
+    msd_curriculum_seed: int = 0,
+    msd_total_epochs: int = 40,
     logger=None,
     log_interval: int = 50,
     resume_from: Optional[str] = None,
@@ -601,13 +604,38 @@ def build_offline_runtime(
         metadata_store=NoOpMetadataStore(),
         enable_sample_queue=False,
     )
-    source_refs = provider.build_reader(
-        hidden_states_path, run_id=run_id, ttt_length=ttt_length, max_len=max_len
-    ).read()
+    if algorithm.name == "msd":
+        if not msd_visual_hidden_states_path:
+            raise ValueError("MSD offline runtime requires the visual feature root")
+        from specforge.algorithms.msd.data import build_paired_offline_reader
+
+        def unsharded_refs_for_epoch(epoch):
+            return build_paired_offline_reader(
+                hidden_states_path,
+                msd_visual_hidden_states_path,
+                run_id=run_id,
+                ttt_length=ttt_length,
+                max_len=max_len,
+                epoch_now=epoch + 1,
+                curriculum_seed=msd_curriculum_seed,
+                total_epoch=msd_total_epochs,
+            ).read()
+
+        source_refs = unsharded_refs_for_epoch(0)
+    else:
+        source_refs = provider.build_reader(
+            hidden_states_path,
+            run_id=run_id,
+            ttt_length=ttt_length,
+            max_len=max_len,
+        ).read()
+
+        def unsharded_refs_for_epoch(_epoch):
+            return source_refs
 
     def refs_for_epoch(epoch):
         return _shard_offline_refs(
-            source_refs,
+            unsharded_refs_for_epoch(epoch),
             use_usp_preprocess=use_usp_preprocess,
             seed=seed,
             epoch=epoch,
@@ -662,6 +690,9 @@ def build_offline_runtime(
             "offline_sampler_version": 1,
             "sampler_seed": seed,
             "source_dataset_size": len(source_refs),
+            "msd_curriculum_seed": (
+                msd_curriculum_seed if algorithm.name == "msd" else None
+            ),
         },
         max_checkpoints=max_checkpoints,
         tp_size=tp_size,

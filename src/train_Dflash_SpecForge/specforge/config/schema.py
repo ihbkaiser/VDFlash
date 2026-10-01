@@ -141,6 +141,8 @@ class DataConfig(StrictConfigModel):
     prompts_path: str = ""
     #: offline mode — directory of precomputed hidden-state .ckpt files.
     hidden_states_path: str = ""
+    #: MSD visual feature root paired with ``hidden_states_path`` (text).
+    msd_visual_hidden_states_path: str = ""
     #: Reserved migration field. Online evaluation is unsupported; keep empty.
     eval_data_path: str = ""
     #: offline evaluation — directory of precomputed hidden-state .ckpt files.
@@ -574,6 +576,12 @@ class TrainingConfig(StrictConfigModel):
     dspark_ce_loss_alpha: float = 0.1
     dspark_l1_loss_alpha: float = 0.9
     dspark_confidence_head_alpha: float = 1.0
+    #: MSD paper-replication objective and curriculum knobs.
+    msd_feature_loss_weight: float = Field(default=1.0, ge=0.0)
+    msd_soft_loss_weight: float = Field(default=0.1, ge=0.0)
+    msd_noise_width: float = Field(default=0.2, ge=0.0)
+    msd_total_epochs: Literal[40] = 40
+    msd_curriculum_seed: int = 0
     #: P-EAGLE COD sampling/model knobs.
     num_depths: int = Field(default=8, gt=0)
     down_sample_ratio: float = 0.8
@@ -726,6 +734,25 @@ class Config(StrictConfigModel):
         mode = self.mode
         deployment = self.deployment.mode
         role = self.training.role
+
+        if self.training.strategy == "msd":
+            if self.training.num_epochs != self.training.msd_total_epochs:
+                raise ValueError("MSD replication requires training.num_epochs=40")
+            if not self.data.msd_visual_hidden_states_path:
+                raise ValueError(
+                    "MSD requires data.msd_visual_hidden_states_path for LLaVA-68k"
+                )
+            if self.model.input_modality != "multimodal":
+                raise ValueError(
+                    "MSD requires model.input_modality='multimodal'"
+                )
+            depth = self.model.draft_num_hidden_layers
+            if depth is not None and depth not in {1, 3, 5}:
+                raise ValueError("MSD draft depth must be 1, 3, or 5")
+        elif self.data.msd_visual_hidden_states_path:
+            raise ValueError(
+                "data.msd_visual_hidden_states_path requires training.strategy='msd'"
+            )
 
         if mode == "online" and deployment != "disaggregated":
             raise ValueError(
