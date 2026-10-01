@@ -1,4 +1,5 @@
 import json
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from types import MethodType, SimpleNamespace
 
@@ -36,7 +37,7 @@ from src.train_VLM.trainer import (
     train_records,
 )
 from src.train_VLM.vlm_decode import Qwen25VLDFlashDecoder
-from src.train_VLM.video import _apply_media_defaults
+from src.train_VLM.video import _apply_media_defaults, prepare_qwen_messages
 from src.train_VLM.real_data import prepare_real_manifest, select_source_records
 
 
@@ -136,6 +137,36 @@ def test_video_defaults_are_parameterized_without_mutating_messages():
     }
     assert materialized[0]["content"][1]["nframes"] == 6
     assert materialized[0]["content"][1]["max_pixels"] == 20000
+
+
+def test_image_only_processor_drops_empty_video_fps(monkeypatch):
+    class StubProcessor:
+        def apply_chat_template(self, messages, *, tokenize, **kwargs):
+            return "rendered image prompt"
+
+        def __call__(self, **kwargs):
+            self.received_kwargs = kwargs
+            return {"input_ids": torch.ones((1, 4), dtype=torch.long)}
+
+    processor = StubProcessor()
+    monkeypatch.setitem(
+        sys.modules,
+        "qwen_vl_utils",
+        SimpleNamespace(
+            process_vision_info=lambda messages, return_video_kwargs: (
+                [object()], [], {"fps": []}
+            )
+        ),
+    )
+    inputs, metadata = prepare_qwen_messages(
+        processor,
+        [{"role": "user", "content": [{"type": "image", "image": "file:///tmp/image.jpg"}]}],
+        device=torch.device("cpu"),
+    )
+
+    assert "fps" not in processor.received_kwargs
+    assert inputs["input_ids"].shape == (1, 4)
+    assert metadata.frame_counts == ()
 
 
 def test_real_dataset_selection_is_deterministic_and_records_source_indices(tmp_path):
