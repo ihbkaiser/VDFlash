@@ -352,13 +352,21 @@ def resolve_offline_capture_plan(
         "trust_remote_code": args.trust_remote_code,
         "cache_dir": getattr(args, "cache_dir", None),
     }
+    if strategy == "msd":
+        model["input_modality"] = "multimodal"
+        model["draft_num_hidden_layers"] = 1
+    data = {
+        "hidden_states_path": args.output_path or "__offline_capture__",
+        "max_length": args.max_length,
+    }
+    training = {"strategy": strategy}
+    if strategy == "msd":
+        data["msd_visual_hidden_states_path"] = "__msd_visual_capture__"
+        training.update(num_epochs=40, msd_total_epochs=40)
     cfg = Config(
         model=model,
-        data={
-            "hidden_states_path": args.output_path or "__offline_capture__",
-            "max_length": args.max_length,
-        },
-        training={"strategy": strategy},
+        data=data,
+        training=training,
     )
     resolved = resolve_offline_capture(cfg, target_config=target_config)
     return OfflineCapturePlan(
@@ -755,6 +763,24 @@ class HiddenStatesGenerator:
                             "loss_mask": filtered_batch["loss_mask"][i].clone(),
                             "aux_hidden_states": aux_hidden_states,
                             "last_hidden_states": last_hidden_states,
+                            "input_embeddings": (
+                                captured.input_embeddings[i].cpu().clone().unsqueeze(0)
+                                if captured.input_embeddings is not None
+                                else None
+                            ),
+                            "visual_token_mask": (
+                                captured.visual_token_mask[i].cpu().clone()
+                                if captured.visual_token_mask is not None
+                                else None
+                            ),
+                            "position_ids": (
+                                captured.position_ids[:, i].cpu().clone()
+                                if captured.position_ids is not None
+                                and captured.position_ids.ndim == 3
+                                else captured.position_ids[i].cpu().clone()
+                                if captured.position_ids is not None
+                                else None
+                            ),
                         }
                     )
 
