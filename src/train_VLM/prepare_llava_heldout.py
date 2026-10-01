@@ -12,7 +12,7 @@ from typing import Any
 from tqdm.auto import tqdm
 
 from .config import DFlashTrainConfig
-from .prepare_responses import prepare_responses
+from .prepare_responses import prepare_responses_batched
 from .prepare_responses_vllm import prepare_responses_vllm
 from .real_data import _iter_json_array
 from .target import Qwen25VLTargetAdapter
@@ -277,7 +277,10 @@ def main() -> None:  # pragma: no cover - exercised through component tests
     parser.add_argument("--manifest", required=True, help="selected held-out input manifest")
     parser.add_argument("--target-output", required=True, help="full target manifest with exact token IDs")
     parser.add_argument("--flat-output", required=True, help="JSONL in the same id/image/prompt/response format as 68K")
-    parser.add_argument("--backend", choices=("hf", "vllm"), default="hf")
+    parser.add_argument("--backend", choices=("hf", "vllm"), default="hf",
+                        help="hf uses native Transformers batches and needs no vLLM install")
+    parser.add_argument("--batch-size", type=int, default=8,
+                        help="number of images per native Transformers generate() call")
     parser.add_argument("--vllm-batch-size", type=int, default=64,
                         help="host-side images per vLLM call; engine batches continuously within this chunk")
     parser.add_argument("--vllm-max-num-seqs", type=int, default=32)
@@ -295,8 +298,6 @@ def main() -> None:  # pragma: no cover - exercised through component tests
     flat_output = Path(args.flat_output).expanduser().resolve()
     if args.overwrite_output and args.resume_output:
         parser.error("--overwrite-output and --resume-output cannot be used together")
-    if args.resume_output and args.backend != "vllm":
-        parser.error("--resume-output is currently supported only with --backend vllm")
     for path in (target_output, flat_output):
         if path.exists() and not (args.overwrite_output or args.resume_output):
             raise FileExistsError(f"output exists: {path}; pass --resume-output or --overwrite-output")
@@ -346,12 +347,16 @@ def main() -> None:  # pragma: no cover - exercised through component tests
         # Honor the configured device explicitly; otherwise the adapter defaults to
         # the process's generic "cuda" device and can follow a different device map.
         adapter = Qwen25VLTargetAdapter.from_pretrained(config, device=config.device)
-        prepare_responses(
+        if args.overwrite_output:
+            target_output.unlink(missing_ok=True)
+        prepare_responses_batched(
             adapter,
             records,
             max_new_tokens=config.response_max_new_tokens,
             max_seq_length=config.max_seq_length,
             output_path=target_output,
+            batch_size=args.batch_size,
+            resume=args.resume_output,
         )
     _, _, _, teacher_model = _read_training_exclusions(Path(args.train_jsonl).expanduser().resolve())
     _write_flat_responses(

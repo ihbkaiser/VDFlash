@@ -37,7 +37,11 @@ from src.train_VLM.trainer import (
     train_records,
 )
 from src.train_VLM.vlm_decode import Qwen25VLDFlashDecoder
-from src.train_VLM.video import _apply_media_defaults, prepare_qwen_messages
+from src.train_VLM.video import (
+    _apply_media_defaults,
+    prepare_qwen_message_batch,
+    prepare_qwen_messages,
+)
 from src.train_VLM.real_data import prepare_real_manifest, select_source_records
 
 
@@ -167,6 +171,49 @@ def test_image_only_processor_drops_empty_video_fps(monkeypatch):
     assert "fps" not in processor.received_kwargs
     assert inputs["input_ids"].shape == (1, 4)
     assert metadata.frame_counts == ()
+
+
+def test_batched_image_processor_keeps_batch_and_drops_empty_video_fps(monkeypatch):
+    class StubProcessor:
+        def __init__(self):
+            self.received = None
+
+        def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
+            return f"rendered {messages[0]['content'][1]['text']}"
+
+        def __call__(self, **kwargs):
+            self.received = kwargs
+            return {"input_ids": torch.ones((2, 4), dtype=torch.long)}
+
+    processor = StubProcessor()
+    monkeypatch.setitem(
+        sys.modules,
+        "qwen_vl_utils",
+        SimpleNamespace(
+            process_vision_info=lambda messages, return_video_kwargs: (
+                [object(), object()], [], {"fps": []}
+            )
+        ),
+    )
+    batch = [
+        [{"role": "user", "content": [
+            {"type": "image", "image": f"file:///tmp/{index}.jpg"},
+            {"type": "text", "text": f"caption {index}"},
+        ]}]
+        for index in range(2)
+    ]
+
+    inputs = prepare_qwen_message_batch(
+        processor,
+        batch,
+        image_min_pixels=12544,
+        image_max_pixels=12544,
+    )
+
+    assert len(processor.received["text"]) == 2
+    assert len(processor.received["images"]) == 2
+    assert "fps" not in processor.received
+    assert inputs["input_ids"].shape == (2, 4)
 
 
 def test_real_dataset_selection_is_deterministic_and_records_source_indices(tmp_path):
