@@ -160,6 +160,11 @@ def prepare_qwen_messages(
     image_inputs, video_inputs, video_kwargs = process_vision_info(
         materialized_messages, return_video_kwargs=True
     )
+    # qwen-vl-utils may return video-only metadata such as ``fps=[]`` for an
+    # image-only request. Recent Transformers processors strictly validate FPS
+    # as a scalar, so do not forward video kwargs when there are no videos.
+    if video_inputs is None or len(video_inputs) == 0:
+        video_kwargs = {}
     call_kwargs = _merge_processor_kwargs(dict(video_kwargs or {}), processor_kwargs)
     inputs = processor(
         text=[rendered],
