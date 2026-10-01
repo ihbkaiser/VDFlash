@@ -85,12 +85,59 @@ def _validate_jsonl(path: Path, *, expected_records: int) -> None:
 def _iter_json_array(path: Path) -> Iterator[dict[str, Any]]:
     try:
         import ijson
-    except ImportError as exc:  # pragma: no cover - dependency error in CLI
-        raise RuntimeError("ijson is required to stream the official dataset JSON files") from exc
-    with path.open("rb") as reader:
-        for value in ijson.items(reader, "item"):
-            if isinstance(value, dict):
-                yield value
+    except ImportError:  # pragma: no cover - exercised on minimal environments
+        # Stream a top-level JSON array with the standard library. This avoids
+        # loading the 558K annotation file into memory when the optional ijson
+        # dependency is not installed.
+        decoder = json.JSONDecoder()
+        with path.open("r", encoding="utf-8") as reader:
+            buffer = ""
+            started = False
+            eof = False
+            while True:
+                buffer = buffer.lstrip()
+                if not started:
+                    while not buffer and not eof:
+                        buffer = reader.read(1024 * 1024)
+                        eof = not buffer
+                        buffer = buffer.lstrip()
+                    if not buffer:
+                        raise ValueError(f"empty JSON file: {path}")
+                    if buffer[0] != "[":
+                        raise ValueError(f"expected a top-level JSON array in {path}")
+                    buffer = buffer[1:]
+                    started = True
+                    continue
+
+                buffer = buffer.lstrip()
+                if buffer.startswith(","):
+                    buffer = buffer[1:]
+                    continue
+                if buffer.startswith("]"):
+                    return
+                if not buffer:
+                    if eof:
+                        raise ValueError(f"unterminated JSON array in {path}")
+                    buffer = reader.read(1024 * 1024)
+                    eof = not buffer
+                    continue
+                try:
+                    value, end = decoder.raw_decode(buffer)
+                except json.JSONDecodeError:
+                    if eof:
+                        raise ValueError(f"invalid or incomplete JSON array in {path}")
+                    chunk = reader.read(1024 * 1024)
+                    buffer += chunk
+                    eof = not chunk
+                    continue
+                buffer = buffer[end:]
+                if isinstance(value, dict):
+                    yield value
+    else:
+        with path.open("rb") as reader:
+            for value in ijson.items(reader, "item"):
+                if isinstance(value, dict):
+                    yield value
 
 
 def _normalized_turns(record: dict[str, Any]) -> tuple[list[dict[str, str]], str] | None:
