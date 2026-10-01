@@ -30,6 +30,7 @@ from specforge.algorithms.msd.data import (
     build_offline_collator,
     build_offline_normalizer,
     build_offline_reader,
+    validate_msd_capture_record,
 )
 
 ALGORITHM_NAME = "msd"
@@ -169,6 +170,7 @@ def algorithm_providers() -> AlgorithmProviders:
                         ("visual_token_mask", "visual_token_mask"),
                         ("position_ids", "position_ids"),
                     ),
+                    record_validator=validate_msd_capture_record,
                 ),
                 build_reader=build_offline_reader,
                 build_normalizer=build_offline_normalizer,

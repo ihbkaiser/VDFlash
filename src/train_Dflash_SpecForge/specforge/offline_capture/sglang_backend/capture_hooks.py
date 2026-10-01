@@ -5,6 +5,73 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+import torch
+
+
+class MSDInputEmbeddingCapture:
+    """Capture the post-vision language-model input without changing outputs."""
+
+    def __init__(self, module: Any) -> None:
+        self.value: torch.Tensor | None = None
+        self.handle = module.register_forward_pre_hook(
+            self._capture,
+            with_kwargs=True,
+        )
+
+    def _capture(self, _module, args, kwargs) -> None:
+        value = kwargs.get("input_embeds", kwargs.get("inputs_embeds"))
+        if value is None:
+            floating = [
+                item
+                for item in args
+                if isinstance(item, torch.Tensor)
+                and item.ndim >= 2
+                and torch.is_floating_point(item)
+            ]
+            if floating:
+                value = floating[-1]
+        if isinstance(value, torch.Tensor):
+            self.value = value.detach()
+
+    def consume(self, expected_tokens: int) -> torch.Tensor:
+        value, self.value = self.value, None
+        if value is None:
+            raise RuntimeError(
+                "MSD capture did not observe post-vision language input embeddings"
+            )
+        flattened = value.reshape(-1, value.shape[-1])
+        if flattened.shape[0] != expected_tokens:
+            raise RuntimeError(
+                "MSD captured embedding/token length mismatch: "
+                f"{flattened.shape[0]} != {expected_tokens}"
+            )
+        return flattened
+
+
+def _attach_msd_input_capture(model: Any) -> MSDInputEmbeddingCapture:
+    existing = getattr(model, "_specforge_msd_input_capture", None)
+    if isinstance(existing, MSDInputEmbeddingCapture):
+        return existing
+    candidates = (
+        getattr(model, "language_model", None),
+        getattr(getattr(model, "model", None), "language_model", None),
+    )
+    module = next(
+        (
+            candidate
+            for candidate in candidates
+            if callable(getattr(candidate, "register_forward_pre_hook", None))
+        ),
+        None,
+    )
+    if module is None:
+        raise RuntimeError(
+            "Qwen2.5-VL target does not expose a hookable language_model for MSD"
+        )
+    capture = MSDInputEmbeddingCapture(module)
+    model._specforge_msd_input_capture = capture
+    return capture
+
 
 def _text_decoder_with_capture_state(model: Any) -> Any | None:
     candidates = (
@@ -30,11 +97,12 @@ def configure_capture_layers(
         "eagle3": "set_eagle3_layers_to_capture",
         "dflash": "set_dflash_layers_to_capture",
         "dspark": "set_dspark_layers_to_capture",
+        "msd": "set_msd_layers_to_capture",
     }.get(capture_method)
     if setter_name is None:
         raise ValueError(
-            "offline SGLang capture method must be 'eagle3', 'dflash', or "
-            f"'dspark', got {capture_method!r}"
+            "offline SGLang capture method must be eagle3, dflash, dspark, "
+            f"or msd; got {capture_method!r}"
         )
 
     setter = getattr(model, setter_name, None)
@@ -44,6 +112,12 @@ def configure_capture_layers(
 
     model_type = str(getattr(getattr(model, "config", None), "model_type", ""))
     decoder = _text_decoder_with_capture_state(model)
+    if capture_method == "msd" and model_type == "qwen2_5_vl":
+        _attach_msd_input_capture(model)
+        if decoder is not None and hasattr(model, "capture_aux_hidden_states"):
+            model.capture_aux_hidden_states = False
+            decoder.layers_to_capture = []
+        return "qwen2_5_vl_msd"
     if (
         capture_method in {"dflash", "dspark"}
         and model_type == "qwen2_5_vl"
@@ -87,4 +161,4 @@ def configure_capture_layers(
     )
 
 
-__all__ = ["configure_capture_layers"]
+__all__ = ["MSDInputEmbeddingCapture", "configure_capture_layers"]

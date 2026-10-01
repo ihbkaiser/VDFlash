@@ -419,6 +419,7 @@ class OfflineCaptureLayout:
     aux_feature: str | None
     last_hidden_feature: str | None
     passthrough: Tuple[Tuple[str, str], ...]
+    record_validator: Factory | None = None
 
     def __post_init__(self) -> None:
         _non_empty(self.capture_method, field_name="capture_method")
@@ -432,6 +433,8 @@ class OfflineCaptureLayout:
             _non_empty(feature_name, field_name="passthrough feature name")
             _non_empty(source_key, field_name="passthrough source key")
         object.__setattr__(self, "passthrough", passthrough)
+        if self.record_validator is not None and not callable(self.record_validator):
+            raise TypeError("record_validator must be callable or None")
 
         output_names = self.output_names
         duplicates = sorted(
@@ -478,6 +481,8 @@ class OfflineCaptureLayout:
                     f"feature {feature_name!r} is None"
                 )
             record[feature_name] = value
+        if self.record_validator is not None:
+            self.record_validator(record)
         return record
 
 

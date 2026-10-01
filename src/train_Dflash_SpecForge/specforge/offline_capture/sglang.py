@@ -13,12 +13,14 @@ from torch.nn.utils.rnn import pad_sequence
 class OfflineCaptureBatch:
     """Generic batched auxiliary and final target states."""
 
-    hidden_states: torch.Tensor
+    hidden_states: Optional[torch.Tensor]
     last_hidden_states: torch.Tensor
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
     loss_mask: torch.Tensor
     position_ids: Optional[torch.Tensor] = None
+    input_embeddings: Optional[torch.Tensor] = None
+    visual_token_mask: Optional[torch.Tensor] = None
 
 
 class OfflineSGLangCapture:
@@ -81,17 +83,45 @@ class OfflineSGLangCapture:
             capture_kwargs["position_ids"] = position_ids
         if multimodal_inputs is not None:
             capture_kwargs["multimodal_inputs"] = multimodal_inputs
-        data, aux_states, last_states = self._backend.capture(**capture_kwargs)
+        backend_output = self._backend.capture(**capture_kwargs)
+        if len(backend_output) == 5:
+            data, aux_states, last_states, input_embeddings, visual_masks = (
+                backend_output
+            )
+        else:
+            data, aux_states, last_states = backend_output
+            input_embeddings = visual_masks = None
         position_batch = None
         if position_ids is not None:
             position_batch = position_ids
+        elif self.capture_method == "msd":
+            base = attention_mask.to(torch.long).cumsum(-1).sub(1).clamp_min(0)
+            position_batch = base.unsqueeze(0).expand(3, -1, -1)
+        if self.capture_method == "msd" and (
+            input_embeddings is None or visual_masks is None
+        ):
+            raise RuntimeError("MSD backend must return input embeddings and visual masks")
         return OfflineCaptureBatch(
-            hidden_states=pad_sequence(list(aux_states), batch_first=True),
+            hidden_states=(
+                None
+                if all(value is None for value in aux_states)
+                else pad_sequence(list(aux_states), batch_first=True)
+            ),
             last_hidden_states=pad_sequence(list(last_states), batch_first=True),
             input_ids=torch.cat([row[0] for row in data], dim=0),
             attention_mask=torch.cat([row[1] for row in data], dim=0),
             loss_mask=torch.cat([row[2] for row in data], dim=0),
             position_ids=position_batch,
+            input_embeddings=(
+                pad_sequence(list(input_embeddings), batch_first=True)
+                if input_embeddings is not None
+                else None
+            ),
+            visual_token_mask=(
+                pad_sequence(list(visual_masks), batch_first=True)
+                if visual_masks is not None
+                else None
+            ),
         )
 
 

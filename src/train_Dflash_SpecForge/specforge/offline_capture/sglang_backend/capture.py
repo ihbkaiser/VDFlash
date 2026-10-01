@@ -40,6 +40,7 @@ class OfflineSGLangCaptureBackend:
 
     def __init__(self, model_runner: SGLangRunner) -> None:
         self.model_runner = model_runner
+        self.capture_method = "eagle3"
 
     @classmethod
     def build(
@@ -112,6 +113,7 @@ class OfflineSGLangCaptureBackend:
             layer_ids,
             capture_method=capture_method,
         )
+        self.capture_method = capture_method
 
     def _maybe_prepare_mlp_sync_batch(self, batch: ScheduleBatch) -> None:
         if require_mlp_sync(self.model_runner.server_args):
@@ -355,16 +357,41 @@ class OfflineSGLangCaptureBackend:
             output = self._forward_extend(reqs)
             aux_hidden_states = getattr(output, "aux_hidden_states", None)
             last_hidden_states = getattr(output, "last_hidden_states", None)
-            if aux_hidden_states is None or last_hidden_states is None:
+            if last_hidden_states is None or (
+                aux_hidden_states is None and self.capture_method != "msd"
+            ):
                 raise RuntimeError(
                     "SGLang did not return the hidden states required for "
                     "offline feature preparation"
                 )
-            aux_rows = torch.split(aux_hidden_states, input_lens, dim=0)
+            aux_rows = (
+                torch.split(aux_hidden_states, input_lens, dim=0)
+                if aux_hidden_states is not None
+                else (None,) * len(input_lens)
+            )
             last_rows = torch.split(last_hidden_states, input_lens, dim=0)
+            if self.capture_method == "msd":
+                state = getattr(
+                    self.model_runner.model,
+                    "_specforge_msd_input_capture",
+                    None,
+                )
+                if state is None:
+                    raise RuntimeError("MSD input-embedding capture hook is missing")
+                embeddings = state.consume(sum(input_lens))
+                embedding_rows = torch.split(embeddings, input_lens, dim=0)
+                image_token_id = self._qwen_image_token_id()
+                visual_rows = tuple(
+                    request_input.view(-1).eq(image_token_id)
+                    for request_input in (
+                        row[0][:, row[1].view(-1).bool()] for row in data
+                    )
+                )
         finally:
             self._clear_pools()
 
+        if self.capture_method == "msd":
+            return data, aux_rows, last_rows, embedding_rows, visual_rows
         return data, aux_rows, last_rows
 
     def capture(

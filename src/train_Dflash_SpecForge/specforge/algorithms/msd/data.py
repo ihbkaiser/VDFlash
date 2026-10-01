@@ -23,6 +23,58 @@ RAW_FEATURE_KEYS = (
 )
 
 
+def validate_msd_capture_record(record: Mapping[str, Tensor]) -> None:
+    """Fail before persistence when a raw MSD capture cannot be normalized."""
+
+    for name in RAW_FEATURE_KEYS:
+        value = record.get(name)
+        if not isinstance(value, Tensor):
+            raise TypeError(f"MSD capture feature {name!r} must be a tensor")
+
+    input_ids = record["input_ids"]
+    loss_mask = record["loss_mask"]
+    target = record["target_hidden_state"]
+    embeddings = record["input_embeddings"]
+    visual_mask = record["visual_token_mask"]
+    positions = record["position_ids"]
+    if positions.ndim == 3 and positions.shape[:2] == (3, 1):
+        position_length = positions.shape[2]
+    elif positions.ndim == 2 and positions.shape[0] == 3:
+        position_length = positions.shape[1]
+    else:
+        raise ValueError(
+            "MSD capture position_ids must use three-axis [3, sequence] positions"
+        )
+
+    def sequence_length(tensor: Tensor, name: str) -> int:
+        if name in {"target_hidden_state", "input_embeddings"}:
+            if tensor.ndim == 3 and tensor.shape[0] == 1:
+                return int(tensor.shape[1])
+            if tensor.ndim == 2:
+                return int(tensor.shape[0])
+            raise ValueError(f"MSD capture {name} must have [S, H] or [1, S, H]")
+        if tensor.ndim == 2 and tensor.shape[0] == 1:
+            return int(tensor.shape[1])
+        if tensor.ndim == 1:
+            return int(tensor.shape[0])
+        raise ValueError(f"MSD capture {name} must have [S] or [1, S]")
+
+    lengths = {
+        sequence_length(input_ids, "input_ids"),
+        sequence_length(loss_mask, "loss_mask"),
+        sequence_length(target, "target_hidden_state"),
+        sequence_length(embeddings, "input_embeddings"),
+        sequence_length(visual_mask, "visual_token_mask"),
+        int(position_length),
+    }
+    if len(lengths) != 1:
+        raise ValueError("MSD capture sequence lengths must match")
+    if embeddings.shape[-1] != target.shape[-1]:
+        raise ValueError("MSD capture hidden widths must match")
+    if visual_mask.dtype != torch.bool:
+        raise ValueError("MSD visual_token_mask must have boolean dtype")
+
+
 def _batched_sequence(tensor: Tensor, name: str) -> Tensor:
     if tensor.ndim == 1:
         return tensor.unsqueeze(0)
@@ -298,4 +350,5 @@ __all__ = [
     "build_offline_reader",
     "build_paired_offline_reader",
     "normalize_offline_sample",
+    "validate_msd_capture_record",
 ]
