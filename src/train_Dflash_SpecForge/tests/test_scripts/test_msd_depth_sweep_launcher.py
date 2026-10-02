@@ -170,6 +170,26 @@ def test_msd_capture_runs_text_then_visual_commands(tmp_path: Path) -> None:
     )
 
 
+def test_msd_capture_prefers_checkout_package_on_pythonpath(tmp_path: Path) -> None:
+    probe = tmp_path / "torchrun-probe.sh"
+    probe.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf 'PYTHONPATH_HEAD=%s\\n' \"${PYTHONPATH%%:*}\"\n",
+        encoding="utf-8",
+    )
+    probe.chmod(0o755)
+    env = capture_env(tmp_path)
+    env["TORCHRUN_BIN"] = probe.as_posix()
+
+    result = run_launcher("--phase", "capture", env=env)
+
+    expected_root = ROOT.as_posix()
+    if os.name == "nt":
+        expected_root = f"/{ROOT.drive[0].lower()}{expected_root[2:]}"
+    assert result.returncode == 0, result.stderr
+    assert f"PYTHONPATH_HEAD={expected_root}" in result.stdout
+
+
 def test_msd_capture_rejects_existing_features_without_resume(tmp_path: Path) -> None:
     env = capture_env(tmp_path)
     existing = tmp_path / "text-features" / "rows_0-2000" / "data_0.ckpt"
