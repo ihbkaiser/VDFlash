@@ -199,7 +199,8 @@ PY
   export CPLUS_INCLUDE_PATH="$nvrtc_root/include${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"
   export LIBRARY_PATH="$nvrtc_lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
   export LD_LIBRARY_PATH="$nvrtc_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-  echo "[msd-capture] NVRTC include=$nvrtc_root/include lib=$nvrtc_lib"
+  export NVCC_PREPEND_FLAGS="-I$nvrtc_root/include${NVCC_PREPEND_FLAGS:+ $NVCC_PREPEND_FLAGS}"
+  echo "[msd-capture] NVRTC include=$nvrtc_root/include lib=$nvrtc_lib nvcc_flags=$NVCC_PREPEND_FLAGS"
 }
 
 if [[ "$PHASE" == data || "$PHASE" == all ]]; then
