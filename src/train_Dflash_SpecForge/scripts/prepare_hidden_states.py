@@ -196,17 +196,17 @@ def parse_args():
     sglang_group = parser.add_argument_group("sglang")
     sglang_group.add_argument(
         "--sglang-attention-backend",
-        default="triton",
+        default=None,
         help="Attention backend used by the offline SGLang capture",
     )
     sglang_group.add_argument(
         "--sglang-sampling-backend",
-        default="pytorch",
+        default=None,
         help="Sampling backend used by the offline SGLang capture",
     )
     sglang_group.add_argument(
         "--sglang-mm-attention-backend",
-        default="sdpa",
+        default=None,
         help="Multimodal attention backend used by the offline SGLang capture",
     )
     sglang_group.add_argument("--sglang-mem-fraction-static", type=float, default=0.4)
@@ -333,10 +333,7 @@ def _generate_shared_vocab_mapping(
 
 
 def _sglang_kwargs(args: argparse.Namespace) -> Dict[str, object]:
-    return {
-        "attention_backend": args.sglang_attention_backend,
-        "sampling_backend": args.sglang_sampling_backend,
-        "mm_attention_backend": args.sglang_mm_attention_backend,
+    kwargs: Dict[str, object] = {
         "mem_fraction_static": args.sglang_mem_fraction_static,
         "context_length": args.sglang_context_length,
         "enable_nccl_nvls": args.sglang_enable_nccl_nvls,
@@ -349,6 +346,15 @@ def _sglang_kwargs(args: argparse.Namespace) -> Dict[str, object]:
         "max_running_requests": args.batch_size,
         "max_total_tokens": args.batch_size * args.max_length,
     }
+    for key in (
+        "attention_backend",
+        "sampling_backend",
+        "mm_attention_backend",
+    ):
+        value = getattr(args, f"sglang_{key}")
+        if value is not None:
+            kwargs[key] = value
+    return kwargs
 
 
 def resolve_offline_capture_plan(

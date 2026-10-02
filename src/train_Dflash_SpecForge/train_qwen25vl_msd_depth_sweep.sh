@@ -16,10 +16,10 @@ GPU_COUNT=${SPECFORGE_GPUS:-4}
 MICRO_BATCH_SIZE=${SPECFORGE_MICRO_BATCH_SIZE:-1}
 EXPECTED_RECORDS=${SPECFORGE_NUM_SAMPLES:-68000}
 MAX_LENGTH=${SPECFORGE_MAX_LENGTH:-2048}
-SGLANG_ATTENTION_BACKEND=${SPECFORGE_SGLANG_ATTENTION_BACKEND:-triton}
-SGLANG_SAMPLING_BACKEND=${SPECFORGE_SGLANG_SAMPLING_BACKEND:-pytorch}
-SGLANG_MM_ATTENTION_BACKEND=${SPECFORGE_SGLANG_MM_ATTENTION_BACKEND:-sdpa}
-SGLANG_MEM_FRACTION_STATIC=${SPECFORGE_SGLANG_MEM_FRACTION_STATIC:-0.65}
+SGLANG_ATTENTION_BACKEND=${SPECFORGE_SGLANG_ATTENTION_BACKEND:-auto}
+SGLANG_SAMPLING_BACKEND=${SPECFORGE_SGLANG_SAMPLING_BACKEND:-auto}
+SGLANG_MM_ATTENTION_BACKEND=${SPECFORGE_SGLANG_MM_ATTENTION_BACKEND:-auto}
+SGLANG_MEM_FRACTION_STATIC=${SPECFORGE_SGLANG_MEM_FRACTION_STATIC:-0.4}
 PHASE=all
 RESUME=0
 PRINT_CONFIG=0
@@ -152,6 +152,56 @@ guard_capture_root() {
   fi
 }
 
+configure_nvrtc() {
+  local nvrtc_root=${SPECFORGE_NVRTC_ROOT:-}
+  local cuda_home=${CUDA_HOME:-}
+  if [[ -z "$nvrtc_root" && -n "$cuda_home" && -f "$cuda_home/include/nvrtc.h" ]]; then
+    nvrtc_root=$cuda_home
+  fi
+  if [[ -z "$nvrtc_root" && -f /usr/local/cuda/include/nvrtc.h ]]; then
+    nvrtc_root=/usr/local/cuda
+  fi
+  if [[ -z "$nvrtc_root" ]]; then
+    nvrtc_root=$("$PYTHON_BIN" - <<'PY'
+from pathlib import Path
+import sys
+
+candidates = []
+for entry in sys.path:
+    if not entry:
+        continue
+    root = Path(entry)
+    candidates.extend(root.glob("nvidia/cu*/include/nvrtc.h"))
+    candidates.extend(root.glob("nvidia/cuda_nvrtc/include/nvrtc.h"))
+if candidates:
+    print(sorted(candidates)[-1].parent.parent)
+PY
+    )
+  fi
+  if [[ -z "$nvrtc_root" ]]; then
+    echo "[msd-capture] warning: nvrtc.h was not found; B200 FlashInfer JIT may fail" >&2
+    return
+  fi
+  if [[ ! -f "$nvrtc_root/include/nvrtc.h" ]]; then
+    echo "SPECFORGE_NVRTC_ROOT does not contain include/nvrtc.h: $nvrtc_root" >&2
+    exit 1
+  fi
+  local nvrtc_lib
+  if [[ -d "$nvrtc_root/lib" ]]; then
+    nvrtc_lib="$nvrtc_root/lib"
+  elif [[ -d "$nvrtc_root/lib64" ]]; then
+    nvrtc_lib="$nvrtc_root/lib64"
+  else
+    echo "NVRTC library directory not found under: $nvrtc_root" >&2
+    exit 1
+  fi
+  export CPATH="$nvrtc_root/include${CPATH:+:$CPATH}"
+  export CPLUS_INCLUDE_PATH="$nvrtc_root/include${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"
+  export LIBRARY_PATH="$nvrtc_lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+  export LD_LIBRARY_PATH="$nvrtc_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  echo "[msd-capture] NVRTC include=$nvrtc_root/include lib=$nvrtc_lib"
+}
+
 if [[ "$PHASE" == data || "$PHASE" == all ]]; then
   [[ -f "$SHAREGPT_SOURCE" ]] || { echo "missing SHAREGPT_SOURCE: $SHAREGPT_SOURCE" >&2; exit 2; }
   [[ -f "$LLAVA_SOURCE_JSONL" ]] || { echo "missing LLAVA_SOURCE_JSONL: $LLAVA_SOURCE_JSONL" >&2; exit 2; }
@@ -176,14 +226,23 @@ if [[ "$PHASE" == capture || "$PHASE" == all ]]; then
   guard_capture_root ShareGPT "$TEXT_FEATURE_ROOT"
   guard_capture_root LLaVA "$VISUAL_FEATURE_ROOT"
   mkdir -p "$TEXT_FEATURE_ROOT" "$VISUAL_FEATURE_ROOT"
+  configure_nvrtc
+  SGLANG_CAPTURE_ARGS=()
+  if [[ "$SGLANG_ATTENTION_BACKEND" != auto ]]; then
+    SGLANG_CAPTURE_ARGS+=(--sglang-attention-backend "$SGLANG_ATTENTION_BACKEND")
+  fi
+  if [[ "$SGLANG_SAMPLING_BACKEND" != auto ]]; then
+    SGLANG_CAPTURE_ARGS+=(--sglang-sampling-backend "$SGLANG_SAMPLING_BACKEND")
+  fi
+  if [[ "$SGLANG_MM_ATTENTION_BACKEND" != auto ]]; then
+    SGLANG_CAPTURE_ARGS+=(--sglang-mm-attention-backend "$SGLANG_MM_ATTENTION_BACKEND")
+  fi
   "$TORCHRUN_BIN" --standalone --nproc_per_node="$GPU_COUNT" "$SPECFORGE_DIR/scripts/prepare_hidden_states.py" \
     --strategy msd --target-model-path "$TARGET_MODEL_PATH" \
     --draft-model-config "$SPECFORGE_DIR/configs/qwen2.5-vl-3b-msd.json" \
     --data-path "$SHAREGPT_JSONL" --output-path "$TEXT_FEATURE_ROOT" \
     --chat-template qwen --max-length "$MAX_LENGTH" --num-samples "$EXPECTED_RECORDS" \
-    --sglang-attention-backend "$SGLANG_ATTENTION_BACKEND" \
-    --sglang-sampling-backend "$SGLANG_SAMPLING_BACKEND" \
-    --sglang-mm-attention-backend "$SGLANG_MM_ATTENTION_BACKEND" \
+    "${SGLANG_CAPTURE_ARGS[@]}" \
     --sglang-mem-fraction-static "$SGLANG_MEM_FRACTION_STATIC"
   "$TORCHRUN_BIN" --standalone --nproc_per_node="$GPU_COUNT" "$SPECFORGE_DIR/scripts/prepare_llava_caption_hidden_states.py" \
     --strategy msd --target-model-path "$TARGET_MODEL_PATH" \
@@ -191,9 +250,7 @@ if [[ "$PHASE" == capture || "$PHASE" == all ]]; then
     --manifest "$LLAVA_MANIFEST" --image-root "$IMAGE_ROOT" \
     --output-path "$VISUAL_FEATURE_ROOT" --max-length "$MAX_LENGTH" \
     --expected-records "$EXPECTED_RECORDS" \
-    --sglang-attention-backend "$SGLANG_ATTENTION_BACKEND" \
-    --sglang-sampling-backend "$SGLANG_SAMPLING_BACKEND" \
-    --sglang-mm-attention-backend "$SGLANG_MM_ATTENTION_BACKEND" \
+    "${SGLANG_CAPTURE_ARGS[@]}" \
     --sglang-mem-fraction-static "$SGLANG_MEM_FRACTION_STATIC"
 fi
 

@@ -35,6 +35,9 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
 
         self.assertEqual("eagle3", args.strategy)
         self.assertIsNone(args.draft_model_config)
+        self.assertIsNone(args.sglang_attention_backend)
+        self.assertIsNone(args.sglang_sampling_backend)
+        self.assertIsNone(args.sglang_mm_attention_backend)
         self.assertFalse(args.sglang_disable_radix_cache)
         self.assertFalse(hasattr(args, "draft_num_hidden_layers"))
         self.assertFalse(hasattr(args, "draft_block_size"))

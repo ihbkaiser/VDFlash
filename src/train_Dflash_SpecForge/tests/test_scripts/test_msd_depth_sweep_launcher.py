@@ -76,10 +76,10 @@ def test_msd_launcher_prints_shared_storage_defaults() -> None:
     assert f"IMAGE_ROOT={SHARED_ROOT}/LlaVA-Pretrain" in result.stdout
     assert "DEPTHS=1,3,5" in result.stdout
     assert "TOTAL_EPOCHS=40" in result.stdout
-    assert "SGLANG_ATTENTION_BACKEND=triton" in result.stdout
-    assert "SGLANG_SAMPLING_BACKEND=pytorch" in result.stdout
-    assert "SGLANG_MM_ATTENTION_BACKEND=sdpa" in result.stdout
-    assert "SGLANG_MEM_FRACTION_STATIC=0.65" in result.stdout
+    assert "SGLANG_ATTENTION_BACKEND=auto" in result.stdout
+    assert "SGLANG_SAMPLING_BACKEND=auto" in result.stdout
+    assert "SGLANG_MM_ATTENTION_BACKEND=auto" in result.stdout
+    assert "SGLANG_MEM_FRACTION_STATIC=0.4" in result.stdout
 
 
 def test_msd_data_phase_prepares_sharegpt_and_llava(tmp_path: Path) -> None:
@@ -148,6 +148,10 @@ def capture_env(tmp_path: Path) -> dict[str, str]:
     llava.write_text("{}\n", encoding="utf-8")
     images.mkdir()
     target.mkdir()
+    nvrtc_root = tmp_path / "nvrtc"
+    (nvrtc_root / "include").mkdir(parents=True)
+    (nvrtc_root / "include" / "nvrtc.h").touch()
+    (nvrtc_root / "lib").mkdir()
     return {
         "SHAREGPT_JSONL": sharegpt.as_posix(),
         "LLAVA_MANIFEST": llava.as_posix(),
@@ -159,6 +163,7 @@ def capture_env(tmp_path: Path) -> dict[str, str]:
         "TORCHRUN_BIN": "/bin/echo",
         "SPECFORGE_GPUS": "1",
         "SPECFORGE_GLOBAL_BATCH_SIZE": "1",
+        "SPECFORGE_NVRTC_ROOT": nvrtc_root.as_posix(),
     }
 
 
@@ -166,6 +171,8 @@ def test_msd_capture_runs_text_then_visual_commands(tmp_path: Path) -> None:
     env = capture_env(tmp_path)
     env["SPECFORGE_SGLANG_MEM_FRACTION_STATIC"] = "0.65"
     env["SPECFORGE_SGLANG_ATTENTION_BACKEND"] = "triton"
+    env["SPECFORGE_SGLANG_SAMPLING_BACKEND"] = "pytorch"
+    env["SPECFORGE_SGLANG_MM_ATTENTION_BACKEND"] = "sdpa"
     result = run_launcher("--phase", "capture", env=env)
 
     assert result.returncode == 0, result.stderr
@@ -174,11 +181,21 @@ def test_msd_capture_runs_text_then_visual_commands(tmp_path: Path) -> None:
     assert result.stdout.count("--sglang-attention-backend triton") == 2
     assert result.stdout.count("--sglang-sampling-backend pytorch") == 2
     assert result.stdout.count("--sglang-mm-attention-backend sdpa") == 2
+    assert "NVRTC include=" in result.stdout
     assert "scripts/prepare_hidden_states.py --strategy msd" in result.stdout
     assert "scripts/prepare_llava_caption_hidden_states.py --strategy msd" in result.stdout
     assert result.stdout.index("prepare_hidden_states.py") < result.stdout.index(
         "prepare_llava_caption_hidden_states.py"
     )
+
+
+def test_msd_capture_uses_sglang_auto_backends_by_default(tmp_path: Path) -> None:
+    result = run_launcher("--phase", "capture", env=capture_env(tmp_path))
+
+    assert result.returncode == 0, result.stderr
+    assert "--sglang-attention-backend" not in result.stdout
+    assert "--sglang-sampling-backend" not in result.stdout
+    assert "--sglang-mm-attention-backend" not in result.stdout
 
 
 def test_msd_capture_prefers_checkout_package_on_pythonpath(tmp_path: Path) -> None:
