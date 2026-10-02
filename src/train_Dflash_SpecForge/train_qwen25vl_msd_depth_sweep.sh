@@ -161,6 +161,17 @@ configure_nvrtc() {
   if [[ -z "$nvrtc_root" && -f /usr/local/cuda/include/nvrtc.h ]]; then
     nvrtc_root=/usr/local/cuda
   fi
+  if [[ -z "$nvrtc_root" && -n "${VIRTUAL_ENV:-}" ]]; then
+    local nvrtc_header
+    for nvrtc_header in \
+      "$VIRTUAL_ENV"/lib/python*/site-packages/nvidia/cu*/include/nvrtc.h \
+      "$VIRTUAL_ENV"/lib/python*/site-packages/nvidia/cuda_nvrtc/include/nvrtc.h; do
+      if [[ -f "$nvrtc_header" ]]; then
+        nvrtc_root=$(dirname -- "$(dirname -- "$nvrtc_header")")
+        break
+      fi
+    done
+  fi
   if [[ -z "$nvrtc_root" ]]; then
     nvrtc_root=$("$PYTHON_BIN" - <<'PY'
 from pathlib import Path
@@ -200,7 +211,25 @@ PY
   export LIBRARY_PATH="$nvrtc_lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
   export LD_LIBRARY_PATH="$nvrtc_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   export NVCC_PREPEND_FLAGS="-I$nvrtc_root/include${NVCC_PREPEND_FLAGS:+ $NVCC_PREPEND_FLAGS}"
-  echo "[msd-capture] NVRTC include=$nvrtc_root/include lib=$nvrtc_lib nvcc_flags=$NVCC_PREPEND_FLAGS"
+  local nvcc_bin=${NVCC_BIN:-}
+  if [[ -z "$nvcc_bin" && -n "$cuda_home" && -x "$cuda_home/bin/nvcc" ]]; then
+    nvcc_bin="$cuda_home/bin/nvcc"
+  fi
+  if [[ -z "$nvcc_bin" && -x /usr/local/cuda/bin/nvcc ]]; then
+    nvcc_bin=/usr/local/cuda/bin/nvcc
+  fi
+  if [[ -z "$nvcc_bin" ]]; then
+    nvcc_bin=$(command -v nvcc || true)
+  fi
+  if [[ -z "$nvcc_bin" ]]; then
+    echo "NVCC was not found; set NVCC_BIN or CUDA_HOME" >&2
+    exit 1
+  fi
+  if ! printf '#include <nvrtc.h>\n' | "$nvcc_bin" -x cu -E - >/dev/null; then
+    echo "[msd-capture] NVRTC header preflight failed with: $nvcc_bin" >&2
+    exit 1
+  fi
+  echo "[msd-capture] NVRTC include=$nvrtc_root/include lib=$nvrtc_lib nvcc=$nvcc_bin nvcc_flags=$NVCC_PREPEND_FLAGS"
 }
 
 if [[ "$PHASE" == data || "$PHASE" == all ]]; then

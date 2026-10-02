@@ -161,6 +161,7 @@ def capture_env(tmp_path: Path) -> dict[str, str]:
         "VISUAL_FEATURE_ROOT": (tmp_path / "visual-features").as_posix(),
         "PYTHON_BIN": "/bin/echo",
         "TORCHRUN_BIN": "/bin/echo",
+        "NVCC_BIN": "/bin/true",
         "SPECFORGE_GPUS": "1",
         "SPECFORGE_GLOBAL_BATCH_SIZE": "1",
         "SPECFORGE_NVRTC_ROOT": nvrtc_root.as_posix(),
@@ -219,6 +220,54 @@ def test_msd_capture_prefers_checkout_package_on_pythonpath(tmp_path: Path) -> N
     assert f"PYTHONPATH_HEAD={expected_root}" in result.stdout
     expected_nvrtc_include = (tmp_path / "nvrtc" / "include").as_posix()
     assert f"NVCC_PREPEND_FLAGS=-I{expected_nvrtc_include}" in result.stdout
+
+
+def test_msd_capture_discovers_cuda13_nvrtc_from_virtualenv(tmp_path: Path) -> None:
+    venv_root = tmp_path / "venv"
+    nvrtc_root = venv_root / "lib" / "python3.12" / "site-packages" / "nvidia" / "cu13"
+    (nvrtc_root / "include").mkdir(parents=True)
+    (nvrtc_root / "include" / "nvrtc.h").touch()
+    (nvrtc_root / "lib").mkdir()
+
+    probe = tmp_path / "torchrun-probe.sh"
+    probe.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf 'NVCC_PREPEND_FLAGS=%s\\n' \"${NVCC_PREPEND_FLAGS:-}\"\n",
+        encoding="utf-8",
+    )
+    probe.chmod(0o755)
+
+    env = capture_env(tmp_path)
+    env.pop("SPECFORGE_NVRTC_ROOT")
+    env["VIRTUAL_ENV"] = venv_root.as_posix()
+    env["TORCHRUN_BIN"] = probe.as_posix()
+    env["NVCC_BIN"] = "/bin/true"
+
+    result = run_launcher("--phase", "capture", env=env)
+
+    assert result.returncode == 0, result.stderr
+    expected_include = (nvrtc_root / "include").as_posix()
+    assert f"NVRTC include={expected_include}" in result.stdout
+    assert f"NVCC_PREPEND_FLAGS=-I{expected_include}" in result.stdout
+
+
+def test_msd_capture_stops_when_nvcc_cannot_include_nvrtc(tmp_path: Path) -> None:
+    nvcc_probe = tmp_path / "nvcc-probe.sh"
+    nvcc_probe.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf 'simulated missing nvrtc header\\n' >&2\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    nvcc_probe.chmod(0o755)
+    env = capture_env(tmp_path)
+    env["NVCC_BIN"] = nvcc_probe.as_posix()
+
+    result = run_launcher("--phase", "capture", env=env)
+
+    assert result.returncode == 1
+    assert "NVRTC header preflight failed" in result.stderr
+    assert "prepare_hidden_states.py" not in result.stdout
 
 
 def test_msd_capture_rejects_existing_features_without_resume(tmp_path: Path) -> None:
