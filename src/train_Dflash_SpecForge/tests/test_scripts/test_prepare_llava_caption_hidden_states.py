@@ -66,7 +66,7 @@ class ParseArgsTest(unittest.TestCase):
 
         self.assertEqual(args.sglang_attention_backend, "triton")
 
-    def test_defaults_avoid_all_flashinfer_backends(self):
+    def test_defaults_leave_backend_selection_to_sglang(self):
         argv = [
             "prepare_llava_caption_hidden_states.py",
             "--target-model-path",
@@ -83,15 +83,12 @@ class ParseArgsTest(unittest.TestCase):
         with patch("sys.argv", argv):
             args = parse_args()
 
-        self.assertEqual(args.sglang_attention_backend, "triton")
-        self.assertEqual(args.sglang_sampling_backend, "pytorch")
-        self.assertEqual(args.sglang_mm_attention_backend, "sdpa")
+        self.assertIsNone(args.sglang_attention_backend)
+        self.assertIsNone(args.sglang_sampling_backend)
+        self.assertIsNone(args.sglang_mm_attention_backend)
         self.assertEqual(
             llava_capture._offline_capture_kwargs(args),
             {
-                "attention_backend": "triton",
-                "sampling_backend": "pytorch",
-                "mm_attention_backend": "sdpa",
                 "mem_fraction_static": 0.4,
             },
         )
