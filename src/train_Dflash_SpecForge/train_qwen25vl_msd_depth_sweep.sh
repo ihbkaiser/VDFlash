@@ -17,6 +17,8 @@ MICRO_BATCH_SIZE=${SPECFORGE_MICRO_BATCH_SIZE:-1}
 EXPECTED_RECORDS=${SPECFORGE_NUM_SAMPLES:-68000}
 MAX_LENGTH=${SPECFORGE_MAX_LENGTH:-2048}
 SGLANG_ATTENTION_BACKEND=${SPECFORGE_SGLANG_ATTENTION_BACKEND:-triton}
+SGLANG_SAMPLING_BACKEND=${SPECFORGE_SGLANG_SAMPLING_BACKEND:-pytorch}
+SGLANG_MM_ATTENTION_BACKEND=${SPECFORGE_SGLANG_MM_ATTENTION_BACKEND:-sdpa}
 SGLANG_MEM_FRACTION_STATIC=${SPECFORGE_SGLANG_MEM_FRACTION_STATIC:-0.65}
 PHASE=all
 RESUME=0
@@ -104,6 +106,8 @@ print_config() {
   echo "ACCUMULATION_STEPS=$ACCUMULATION_STEPS"
   echo "LEARNING_RATE=$LEARNING_RATE"
   echo "SGLANG_ATTENTION_BACKEND=$SGLANG_ATTENTION_BACKEND"
+  echo "SGLANG_SAMPLING_BACKEND=$SGLANG_SAMPLING_BACKEND"
+  echo "SGLANG_MM_ATTENTION_BACKEND=$SGLANG_MM_ATTENTION_BACKEND"
   echo "SGLANG_MEM_FRACTION_STATIC=$SGLANG_MEM_FRACTION_STATIC"
   echo "TEXT_FEATURE_ROOT=$TEXT_FEATURE_ROOT"
   echo "VISUAL_FEATURE_ROOT=$VISUAL_FEATURE_ROOT"
@@ -178,6 +182,8 @@ if [[ "$PHASE" == capture || "$PHASE" == all ]]; then
     --data-path "$SHAREGPT_JSONL" --output-path "$TEXT_FEATURE_ROOT" \
     --chat-template qwen --max-length "$MAX_LENGTH" --num-samples "$EXPECTED_RECORDS" \
     --sglang-attention-backend "$SGLANG_ATTENTION_BACKEND" \
+    --sglang-sampling-backend "$SGLANG_SAMPLING_BACKEND" \
+    --sglang-mm-attention-backend "$SGLANG_MM_ATTENTION_BACKEND" \
     --sglang-mem-fraction-static "$SGLANG_MEM_FRACTION_STATIC"
   "$TORCHRUN_BIN" --standalone --nproc_per_node="$GPU_COUNT" "$SPECFORGE_DIR/scripts/prepare_llava_caption_hidden_states.py" \
     --strategy msd --target-model-path "$TARGET_MODEL_PATH" \
@@ -186,6 +192,8 @@ if [[ "$PHASE" == capture || "$PHASE" == all ]]; then
     --output-path "$VISUAL_FEATURE_ROOT" --max-length "$MAX_LENGTH" \
     --expected-records "$EXPECTED_RECORDS" \
     --sglang-attention-backend "$SGLANG_ATTENTION_BACKEND" \
+    --sglang-sampling-backend "$SGLANG_SAMPLING_BACKEND" \
+    --sglang-mm-attention-backend "$SGLANG_MM_ATTENTION_BACKEND" \
     --sglang-mem-fraction-static "$SGLANG_MEM_FRACTION_STATIC"
 fi
 

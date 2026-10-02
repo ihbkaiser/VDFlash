@@ -77,6 +77,8 @@ def test_msd_launcher_prints_shared_storage_defaults() -> None:
     assert "DEPTHS=1,3,5" in result.stdout
     assert "TOTAL_EPOCHS=40" in result.stdout
     assert "SGLANG_ATTENTION_BACKEND=triton" in result.stdout
+    assert "SGLANG_SAMPLING_BACKEND=pytorch" in result.stdout
+    assert "SGLANG_MM_ATTENTION_BACKEND=sdpa" in result.stdout
     assert "SGLANG_MEM_FRACTION_STATIC=0.65" in result.stdout
 
 
@@ -170,6 +172,8 @@ def test_msd_capture_runs_text_then_visual_commands(tmp_path: Path) -> None:
     assert result.stdout.count("--standalone --nproc_per_node=1") == 2
     assert result.stdout.count("--sglang-mem-fraction-static 0.65") == 2
     assert result.stdout.count("--sglang-attention-backend triton") == 2
+    assert result.stdout.count("--sglang-sampling-backend pytorch") == 2
+    assert result.stdout.count("--sglang-mm-attention-backend sdpa") == 2
     assert "scripts/prepare_hidden_states.py --strategy msd" in result.stdout
     assert "scripts/prepare_llava_caption_hidden_states.py --strategy msd" in result.stdout
     assert result.stdout.index("prepare_hidden_states.py") < result.stdout.index(

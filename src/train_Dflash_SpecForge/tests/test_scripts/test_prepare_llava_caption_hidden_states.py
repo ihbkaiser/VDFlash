@@ -7,7 +7,10 @@ from unittest.mock import patch
 
 import torch
 
-from scripts.prepare_llava_caption_hidden_states import _collate_prepared, parse_args
+from scripts import prepare_llava_caption_hidden_states as llava_capture
+
+_collate_prepared = llava_capture._collate_prepared
+parse_args = llava_capture.parse_args
 
 
 def _prepared(length: int, offset: int) -> dict:
@@ -62,6 +65,36 @@ class ParseArgsTest(unittest.TestCase):
             args = parse_args()
 
         self.assertEqual(args.sglang_attention_backend, "triton")
+
+    def test_defaults_avoid_all_flashinfer_backends(self):
+        argv = [
+            "prepare_llava_caption_hidden_states.py",
+            "--target-model-path",
+            "target",
+            "--draft-model-config",
+            "draft.json",
+            "--manifest",
+            "manifest.jsonl",
+            "--image-root",
+            "images",
+            "--output-path",
+            "features",
+        ]
+        with patch("sys.argv", argv):
+            args = parse_args()
+
+        self.assertEqual(args.sglang_attention_backend, "triton")
+        self.assertEqual(args.sglang_sampling_backend, "pytorch")
+        self.assertEqual(args.sglang_mm_attention_backend, "sdpa")
+        self.assertEqual(
+            llava_capture._offline_capture_kwargs(args),
+            {
+                "attention_backend": "triton",
+                "sampling_backend": "pytorch",
+                "mm_attention_backend": "sdpa",
+                "mem_fraction_static": 0.4,
+            },
+        )
 
 
 if __name__ == "__main__":

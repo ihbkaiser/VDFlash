@@ -86,8 +86,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dist-timeout", type=int, default=2000)
     parser.add_argument(
         "--sglang-attention-backend",
-        default="flashinfer",
+        default="triton",
         help="Attention backend used by the offline SGLang capture",
+    )
+    parser.add_argument(
+        "--sglang-sampling-backend",
+        default="pytorch",
+        help="Sampling backend used by the offline SGLang capture",
+    )
+    parser.add_argument(
+        "--sglang-mm-attention-backend",
+        default="sdpa",
+        help="Multimodal attention backend used by the offline SGLang capture",
     )
     parser.add_argument(
         "--sglang-mem-fraction-static",
@@ -96,6 +106,15 @@ def parse_args() -> argparse.Namespace:
         help="GPU memory fraction reserved for SGLang weights and KV cache",
     )
     return parser.parse_args()
+
+
+def _offline_capture_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "attention_backend": args.sglang_attention_backend,
+        "sampling_backend": args.sglang_sampling_backend,
+        "mm_attention_backend": args.sglang_mm_attention_backend,
+        "mem_fraction_static": args.sglang_mem_fraction_static,
+    }
 
 
 def _collate_prepared(
@@ -266,8 +285,7 @@ def main() -> int:
             tp_size=args.tp_size,
             max_running_requests=args.batch_size,
             max_total_tokens=args.batch_size * args.max_length,
-            attention_backend=args.sglang_attention_backend,
-            mem_fraction_static=args.sglang_mem_fraction_static,
+            **_offline_capture_kwargs(args),
         )
         capture.set_capture_layers(layer_ids, capture_method=args.strategy)
 
