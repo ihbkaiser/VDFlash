@@ -170,6 +170,8 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
             target_model_path="target",
             trust_remote_code=True,
             sglang_attention_backend="fa3",
+            sglang_sampling_backend="pytorch",
+            sglang_mm_attention_backend="sdpa",
             sglang_mem_fraction_static=0.4,
             sglang_context_length=4096,
             sglang_enable_nccl_nvls=False,
@@ -197,6 +199,8 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
         self.assertNotIn("device", load.call_args.kwargs)
         self.assertNotIn("cache_dir", load.call_args.kwargs)
         self.assertFalse(load.call_args.kwargs["disable_radix_cache"])
+        self.assertEqual(load.call_args.kwargs["sampling_backend"], "pytorch")
+        self.assertEqual(load.call_args.kwargs["mm_attention_backend"], "sdpa")
         target.set_capture_layers.assert_called_once_with(
             [2, 7, 19],
             capture_method="eagle3",
@@ -208,6 +212,8 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
             target_model_path="target",
             trust_remote_code=True,
             sglang_attention_backend="fa3",
+            sglang_sampling_backend="pytorch",
+            sglang_mm_attention_backend="sdpa",
             sglang_mem_fraction_static=0.4,
             sglang_context_length=4096,
             sglang_enable_nccl_nvls=False,
