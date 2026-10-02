@@ -362,7 +362,11 @@ def resolve_offline_capture_plan(
     training = {"strategy": strategy}
     if strategy == "msd":
         data["msd_visual_hidden_states_path"] = "__msd_visual_capture__"
-        training.update(num_epochs=40, msd_total_epochs=40)
+        training.update(
+            attention_backend="sdpa",
+            num_epochs=40,
+            msd_total_epochs=40,
+        )
     cfg = Config(
         model=model,
         data=data,

@@ -122,6 +122,18 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
                     "target_last_hidden_states",
                 },
             ),
+            "msd": (
+                "qwen2.5-vl-3b-msd.json",
+                (39,),
+                {
+                    "input_ids",
+                    "loss_mask",
+                    "target_hidden_state",
+                    "input_embeddings",
+                    "visual_token_mask",
+                    "position_ids",
+                },
+            ),
         }
         target_config = SimpleNamespace(num_hidden_layers=40)
 
@@ -141,11 +153,12 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
                 expected_capture_method = {
                     "eagle3": "eagle3",
                     "dspark": "dspark",
+                    "msd": "msd",
                 }.get(strategy, "dflash")
                 self.assertEqual(expected_capture_method, plan.capture_method)
                 self.assertEqual(layers, plan.capture_layers)
                 self.assertEqual(feature_names, set(plan.layout.output_names))
-                if strategy == "eagle3":
+                if strategy in {"eagle3", "msd"}:
                     self.assertIsNone(plan.loss_mask_filter)
                 else:
                     self.assertTrue(plan.loss_mask_filter([0, 1, 1]))
