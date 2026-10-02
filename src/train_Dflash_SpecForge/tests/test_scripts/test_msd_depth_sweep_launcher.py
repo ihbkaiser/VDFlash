@@ -135,6 +135,66 @@ def test_msd_data_phase_validates_all_inputs_before_preparation(tmp_path: Path) 
     assert "prepare_data.py" not in result.stdout
 
 
+def capture_env(tmp_path: Path) -> dict[str, str]:
+    sharegpt = tmp_path / "sharegpt_train.jsonl"
+    llava = tmp_path / "llava68k.jsonl"
+    images = tmp_path / "images"
+    target = tmp_path / "target"
+    sharegpt.write_text("{}\n", encoding="utf-8")
+    llava.write_text("{}\n", encoding="utf-8")
+    images.mkdir()
+    target.mkdir()
+    return {
+        "SHAREGPT_JSONL": sharegpt.as_posix(),
+        "LLAVA_MANIFEST": llava.as_posix(),
+        "IMAGE_ROOT": images.as_posix(),
+        "TARGET_MODEL_PATH": target.as_posix(),
+        "TEXT_FEATURE_ROOT": (tmp_path / "text-features").as_posix(),
+        "VISUAL_FEATURE_ROOT": (tmp_path / "visual-features").as_posix(),
+        "PYTHON_BIN": "/bin/echo",
+        "TORCHRUN_BIN": "/bin/echo",
+        "SPECFORGE_GPUS": "1",
+        "SPECFORGE_GLOBAL_BATCH_SIZE": "1",
+    }
+
+
+def test_msd_capture_runs_text_then_visual_commands(tmp_path: Path) -> None:
+    result = run_launcher("--phase", "capture", env=capture_env(tmp_path))
+
+    assert result.returncode == 0, result.stderr
+    assert "scripts/prepare_hidden_states.py --strategy msd" in result.stdout
+    assert "scripts/prepare_llava_caption_hidden_states.py --strategy msd" in result.stdout
+    assert result.stdout.index("prepare_hidden_states.py") < result.stdout.index(
+        "prepare_llava_caption_hidden_states.py"
+    )
+
+
+def test_msd_capture_rejects_existing_features_without_resume(tmp_path: Path) -> None:
+    env = capture_env(tmp_path)
+    existing = tmp_path / "text-features" / "rows_0-2000" / "data_0.ckpt"
+    existing.parent.mkdir(parents=True)
+    existing.touch()
+
+    result = run_launcher("--phase", "capture", env=env)
+
+    assert result.returncode == 1
+    assert "pass --resume" in result.stderr
+    assert "prepare_hidden_states.py" not in result.stdout
+
+
+def test_msd_capture_resume_preserves_existing_features(tmp_path: Path) -> None:
+    env = capture_env(tmp_path)
+    existing = tmp_path / "text-features" / "rows_0-2000" / "data_0.ckpt"
+    existing.parent.mkdir(parents=True)
+    existing.touch()
+
+    result = run_launcher("--phase", "capture", "--resume", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert "scripts/prepare_hidden_states.py --strategy msd" in result.stdout
+    assert "scripts/prepare_llava_caption_hidden_states.py --strategy msd" in result.stdout
+
+
 def test_msd_materializer_creates_isolated_depth_configs(tmp_path: Path) -> None:
     module = _module()
     outputs = []
