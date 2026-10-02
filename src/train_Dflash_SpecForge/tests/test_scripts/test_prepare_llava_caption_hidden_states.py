@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -92,6 +94,23 @@ class ParseArgsTest(unittest.TestCase):
                 "mem_fraction_static": 0.4,
             },
         )
+
+
+class CaptureMetadataTest(unittest.TestCase):
+    def test_msd_capture_does_not_write_dflash_layer_metadata(self):
+        with self.subTest("MSD stores one last-hidden-state tensor, not five layers"):
+            output_root = Path(self._testMethodName)
+            result = llava_capture._write_capture_metadata_if_required(
+                output_root=output_root,
+                strategy="msd",
+                layer_ids=[0],
+                target_config=SimpleNamespace(hidden_size=2048),
+                phase="phase2",
+                target_model_path="target",
+            )
+
+        self.assertIsNone(result)
+        self.assertFalse((output_root / "hidden_state_metadata.json").exists())
 
 
 if __name__ == "__main__":

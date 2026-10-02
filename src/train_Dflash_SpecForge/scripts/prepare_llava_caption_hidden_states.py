@@ -123,6 +123,47 @@ def _offline_capture_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     return kwargs
 
 
+def _write_capture_metadata_if_required(
+    *,
+    output_root: Path,
+    strategy: str,
+    layer_ids: list[int],
+    target_config: Any,
+    phase: str,
+    target_model_path: str,
+) -> Path | None:
+    """Write five-layer provenance only for DFlash feature caches."""
+
+    if strategy != "dflash":
+        return None
+
+    from specforge.hidden_state import (
+        build_hidden_state_metadata,
+        write_hidden_state_metadata,
+    )
+
+    text_config = getattr(target_config, "text_config", target_config)
+    return write_hidden_state_metadata(
+        output_root,
+        build_hidden_state_metadata(
+            target_layer_ids=layer_ids,
+            hidden_size=int(text_config.hidden_size),
+            phase=phase,
+            target_model=target_model_path,
+            target_model_revision=getattr(target_config, "_commit_hash", None),
+            dtype=str(
+                getattr(
+                    text_config,
+                    "torch_dtype",
+                    getattr(text_config, "dtype", None),
+                )
+            ),
+            layer_indexing="qwen25vl_hf_decoder_zero_based",
+            expected_count=5,
+        ),
+    )
+
+
 def _collate_prepared(
     prepared_batch: list[dict[str, Any]],
     *,
@@ -451,32 +492,16 @@ def main() -> int:
                 "the strict 68k pipeline refuses a partial feature set"
             )
         if rank == 0:
-            from specforge.hidden_state import (
-                build_hidden_state_metadata,
-                write_hidden_state_metadata,
+            metadata_path = _write_capture_metadata_if_required(
+                output_root=output_root,
+                strategy=args.strategy,
+                layer_ids=layer_ids,
+                target_config=target_config,
+                phase=args.phase,
+                target_model_path=args.target_model_path,
             )
-
-            text_config = getattr(target_config, "text_config", target_config)
-            write_hidden_state_metadata(
-                output_root,
-                build_hidden_state_metadata(
-                    target_layer_ids=layer_ids,
-                    hidden_size=int(text_config.hidden_size),
-                    phase=args.phase,
-                    target_model=args.target_model_path,
-                    target_model_revision=getattr(target_config, "_commit_hash", None),
-                    dtype=str(
-                        getattr(
-                            text_config,
-                            "torch_dtype",
-                            getattr(text_config, "dtype", None),
-                        )
-                    ),
-                    layer_indexing="qwen25vl_hf_decoder_zero_based",
-                    expected_count=5,
-                ),
-            )
-            print(f"Hidden-state metadata written to {output_root}")
+            if metadata_path is not None:
+                print(f"Hidden-state metadata written to {output_root}")
     finally:
         destroy_distributed()
     return 0
