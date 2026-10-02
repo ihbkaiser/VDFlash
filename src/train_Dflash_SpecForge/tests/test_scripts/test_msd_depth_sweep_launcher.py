@@ -202,7 +202,8 @@ def test_msd_capture_prefers_checkout_package_on_pythonpath(tmp_path: Path) -> N
     probe = tmp_path / "torchrun-probe.sh"
     probe.write_text(
         "#!/usr/bin/env bash\n"
-        "printf 'PYTHONPATH_HEAD=%s\\n' \"${PYTHONPATH%%:*}\"\n",
+        "printf 'PYTHONPATH_HEAD=%s\\n' \"${PYTHONPATH%%:*}\"\n"
+        "printf 'NVCC_PREPEND_FLAGS=%s\\n' \"${NVCC_PREPEND_FLAGS:-}\"\n",
         encoding="utf-8",
     )
     probe.chmod(0o755)
@@ -216,6 +217,8 @@ def test_msd_capture_prefers_checkout_package_on_pythonpath(tmp_path: Path) -> N
         expected_root = f"/{ROOT.drive[0].lower()}{expected_root[2:]}"
     assert result.returncode == 0, result.stderr
     assert f"PYTHONPATH_HEAD={expected_root}" in result.stdout
+    expected_nvrtc_include = (tmp_path / "nvrtc" / "include").as_posix()
+    assert f"NVCC_PREPEND_FLAGS=-I{expected_nvrtc_include}" in result.stdout
 
 
 def test_msd_capture_rejects_existing_features_without_resume(tmp_path: Path) -> None:
