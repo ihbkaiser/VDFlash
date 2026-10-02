@@ -125,6 +125,21 @@ require_jsonl_count() {
   fi
 }
 
+feature_count() {
+  local root=$1
+  [[ -d "$root" ]] || { echo 0; return; }
+  find "$root" -type f \( -name '*.ckpt' -o -name '*.ckpt.gz' \) -print 2>/dev/null | wc -l
+}
+
+guard_capture_root() {
+  local label=$1 root=$2 count
+  count=$(feature_count "$root")
+  if ((count > 0 && !RESUME)); then
+    echo "$label feature cache already contains $count records at $root; pass --resume" >&2
+    exit 1
+  fi
+}
+
 if [[ "$PHASE" == data || "$PHASE" == all ]]; then
   [[ -f "$SHAREGPT_SOURCE" ]] || { echo "missing SHAREGPT_SOURCE: $SHAREGPT_SOURCE" >&2; exit 2; }
   [[ -f "$LLAVA_SOURCE_JSONL" ]] || { echo "missing LLAVA_SOURCE_JSONL: $LLAVA_SOURCE_JSONL" >&2; exit 2; }
@@ -141,17 +156,22 @@ if [[ "$PHASE" == data || "$PHASE" == all ]]; then
 fi
 
 if [[ "$PHASE" == capture || "$PHASE" == all ]]; then
+  command -v "$TORCHRUN_BIN" >/dev/null 2>&1 || { echo "missing command: $TORCHRUN_BIN" >&2; exit 2; }
+  [[ -d "$TARGET_MODEL_PATH" ]] || { echo "missing TARGET_MODEL_PATH: $TARGET_MODEL_PATH" >&2; exit 2; }
   [[ -f "$SHAREGPT_JSONL" ]] || { echo "missing SHAREGPT_JSONL: $SHAREGPT_JSONL" >&2; exit 2; }
   [[ -f "$LLAVA_MANIFEST" ]] || { echo "missing LLAVA_MANIFEST: $LLAVA_MANIFEST" >&2; exit 2; }
   [[ -d "$IMAGE_ROOT" ]] || { echo "missing IMAGE_ROOT: $IMAGE_ROOT" >&2; exit 2; }
-  torchrun --nproc_per_node="$GPU_COUNT" scripts/prepare_hidden_states.py \
+  guard_capture_root ShareGPT "$TEXT_FEATURE_ROOT"
+  guard_capture_root LLaVA "$VISUAL_FEATURE_ROOT"
+  mkdir -p "$TEXT_FEATURE_ROOT" "$VISUAL_FEATURE_ROOT"
+  "$TORCHRUN_BIN" --nproc_per_node="$GPU_COUNT" "$SPECFORGE_DIR/scripts/prepare_hidden_states.py" \
     --strategy msd --target-model-path "$TARGET_MODEL_PATH" \
-    --draft-model-config configs/qwen2.5-vl-3b-msd.json \
+    --draft-model-config "$SPECFORGE_DIR/configs/qwen2.5-vl-3b-msd.json" \
     --data-path "$SHAREGPT_JSONL" --output-path "$TEXT_FEATURE_ROOT" \
     --chat-template qwen --max-length "$MAX_LENGTH" --num-samples "$EXPECTED_RECORDS"
-  torchrun --nproc_per_node="$GPU_COUNT" scripts/prepare_llava_caption_hidden_states.py \
+  "$TORCHRUN_BIN" --nproc_per_node="$GPU_COUNT" "$SPECFORGE_DIR/scripts/prepare_llava_caption_hidden_states.py" \
     --strategy msd --target-model-path "$TARGET_MODEL_PATH" \
-    --draft-model-config configs/qwen2.5-vl-3b-msd.json \
+    --draft-model-config "$SPECFORGE_DIR/configs/qwen2.5-vl-3b-msd.json" \
     --manifest "$LLAVA_MANIFEST" --image-root "$IMAGE_ROOT" \
     --output-path "$VISUAL_FEATURE_ROOT" --max-length "$MAX_LENGTH" \
     --expected-records "$EXPECTED_RECORDS"
