@@ -397,10 +397,41 @@ def test_msd_paired_reader_applies_epoch_curriculum_without_mutable_rng() -> Non
     } for ref in first)
 
 
-def test_msd_paired_reader_requires_matched_nonempty_feature_cohorts() -> None:
-    with tempfile.TemporaryDirectory() as text_root, tempfile.TemporaryDirectory() as visual_root:
+def test_msd_paired_reader_uses_the_shorter_nonempty_feature_cohort() -> None:
+    with (
+        tempfile.TemporaryDirectory() as text_root,
+        tempfile.TemporaryDirectory() as visual_root,
+    ):
+        for index in range(3):
+            _write_msd_record(text_root, index)
+        for index in range(5):
+            _write_msd_record(visual_root, index)
+
+        refs = build_paired_offline_reader(
+            text_root,
+            visual_root,
+            run_id="msd-reader",
+            ttt_length=1,
+            max_len=8,
+            epoch_now=40,
+        ).read()
+
+    assert len(refs) == 3
+    assert {ref.metadata["msd_corpus"] for ref in refs} == {"visual"}
+    assert [os.path.basename(ref.feature_store_uri) for ref in refs] == [
+        "0000.ckpt",
+        "0001.ckpt",
+        "0002.ckpt",
+    ]
+
+
+def test_msd_paired_reader_requires_both_feature_cohorts_to_be_nonempty() -> None:
+    with (
+        tempfile.TemporaryDirectory() as text_root,
+        tempfile.TemporaryDirectory() as visual_root,
+    ):
         _write_msd_record(text_root, 0)
-        with pytest.raises(ValueError, match="same non-zero number"):
+        with pytest.raises(ValueError, match="both be non-empty"):
             build_paired_offline_reader(
                 text_root,
                 visual_root,

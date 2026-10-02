@@ -212,11 +212,12 @@ class MSDPairedManifestReader:
 
         text_files = list_feature_files(text_root)
         visual_files = list_feature_files(visual_root)
-        if not text_files or len(text_files) != len(visual_files):
+        if not text_files or not visual_files:
             raise ValueError(
-                "MSD text and visual roots must contain the same non-zero number "
-                "of feature records"
+                "MSD text and visual feature cohorts must both be non-empty "
+                f"(text={len(text_files)}, visual={len(visual_files)})"
             )
+        cohort_size = min(len(text_files), len(visual_files))
         common = {
             "run_id": run_id,
             "strategy": "msd",
@@ -225,8 +226,12 @@ class MSDPairedManifestReader:
             "ttt_length": ttt_length,
             "max_len": max_len,
         }
-        self.text_refs = OfflineManifestReader(text_root, **common).read()
-        self.visual_refs = OfflineManifestReader(visual_root, **common).read()
+        self.text_refs = OfflineManifestReader(text_root, **common).read()[
+            :cohort_size
+        ]
+        self.visual_refs = OfflineManifestReader(visual_root, **common).read()[
+            :cohort_size
+        ]
         self.run_id = run_id
         self.epoch_now = epoch_now
         self.curriculum_seed = int(curriculum_seed)
