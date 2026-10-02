@@ -21,6 +21,7 @@ SGLANG_SAMPLING_BACKEND=${SPECFORGE_SGLANG_SAMPLING_BACKEND:-auto}
 SGLANG_MM_ATTENTION_BACKEND=${SPECFORGE_SGLANG_MM_ATTENTION_BACKEND:-auto}
 SGLANG_MEM_FRACTION_STATIC=${SPECFORGE_SGLANG_MEM_FRACTION_STATIC:-0.4}
 PHASE=all
+CAPTURE_TARGET=both
 RESUME=0
 PRINT_CONFIG=0
 
@@ -43,6 +44,7 @@ usage() {
     'Qwen2.5-VL-3B original-MSD 1/3/5-layer static sweep launcher.' \
     'Usage: bash train_qwen25vl_msd_depth_sweep.sh [options]' \
     '  --phase data|capture|train|all' \
+    '  --capture-target both|text|llava' \
     '  --resume' \
     '  --print-config' \
     '  -h, --help'
@@ -51,6 +53,7 @@ usage() {
 while (($#)); do
   case "$1" in
     --phase) PHASE=${2:?"--phase requires a value"}; shift 2 ;;
+    --capture-target) CAPTURE_TARGET=${2:?"--capture-target requires a value"}; shift 2 ;;
     --resume) RESUME=1; shift ;;
     --print-config) PRINT_CONFIG=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -59,6 +62,10 @@ while (($#)); do
 done
 
 case "$PHASE" in data|capture|train|all) ;; *) echo "invalid --phase: $PHASE" >&2; exit 2 ;; esac
+case "$CAPTURE_TARGET" in
+  both|text|llava) ;;
+  *) echo "invalid --capture-target: $CAPTURE_TARGET" >&2; exit 2 ;;
+esac
 if [[ "${SPECFORGE_TOTAL_EPOCHS:-40}" != 40 ]]; then
   echo "MSD replication fixes TOTAL_EPOCHS=40" >&2
   exit 2
@@ -98,6 +105,7 @@ print_config() {
   echo "LLAVA_SOURCE_JSONL=$LLAVA_SOURCE_JSONL"
   echo "LLAVA_MANIFEST=$LLAVA_MANIFEST"
   echo "IMAGE_ROOT=$IMAGE_ROOT"
+  echo "CAPTURE_TARGET=$CAPTURE_TARGET"
   echo "DEPTHS=$DEPTHS"
   echo "TOTAL_EPOCHS=$TOTAL_EPOCHS"
   echo "GPU_COUNT=$GPU_COUNT"
@@ -250,12 +258,17 @@ fi
 if [[ "$PHASE" == capture || "$PHASE" == all ]]; then
   command -v "$TORCHRUN_BIN" >/dev/null 2>&1 || { echo "missing command: $TORCHRUN_BIN" >&2; exit 2; }
   [[ -d "$TARGET_MODEL_PATH" ]] || { echo "missing TARGET_MODEL_PATH: $TARGET_MODEL_PATH" >&2; exit 2; }
-  [[ -f "$SHAREGPT_JSONL" ]] || { echo "missing SHAREGPT_JSONL: $SHAREGPT_JSONL" >&2; exit 2; }
-  [[ -f "$LLAVA_MANIFEST" ]] || { echo "missing LLAVA_MANIFEST: $LLAVA_MANIFEST" >&2; exit 2; }
-  [[ -d "$IMAGE_ROOT" ]] || { echo "missing IMAGE_ROOT: $IMAGE_ROOT" >&2; exit 2; }
-  guard_capture_root ShareGPT "$TEXT_FEATURE_ROOT"
-  guard_capture_root LLaVA "$VISUAL_FEATURE_ROOT"
-  mkdir -p "$TEXT_FEATURE_ROOT" "$VISUAL_FEATURE_ROOT"
+  if [[ "$CAPTURE_TARGET" != llava ]]; then
+    [[ -f "$SHAREGPT_JSONL" ]] || { echo "missing SHAREGPT_JSONL: $SHAREGPT_JSONL" >&2; exit 2; }
+    guard_capture_root ShareGPT "$TEXT_FEATURE_ROOT"
+    mkdir -p "$TEXT_FEATURE_ROOT"
+  fi
+  if [[ "$CAPTURE_TARGET" != text ]]; then
+    [[ -f "$LLAVA_MANIFEST" ]] || { echo "missing LLAVA_MANIFEST: $LLAVA_MANIFEST" >&2; exit 2; }
+    [[ -d "$IMAGE_ROOT" ]] || { echo "missing IMAGE_ROOT: $IMAGE_ROOT" >&2; exit 2; }
+    guard_capture_root LLaVA "$VISUAL_FEATURE_ROOT"
+    mkdir -p "$VISUAL_FEATURE_ROOT"
+  fi
   configure_nvrtc
   SGLANG_CAPTURE_ARGS=()
   if [[ "$SGLANG_ATTENTION_BACKEND" != auto ]]; then
@@ -267,21 +280,25 @@ if [[ "$PHASE" == capture || "$PHASE" == all ]]; then
   if [[ "$SGLANG_MM_ATTENTION_BACKEND" != auto ]]; then
     SGLANG_CAPTURE_ARGS+=(--sglang-mm-attention-backend "$SGLANG_MM_ATTENTION_BACKEND")
   fi
-  "$TORCHRUN_BIN" --standalone --nproc_per_node="$GPU_COUNT" "$SPECFORGE_DIR/scripts/prepare_hidden_states.py" \
-    --strategy msd --target-model-path "$TARGET_MODEL_PATH" \
-    --draft-model-config "$SPECFORGE_DIR/configs/qwen2.5-vl-3b-msd.json" \
-    --data-path "$SHAREGPT_JSONL" --output-path "$TEXT_FEATURE_ROOT" \
-    --chat-template qwen --max-length "$MAX_LENGTH" --num-samples "$EXPECTED_RECORDS" \
-    "${SGLANG_CAPTURE_ARGS[@]}" \
-    --sglang-mem-fraction-static "$SGLANG_MEM_FRACTION_STATIC"
-  "$TORCHRUN_BIN" --standalone --nproc_per_node="$GPU_COUNT" "$SPECFORGE_DIR/scripts/prepare_llava_caption_hidden_states.py" \
-    --strategy msd --target-model-path "$TARGET_MODEL_PATH" \
-    --draft-model-config "$SPECFORGE_DIR/configs/qwen2.5-vl-3b-msd.json" \
-    --manifest "$LLAVA_MANIFEST" --image-root "$IMAGE_ROOT" \
-    --output-path "$VISUAL_FEATURE_ROOT" --max-length "$MAX_LENGTH" \
-    --expected-records "$EXPECTED_RECORDS" \
-    "${SGLANG_CAPTURE_ARGS[@]}" \
-    --sglang-mem-fraction-static "$SGLANG_MEM_FRACTION_STATIC"
+  if [[ "$CAPTURE_TARGET" != llava ]]; then
+    "$TORCHRUN_BIN" --standalone --nproc_per_node="$GPU_COUNT" "$SPECFORGE_DIR/scripts/prepare_hidden_states.py" \
+      --strategy msd --target-model-path "$TARGET_MODEL_PATH" \
+      --draft-model-config "$SPECFORGE_DIR/configs/qwen2.5-vl-3b-msd.json" \
+      --data-path "$SHAREGPT_JSONL" --output-path "$TEXT_FEATURE_ROOT" \
+      --chat-template qwen --max-length "$MAX_LENGTH" --num-samples "$EXPECTED_RECORDS" \
+      "${SGLANG_CAPTURE_ARGS[@]}" \
+      --sglang-mem-fraction-static "$SGLANG_MEM_FRACTION_STATIC"
+  fi
+  if [[ "$CAPTURE_TARGET" != text ]]; then
+    "$TORCHRUN_BIN" --standalone --nproc_per_node="$GPU_COUNT" "$SPECFORGE_DIR/scripts/prepare_llava_caption_hidden_states.py" \
+      --strategy msd --target-model-path "$TARGET_MODEL_PATH" \
+      --draft-model-config "$SPECFORGE_DIR/configs/qwen2.5-vl-3b-msd.json" \
+      --manifest "$LLAVA_MANIFEST" --image-root "$IMAGE_ROOT" \
+      --output-path "$VISUAL_FEATURE_ROOT" --max-length "$MAX_LENGTH" \
+      --expected-records "$EXPECTED_RECORDS" \
+      "${SGLANG_CAPTURE_ARGS[@]}" \
+      --sglang-mem-fraction-static "$SGLANG_MEM_FRACTION_STATIC"
+  fi
 fi
 
 if [[ "$PHASE" == train || "$PHASE" == all ]]; then

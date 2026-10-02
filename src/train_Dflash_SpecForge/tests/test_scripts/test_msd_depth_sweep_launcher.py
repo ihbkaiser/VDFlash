@@ -190,6 +190,36 @@ def test_msd_capture_runs_text_then_visual_commands(tmp_path: Path) -> None:
     )
 
 
+def test_msd_capture_target_llava_skips_text_inputs_and_command(tmp_path: Path) -> None:
+    env = capture_env(tmp_path)
+    env["SHAREGPT_JSONL"] = (tmp_path / "missing-sharegpt.jsonl").as_posix()
+
+    result = run_launcher("--phase", "capture", "--capture-target", "llava", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert "prepare_hidden_states.py" not in result.stdout
+    assert "prepare_llava_caption_hidden_states.py" in result.stdout
+
+
+def test_msd_capture_target_text_skips_visual_inputs_and_command(tmp_path: Path) -> None:
+    env = capture_env(tmp_path)
+    env["LLAVA_MANIFEST"] = (tmp_path / "missing-llava.jsonl").as_posix()
+    env["IMAGE_ROOT"] = (tmp_path / "missing-images").as_posix()
+
+    result = run_launcher("--phase", "capture", "--capture-target", "text", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert "prepare_hidden_states.py" in result.stdout
+    assert "prepare_llava_caption_hidden_states.py" not in result.stdout
+
+
+def test_msd_capture_target_rejects_unknown_value() -> None:
+    result = run_launcher("--phase", "capture", "--capture-target", "video")
+
+    assert result.returncode == 2
+    assert "invalid --capture-target: video" in result.stderr
+
+
 def test_msd_capture_uses_sglang_auto_backends_by_default(tmp_path: Path) -> None:
     result = run_launcher("--phase", "capture", env=capture_env(tmp_path))
 
