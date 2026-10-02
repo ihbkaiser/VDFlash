@@ -115,10 +115,29 @@ for command in "$PYTHON_BIN"; do
   command -v "$command" >/dev/null 2>&1 || { echo "missing command: $command" >&2; exit 2; }
 done
 
+require_jsonl_count() {
+  local label=$1 path=$2 expected=$3 count
+  [[ -f "$path" ]] || { echo "missing $label output: $path" >&2; exit 1; }
+  count=$(awk 'NF { count += 1 } END { print count + 0 }' "$path")
+  if ((count != expected)); then
+    echo "$label produced $count records; expected $expected" >&2
+    exit 1
+  fi
+}
+
 if [[ "$PHASE" == data || "$PHASE" == all ]]; then
   [[ -f "$SHAREGPT_SOURCE" ]] || { echo "missing SHAREGPT_SOURCE: $SHAREGPT_SOURCE" >&2; exit 2; }
-  "$PYTHON_BIN" scripts/prepare_data.py --dataset sharegpt \
-    --data-path "$SHAREGPT_SOURCE" --output-path "$(dirname "$SHAREGPT_JSONL")"
+  [[ -f "$LLAVA_SOURCE_JSONL" ]] || { echo "missing LLAVA_SOURCE_JSONL: $LLAVA_SOURCE_JSONL" >&2; exit 2; }
+  [[ -d "$IMAGE_ROOT" ]] || { echo "missing IMAGE_ROOT: $IMAGE_ROOT" >&2; exit 2; }
+  mkdir -p "$(dirname "$SHAREGPT_JSONL")" "$(dirname "$LLAVA_MANIFEST")"
+  "$PYTHON_BIN" "$SPECFORGE_DIR/scripts/prepare_data.py" --dataset sharegpt \
+    --data-path "$SHAREGPT_SOURCE" --output-path "$(dirname "$SHAREGPT_JSONL")" \
+    --sample-size "$EXPECTED_RECORDS"
+  "$PYTHON_BIN" "$SPECFORGE_DIR/scripts/prepare_llava_caption_manifest.py" \
+    --input "$LLAVA_SOURCE_JSONL" --output "$LLAVA_MANIFEST" \
+    --image-root "$IMAGE_ROOT" --expected-records "$EXPECTED_RECORDS"
+  require_jsonl_count ShareGPT "$SHAREGPT_JSONL" "$EXPECTED_RECORDS"
+  require_jsonl_count LLaVA "$LLAVA_MANIFEST" "$EXPECTED_RECORDS"
 fi
 
 if [[ "$PHASE" == capture || "$PHASE" == all ]]; then

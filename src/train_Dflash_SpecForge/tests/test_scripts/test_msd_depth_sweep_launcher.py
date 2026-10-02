@@ -78,6 +78,63 @@ def test_msd_launcher_prints_shared_storage_defaults() -> None:
     assert "TOTAL_EPOCHS=40" in result.stdout
 
 
+def test_msd_data_phase_prepares_sharegpt_and_llava(tmp_path: Path) -> None:
+    sharegpt = tmp_path / "sharegpt.json"
+    llava = tmp_path / "llava.jsonl"
+    image_root = tmp_path / "images"
+    artifact_root = tmp_path / "artifacts"
+    sharegpt.write_text("[]", encoding="utf-8")
+    llava.write_text("{}\n", encoding="utf-8")
+    image_root.mkdir()
+    manifests = artifact_root / "manifests"
+    manifests.mkdir(parents=True)
+    (manifests / "sharegpt_train.jsonl").write_text("{}\n", encoding="utf-8")
+    (manifests / "llava68k.jsonl").write_text("{}\n", encoding="utf-8")
+
+    result = run_launcher(
+        "--phase",
+        "data",
+        env={
+            "ARTIFACT_ROOT": artifact_root.as_posix(),
+            "SHAREGPT_SOURCE": sharegpt.as_posix(),
+            "LLAVA_SOURCE_JSONL": llava.as_posix(),
+            "IMAGE_ROOT": image_root.as_posix(),
+            "PYTHON_BIN": "/bin/echo",
+            "SPECFORGE_NUM_SAMPLES": "1",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "scripts/prepare_data.py --dataset sharegpt" in result.stdout
+    assert "scripts/prepare_llava_caption_manifest.py" in result.stdout
+    assert f"--image-root {image_root.as_posix()}" in result.stdout
+    assert "--expected-records 1" in result.stdout
+
+
+def test_msd_data_phase_validates_all_inputs_before_preparation(tmp_path: Path) -> None:
+    sharegpt = tmp_path / "sharegpt.json"
+    image_root = tmp_path / "images"
+    sharegpt.write_text("[]", encoding="utf-8")
+    image_root.mkdir()
+
+    result = run_launcher(
+        "--phase",
+        "data",
+        env={
+            "ARTIFACT_ROOT": (tmp_path / "artifacts").as_posix(),
+            "SHAREGPT_SOURCE": sharegpt.as_posix(),
+            "LLAVA_SOURCE_JSONL": (tmp_path / "missing.jsonl").as_posix(),
+            "IMAGE_ROOT": image_root.as_posix(),
+            "PYTHON_BIN": "/bin/echo",
+            "SPECFORGE_NUM_SAMPLES": "1",
+        },
+    )
+
+    assert result.returncode == 2
+    assert "missing LLAVA_SOURCE_JSONL" in result.stderr
+    assert "prepare_data.py" not in result.stdout
+
+
 def test_msd_materializer_creates_isolated_depth_configs(tmp_path: Path) -> None:
     module = _module()
     outputs = []
