@@ -55,6 +55,7 @@ def _attach_msd_input_capture(model: Any) -> MSDInputEmbeddingCapture:
     candidates = (
         getattr(model, "language_model", None),
         getattr(getattr(model, "model", None), "language_model", None),
+        getattr(model, "model", None),
     )
     module = next(
         (
@@ -66,7 +67,7 @@ def _attach_msd_input_capture(model: Any) -> MSDInputEmbeddingCapture:
     )
     if module is None:
         raise RuntimeError(
-            "Qwen2.5-VL target does not expose a hookable language_model for MSD"
+            "Qwen2.5-VL target does not expose a hookable language model for MSD"
         )
     capture = MSDInputEmbeddingCapture(module)
     model._specforge_msd_input_capture = capture
