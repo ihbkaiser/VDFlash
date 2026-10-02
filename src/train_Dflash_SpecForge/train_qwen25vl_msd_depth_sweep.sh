@@ -164,12 +164,12 @@ if [[ "$PHASE" == capture || "$PHASE" == all ]]; then
   guard_capture_root ShareGPT "$TEXT_FEATURE_ROOT"
   guard_capture_root LLaVA "$VISUAL_FEATURE_ROOT"
   mkdir -p "$TEXT_FEATURE_ROOT" "$VISUAL_FEATURE_ROOT"
-  "$TORCHRUN_BIN" --nproc_per_node="$GPU_COUNT" "$SPECFORGE_DIR/scripts/prepare_hidden_states.py" \
+  "$TORCHRUN_BIN" --standalone --nproc_per_node="$GPU_COUNT" "$SPECFORGE_DIR/scripts/prepare_hidden_states.py" \
     --strategy msd --target-model-path "$TARGET_MODEL_PATH" \
     --draft-model-config "$SPECFORGE_DIR/configs/qwen2.5-vl-3b-msd.json" \
     --data-path "$SHAREGPT_JSONL" --output-path "$TEXT_FEATURE_ROOT" \
     --chat-template qwen --max-length "$MAX_LENGTH" --num-samples "$EXPECTED_RECORDS"
-  "$TORCHRUN_BIN" --nproc_per_node="$GPU_COUNT" "$SPECFORGE_DIR/scripts/prepare_llava_caption_hidden_states.py" \
+  "$TORCHRUN_BIN" --standalone --nproc_per_node="$GPU_COUNT" "$SPECFORGE_DIR/scripts/prepare_llava_caption_hidden_states.py" \
     --strategy msd --target-model-path "$TARGET_MODEL_PATH" \
     --draft-model-config "$SPECFORGE_DIR/configs/qwen2.5-vl-3b-msd.json" \
     --manifest "$LLAVA_MANIFEST" --image-root "$IMAGE_ROOT" \

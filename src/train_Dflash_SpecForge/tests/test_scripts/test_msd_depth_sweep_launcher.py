@@ -162,6 +162,7 @@ def test_msd_capture_runs_text_then_visual_commands(tmp_path: Path) -> None:
     result = run_launcher("--phase", "capture", env=capture_env(tmp_path))
 
     assert result.returncode == 0, result.stderr
+    assert result.stdout.count("--standalone --nproc_per_node=1") == 2
     assert "scripts/prepare_hidden_states.py --strategy msd" in result.stdout
     assert "scripts/prepare_llava_caption_hidden_states.py --strategy msd" in result.stdout
     assert result.stdout.index("prepare_hidden_states.py") < result.stdout.index(
