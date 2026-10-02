@@ -118,16 +118,24 @@ def msd_loss(
     feature_per_token = F.smooth_l1_loss(predicted, target, reduction="none").mean(-1)
     feature_loss = (feature_per_token * mask).sum() / denominator
 
-    predicted_logits = _head_logits(predicted, frozen_lm_head)
+    active = mask.ne(0)
+    active_weights = mask[active]
+    predicted_active = predicted[active]
+    target_active = target[active]
+
+    # The reference implementation applies the vocabulary head before masking.
+    # Selecting active tokens first is algebraically equivalent, while avoiding
+    # two full-vocabulary projections for prompt and padding positions.
+    predicted_logits = _head_logits(predicted_active, frozen_lm_head)
     with torch.no_grad():
-        target_logits = _head_logits(target, frozen_lm_head)
+        target_logits = _head_logits(target_active, frozen_lm_head)
         target_probabilities = F.softmax(target_logits, dim=-1)
     soft_per_token = -(
         target_probabilities * F.log_softmax(predicted_logits, dim=-1)
     ).sum(-1)
-    soft_target_loss = (soft_per_token * mask).sum() / denominator
+    soft_target_loss = (soft_per_token * active_weights).sum() / denominator
     correct = predicted_logits.argmax(-1).eq(target_logits.argmax(-1)).float()
-    accuracy = (correct * mask).sum() / valid_tokens
+    accuracy = (correct * active_weights).sum() / valid_tokens
     total = feature_weight * feature_loss + soft_target_weight * soft_target_loss
     return MSDLossOutput(total, feature_loss, soft_target_loss, accuracy)
 
