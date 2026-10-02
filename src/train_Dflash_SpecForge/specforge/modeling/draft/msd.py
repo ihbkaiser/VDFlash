@@ -242,6 +242,7 @@ class MSDDraftModel(PreTrainedModel):
     """Trainable MSD draft backbone; target embeddings and LM head stay frozen."""
 
     config_class = MSDConfig
+    _supports_sdpa = True
     base_model_prefix = "msd"
     main_input_name = "conditioning_hidden_state"
 

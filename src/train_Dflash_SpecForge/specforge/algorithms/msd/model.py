@@ -19,6 +19,17 @@ class MSDLossOutput:
     accuracy: Tensor
 
 
+class MSDTrainingModel(nn.Module):
+    """Composite training shell required by the shared FSDP trainer."""
+
+    def __init__(self, draft_model: nn.Module) -> None:
+        super().__init__()
+        self.draft_model = draft_model
+
+    def forward(self, *args, **kwargs):
+        return self.draft_model(*args, **kwargs)
+
+
 def decouple_msd_inputs(
     conditioning_hidden_state: Tensor,
     next_token_embeddings: Tensor,
@@ -123,6 +134,7 @@ def msd_loss(
 
 __all__ = [
     "MSDLossOutput",
+    "MSDTrainingModel",
     "add_reference_uniform_noise",
     "decouple_msd_inputs",
     "msd_loss",

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
-from scripts.prepare_llava_caption_hidden_states import _collate_prepared
+from scripts.prepare_llava_caption_hidden_states import _collate_prepared, parse_args
 
 
 def _prepared(length: int, offset: int) -> dict:
@@ -38,6 +39,29 @@ class CollatePreparedTest(unittest.TestCase):
         self.assertTrue(torch.equal(batch["loss_mask"][0, 3:], torch.zeros(2)))
         self.assertIs(media[0], first["multimodal_inputs"])
         self.assertIs(media[1], second["multimodal_inputs"])
+
+
+class ParseArgsTest(unittest.TestCase):
+    def test_accepts_sglang_attention_backend(self):
+        argv = [
+            "prepare_llava_caption_hidden_states.py",
+            "--target-model-path",
+            "target",
+            "--draft-model-config",
+            "draft.json",
+            "--manifest",
+            "manifest.jsonl",
+            "--image-root",
+            "images",
+            "--output-path",
+            "features",
+            "--sglang-attention-backend",
+            "triton",
+        ]
+        with patch("sys.argv", argv):
+            args = parse_args()
+
+        self.assertEqual(args.sglang_attention_backend, "triton")
 
 
 if __name__ == "__main__":

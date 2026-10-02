@@ -17,6 +17,7 @@ from specforge.algorithms.msd.data import (
     normalize_offline_sample,
 )
 from specforge.algorithms.msd.model import (
+    MSDTrainingModel,
     add_reference_uniform_noise,
     decouple_msd_inputs,
     msd_loss,
@@ -25,6 +26,15 @@ from specforge.config.schema import TrainingConfig
 from specforge.modeling.draft.msd import MSDDraftModel
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.strategies.base import MSDTrainStrategy
+
+
+def test_msd_training_wrapper_exposes_the_draft_model_contract() -> None:
+    draft = torch.nn.Linear(3, 2)
+    wrapped = MSDTrainingModel(draft)
+    inputs = torch.randn(4, 3)
+
+    assert wrapped.draft_model is draft
+    torch.testing.assert_close(wrapped(inputs), draft(inputs))
 
 
 @pytest.mark.parametrize(

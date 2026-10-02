@@ -76,6 +76,8 @@ def test_msd_launcher_prints_shared_storage_defaults() -> None:
     assert f"IMAGE_ROOT={SHARED_ROOT}/LlaVA-Pretrain" in result.stdout
     assert "DEPTHS=1,3,5" in result.stdout
     assert "TOTAL_EPOCHS=40" in result.stdout
+    assert "SGLANG_ATTENTION_BACKEND=triton" in result.stdout
+    assert "SGLANG_MEM_FRACTION_STATIC=0.65" in result.stdout
 
 
 def test_msd_data_phase_prepares_sharegpt_and_llava(tmp_path: Path) -> None:
@@ -159,10 +161,15 @@ def capture_env(tmp_path: Path) -> dict[str, str]:
 
 
 def test_msd_capture_runs_text_then_visual_commands(tmp_path: Path) -> None:
-    result = run_launcher("--phase", "capture", env=capture_env(tmp_path))
+    env = capture_env(tmp_path)
+    env["SPECFORGE_SGLANG_MEM_FRACTION_STATIC"] = "0.65"
+    env["SPECFORGE_SGLANG_ATTENTION_BACKEND"] = "triton"
+    result = run_launcher("--phase", "capture", env=env)
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.count("--standalone --nproc_per_node=1") == 2
+    assert result.stdout.count("--sglang-mem-fraction-static 0.65") == 2
+    assert result.stdout.count("--sglang-attention-backend triton") == 2
     assert "scripts/prepare_hidden_states.py --strategy msd" in result.stdout
     assert "scripts/prepare_llava_caption_hidden_states.py --strategy msd" in result.stdout
     assert result.stdout.index("prepare_hidden_states.py") < result.stdout.index(
@@ -299,6 +306,7 @@ def test_msd_materializer_creates_isolated_depth_configs(tmp_path: Path) -> None
         assert recipe["training"]["num_epochs"] == 40
         assert recipe["training"]["msd_total_epochs"] == 40
         assert recipe["model"]["draft_num_hidden_layers"] == depth
+        assert recipe["model"]["embedding_key"] == "model.embed_tokens.weight"
         assert parsed.training.strategy == "msd"
         assert recipe["data"]["hidden_states_path"].endswith("sharegpt68k")
         assert recipe["data"]["msd_visual_hidden_states_path"].endswith("llava68k")

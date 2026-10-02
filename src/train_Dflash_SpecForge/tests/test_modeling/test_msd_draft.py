@@ -55,6 +55,15 @@ def test_msd_draft_is_registered_as_first_class_architecture() -> None:
     assert MSDDraftModel.config_class is MSDConfig
 
 
+def test_msd_draft_declares_native_sdpa_support() -> None:
+    config = tiny_config(1)
+    config._attn_implementation = "sdpa"
+
+    model = MSDDraftModel(config)
+
+    assert model._supports_sdpa is True
+
+
 def test_msd_prepare_inputs_decouples_visual_tokens() -> None:
     model = MSDDraftModel(tiny_config(1))
     model.fusion_projection.weight.data.zero_()
