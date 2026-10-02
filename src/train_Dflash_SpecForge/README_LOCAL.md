@@ -124,18 +124,28 @@ select ShareGPT only. Epochs 21-39 select LLaVA with probability
 hash-based on seed, epoch, and logical sample index, so checkpoint resume
 reconstructs the same mixture.
 
-Inspect the complete sweep without touching data or GPUs:
+The launcher defaults to `/workspace/storage-shared/nlp/tungdd11/tungdecoder`:
+it reads the ShareGPT JSON, the LLaVA 68k JSONL, images below
+`LLaVA-Pretrain/`, and the local Qwen2.5-VL-3B target from that tree. Override
+the common prefix with `SPECFORGE_SHARED_STORAGE_ROOT` or override any printed
+path individually.
+
+From the SpecForge directory, inspect the resolved configuration without
+touching data or GPUs, or run the complete workflow:
 
 ```bash
+cd /workspace/VDFlash/src/train_Dflash_SpecForge
 bash train_qwen25vl_msd_depth_sweep.sh --print-config
+bash train_qwen25vl_msd_depth_sweep.sh --phase all
 ```
 
-Run phases separately or together after overriding the machine paths shown by
-the dry run:
+The train phase runs depths 1, 3, then 5 sequentially. For recovery, rerun only
+the required phase; `--resume` preserves existing feature records, resumes an
+unfinished checkpoint, and skips a depth whose `.complete` marker exists:
 
 ```bash
 bash train_qwen25vl_msd_depth_sweep.sh --phase data
-bash train_qwen25vl_msd_depth_sweep.sh --phase capture
+bash train_qwen25vl_msd_depth_sweep.sh --phase capture --resume
 bash train_qwen25vl_msd_depth_sweep.sh --phase train --resume
 ```
 
@@ -143,8 +153,8 @@ The immutable text and visual feature caches are shared across all depths.
 Generated configs and checkpoints remain isolated:
 
 ```text
-outputs/qwen25vl-3b-msd/generated/depth{1,3,5}/
-outputs/qwen25vl-3b-msd/depth{1,3,5}/output/
+/workspace/storage-shared/nlp/tungdd11/tungdecoder/artifacts/qwen25vl_msd_68k/generated/depth{1,3,5}/
+/workspace/storage-shared/nlp/tungdd11/tungdecoder/artifacts/qwen25vl_msd_68k/outputs/depth{1,3,5}/output/
 ```
 
 Each raw MSD feature record contains `input_ids`, `loss_mask`, the target final
@@ -153,9 +163,8 @@ explicit visual-token mask, and Qwen2.5-VL three-axis position IDs. Resume
 metadata records the depth, objective weights, noise width, target dimensions,
 curriculum seed, and curriculum formula version.
 
-The current implementation has been verified only with static/config tests and
-a tiny CPU forward/backward step (verification rung R2). It has not downloaded
-the 68k datasets or target weights, run a CUDA capture, completed 40 epochs, or
+This automated launcher is verified at static/config rung R1 only. It has not
+read the server-side 68k datasets, run CUDA capture, completed 40 epochs, or
 reproduced the paper's acceptance/speed results. Perform a tiny real-cache
 overfit and GPU capture smoke test before launching the full sweep.
 
