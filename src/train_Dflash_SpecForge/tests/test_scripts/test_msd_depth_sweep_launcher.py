@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
+import subprocess
 
 import pytest
 import yaml
@@ -15,6 +17,21 @@ LAUNCHER = ROOT / "train_qwen25vl_msd_depth_sweep.sh"
 MATERIALIZER = ROOT / "scripts" / "materialize_msd_sweep.py"
 BASE_DRAFT = ROOT / "configs" / "qwen2.5-vl-3b-msd.json"
 BASE_RECIPE = ROOT / "examples" / "configs" / "qwen2.5-vl-3b-msd-68k-offline.yaml"
+SHARED_ROOT = "/workspace/storage-shared/nlp/tungdd11/tungdecoder"
+BASH = r"C:\Program Files\Git\bin\bash.exe" if os.name == "nt" else "bash"
+
+
+def run_launcher(*args: str, env: dict[str, str] | None = None):
+    process_env = {**os.environ}
+    if env:
+        process_env.update(env)
+    return subprocess.run(
+        [BASH, LAUNCHER.as_posix(), *args],
+        env=process_env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
 
 
 def _module():
@@ -33,12 +50,32 @@ def test_msd_launcher_declares_exact_static_sweep_contract() -> None:
         "TOTAL_EPOCHS=40",
         "GLOBAL_BATCH_SIZE=4",
         "LEARNING_RATE=5e-5",
-        "SHAREGPT_JSONL=${SHAREGPT_JSONL-/data/msd/manifests/sharegpt_train.jsonl}",
+        "SHARED_STORAGE_ROOT=${SPECFORGE_SHARED_STORAGE_ROOT:-/workspace/storage-shared/nlp/tungdd11/tungdecoder}",
+        "SHAREGPT_JSONL=${SHAREGPT_JSONL:-\"$ARTIFACT_ROOT/manifests/sharegpt_train.jsonl\"}",
         "--phase",
         "--resume",
         "--print-config",
     ):
         assert expected in text
+
+
+def test_msd_launcher_prints_shared_storage_defaults() -> None:
+    result = run_launcher("--print-config")
+
+    assert result.returncode == 0, result.stderr
+    assert f"TARGET_MODEL_PATH={SHARED_ROOT}/models/qwen25-vl-3b" in result.stdout
+    assert (
+        f"SHAREGPT_SOURCE={SHARED_ROOT}/ShareGPT/"
+        "ShareGPT_V3_unfiltered_cleaned_split.json" in result.stdout
+    )
+    assert (
+        f"LLAVA_SOURCE_JSONL={SHARED_ROOT}/data/"
+        "llava_dflash_qwen25vl3b_68k/llava_dflash_68k_clean_3b.jsonl"
+        in result.stdout
+    )
+    assert f"IMAGE_ROOT={SHARED_ROOT}/LlaVA-Pretrain" in result.stdout
+    assert "DEPTHS=1,3,5" in result.stdout
+    assert "TOTAL_EPOCHS=40" in result.stdout
 
 
 def test_msd_materializer_creates_isolated_depth_configs(tmp_path: Path) -> None:
