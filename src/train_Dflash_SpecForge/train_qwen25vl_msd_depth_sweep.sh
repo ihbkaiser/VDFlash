@@ -2,6 +2,7 @@
 set -euo pipefail
 
 SPECFORGE_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+export PYTHONPATH="$SPECFORGE_DIR${PYTHONPATH:+:$PYTHONPATH}"
 PYTHON_BIN=${PYTHON_BIN:-python3}
 
 DEPTHS=1,3,5
