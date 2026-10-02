@@ -96,6 +96,31 @@ def test_msd_qwen_hook_captures_post_vision_language_embeddings() -> None:
     torch.testing.assert_close(actual, expected)
 
 
+def test_msd_qwen_hook_supports_sglang_0514_model_layout() -> None:
+    class LanguageModel(nn.Module):
+        def forward(self, input_ids=None, input_embeds=None):
+            del input_ids
+            return input_embeds
+
+    class Model:
+        config = type("Config", (), {"model_type": "qwen2_5_vl"})()
+        capture_aux_hidden_states = False
+
+        def __init__(self):
+            self.model = LanguageModel()
+
+    model = Model()
+    assert configure_capture_layers(model, [3], capture_method="msd") == (
+        "qwen2_5_vl_msd"
+    )
+    expected = torch.randn(5, 8)
+    model.model(input_embeds=expected)
+
+    actual = model._specforge_msd_input_capture.consume(5)
+
+    torch.testing.assert_close(actual, expected)
+
+
 def test_msd_capture_batch_synthesizes_text_mrope_and_carries_visual_mask() -> None:
     class Backend:
         def set_capture_layers(self, layer_ids, *, capture_method):
