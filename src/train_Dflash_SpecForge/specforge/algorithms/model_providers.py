@@ -199,6 +199,7 @@ def build_msd_model(
     _target_config: Any,
     _tokenizer: Any,
 ) -> AlgorithmModelParts:
+    from specforge.algorithms.msd.model import MSDTrainingModel
     from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 
     target = TargetEmbeddingsAndHead.from_pretrained(
@@ -218,7 +219,10 @@ def build_msd_model(
         draft_model.embed_tokens.weight.copy_(target.embed_tokens.weight)
     draft_model.embed_tokens.weight.requires_grad_(False)
     target.lm_head.requires_grad_(False)
-    return AlgorithmModelParts(model=draft_model, target_head=target.lm_head)
+    return AlgorithmModelParts(
+        model=MSDTrainingModel(draft_model),
+        target_head=target.lm_head,
+    )
 
 
 def build_dflash_draft(

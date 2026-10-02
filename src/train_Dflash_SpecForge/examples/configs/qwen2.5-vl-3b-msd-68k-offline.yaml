@@ -4,7 +4,7 @@ model:
   draft_num_hidden_layers: 1
   target_backend: sglang
   input_modality: multimodal
-  embedding_key: model.language_model.embed_tokens.weight
+  embedding_key: model.embed_tokens.weight
   lm_head_key: lm_head.weight
   torch_dtype: bfloat16
 

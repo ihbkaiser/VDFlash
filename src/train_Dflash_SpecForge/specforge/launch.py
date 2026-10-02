@@ -690,9 +690,6 @@ def build_offline_runtime(
             "offline_sampler_version": 1,
             "sampler_seed": seed,
             "source_dataset_size": len(source_refs),
-            "msd_curriculum_seed": (
-                msd_curriculum_seed if algorithm.name == "msd" else None
-            ),
         },
         max_checkpoints=max_checkpoints,
         tp_size=tp_size,

@@ -16,6 +16,8 @@ GPU_COUNT=${SPECFORGE_GPUS:-4}
 MICRO_BATCH_SIZE=${SPECFORGE_MICRO_BATCH_SIZE:-1}
 EXPECTED_RECORDS=${SPECFORGE_NUM_SAMPLES:-68000}
 MAX_LENGTH=${SPECFORGE_MAX_LENGTH:-2048}
+SGLANG_ATTENTION_BACKEND=${SPECFORGE_SGLANG_ATTENTION_BACKEND:-triton}
+SGLANG_MEM_FRACTION_STATIC=${SPECFORGE_SGLANG_MEM_FRACTION_STATIC:-0.65}
 PHASE=all
 RESUME=0
 PRINT_CONFIG=0
@@ -66,7 +68,6 @@ if ((GPU_COUNT < 1 || MICRO_BATCH_SIZE < 1 || GLOBAL_BATCH_SIZE < 1 || EXPECTED_
   echo "GPU, batch, sample, and sequence sizes must be positive" >&2
   exit 2
 fi
-
 IFS=',' read -r -a DEPTH_ARRAY <<< "$DEPTHS"
 declare -A SEEN_DEPTHS=()
 for depth in "${DEPTH_ARRAY[@]}"; do
@@ -102,6 +103,8 @@ print_config() {
   echo "GLOBAL_BATCH_SIZE=$GLOBAL_BATCH_SIZE"
   echo "ACCUMULATION_STEPS=$ACCUMULATION_STEPS"
   echo "LEARNING_RATE=$LEARNING_RATE"
+  echo "SGLANG_ATTENTION_BACKEND=$SGLANG_ATTENTION_BACKEND"
+  echo "SGLANG_MEM_FRACTION_STATIC=$SGLANG_MEM_FRACTION_STATIC"
   echo "TEXT_FEATURE_ROOT=$TEXT_FEATURE_ROOT"
   echo "VISUAL_FEATURE_ROOT=$VISUAL_FEATURE_ROOT"
   echo "OUTPUT_ROOT=$OUTPUT_ROOT"
@@ -115,6 +118,10 @@ if ((PRINT_CONFIG)); then print_config; exit 0; fi
 for command in "$PYTHON_BIN"; do
   command -v "$command" >/dev/null 2>&1 || { echo "missing command: $command" >&2; exit 2; }
 done
+if ! "$PYTHON_BIN" -c 'import sys; value=float(sys.argv[1]); raise SystemExit(0 if 0 < value <= 1 else 1)' "$SGLANG_MEM_FRACTION_STATIC"; then
+  echo "SPECFORGE_SGLANG_MEM_FRACTION_STATIC must be in (0, 1]" >&2
+  exit 2
+fi
 
 require_jsonl_count() {
   local label=$1 path=$2 expected=$3 count
@@ -169,13 +176,17 @@ if [[ "$PHASE" == capture || "$PHASE" == all ]]; then
     --strategy msd --target-model-path "$TARGET_MODEL_PATH" \
     --draft-model-config "$SPECFORGE_DIR/configs/qwen2.5-vl-3b-msd.json" \
     --data-path "$SHAREGPT_JSONL" --output-path "$TEXT_FEATURE_ROOT" \
-    --chat-template qwen --max-length "$MAX_LENGTH" --num-samples "$EXPECTED_RECORDS"
+    --chat-template qwen --max-length "$MAX_LENGTH" --num-samples "$EXPECTED_RECORDS" \
+    --sglang-attention-backend "$SGLANG_ATTENTION_BACKEND" \
+    --sglang-mem-fraction-static "$SGLANG_MEM_FRACTION_STATIC"
   "$TORCHRUN_BIN" --standalone --nproc_per_node="$GPU_COUNT" "$SPECFORGE_DIR/scripts/prepare_llava_caption_hidden_states.py" \
     --strategy msd --target-model-path "$TARGET_MODEL_PATH" \
     --draft-model-config "$SPECFORGE_DIR/configs/qwen2.5-vl-3b-msd.json" \
     --manifest "$LLAVA_MANIFEST" --image-root "$IMAGE_ROOT" \
     --output-path "$VISUAL_FEATURE_ROOT" --max-length "$MAX_LENGTH" \
-    --expected-records "$EXPECTED_RECORDS"
+    --expected-records "$EXPECTED_RECORDS" \
+    --sglang-attention-backend "$SGLANG_ATTENTION_BACKEND" \
+    --sglang-mem-fraction-static "$SGLANG_MEM_FRACTION_STATIC"
 fi
 
 if [[ "$PHASE" == train || "$PHASE" == all ]]; then
