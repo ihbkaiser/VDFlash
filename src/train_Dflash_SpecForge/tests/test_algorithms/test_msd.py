@@ -45,6 +45,14 @@ def test_msd_40_epoch_ratio_matches_reference_boundaries(
     assert visual_ratio_for_epoch(epoch_now, 40) == pytest.approx(expected)
 
 
+def test_msd_ratio_matches_literal_reference_for_every_epoch() -> None:
+    expected = [0.0] * 20 + [step / 20 for step in range(1, 20)] + [1.0]
+
+    assert [visual_ratio_for_epoch(epoch, 40) for epoch in range(1, 41)] == (
+        pytest.approx(expected)
+    )
+
+
 @pytest.mark.parametrize(
     ("epoch_now", "total_epoch"),
     [(0, 40), (41, 40), (1, 0), (1, 39)],
@@ -66,6 +74,18 @@ def test_msd_choice_is_stateless_and_resume_stable() -> None:
     assert first[50:] == resumed
     assert any(first)
     assert not all(first)
+
+
+def test_msd_choice_is_independent_of_worker_iteration_order() -> None:
+    indices = [7, 1, 31, 4, 19, 0, 12]
+    reordered = {
+        index: choose_visual_sample(13, 29, index, 40) for index in indices
+    }
+    canonical = {
+        index: choose_visual_sample(13, 29, index, 40) for index in sorted(indices)
+    }
+
+    assert reordered == canonical
 
 
 def test_msd_choice_obeys_pure_text_and_pure_visual_epochs() -> None:

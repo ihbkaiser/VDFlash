@@ -32,6 +32,18 @@ def test_msd_supports_exact_depth_sweep(depth: int) -> None:
     assert not hasattr(model, "norm")
 
 
+def test_msd_depth_is_the_only_capacity_variable() -> None:
+    models = [MSDDraftModel(tiny_config(depth)) for depth in (1, 3, 5)]
+    trainable_counts = [
+        sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+        for model in models
+    ]
+
+    assert trainable_counts[0] < trainable_counts[1] < trainable_counts[2]
+    assert all(model.config.hidden_size == 32 for model in models)
+    assert all(model.config.intermediate_size == 64 for model in models)
+
+
 @pytest.mark.parametrize("depth", [0, 2, 4, 6])
 def test_msd_rejects_depths_outside_replication_sweep(depth: int) -> None:
     with pytest.raises(ValueError, match="1, 3, or 5"):
@@ -91,6 +103,25 @@ def test_msd_forward_accepts_qwen25vl_three_axis_positions_and_backpropagates() 
     assert model.fusion_projection.weight.grad is not None
     assert model.layers[0].self_attn.q_proj.weight.grad is not None
     assert model.embed_tokens.weight.grad is None
+
+
+def test_msd_forward_accepts_two_axis_text_positions_and_is_deterministic() -> None:
+    model = MSDDraftModel(tiny_config(1)).eval()
+    batch, length, hidden_size = 2, 4, 32
+    kwargs = {
+        "conditioning_hidden_state": torch.randn(batch, length, hidden_size),
+        "next_token_embeddings": torch.randn(batch, length, hidden_size),
+        "visual_embeddings": torch.zeros(batch, length, hidden_size),
+        "visual_token_mask": torch.zeros(batch, length, dtype=torch.bool),
+        "attention_mask": torch.ones(batch, length, dtype=torch.bool),
+        "position_ids": torch.arange(length).expand(batch, -1),
+    }
+
+    with torch.no_grad():
+        first = model(**kwargs)
+        second = model(**kwargs)
+
+    torch.testing.assert_close(first, second)
 
 
 def test_msd_config_matches_qwen25vl_3b_replication_shape() -> None:
