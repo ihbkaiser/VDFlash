@@ -181,19 +181,35 @@ if [[ "$PHASE" == train || "$PHASE" == all ]]; then
   [[ -d "$TEXT_FEATURE_ROOT" ]] || { echo "missing text feature root" >&2; exit 2; }
   [[ -d "$VISUAL_FEATURE_ROOT" ]] || { echo "missing visual feature root" >&2; exit 2; }
   for depth in "${DEPTH_ARRAY[@]}"; do
-    "$PYTHON_BIN" scripts/materialize_msd_sweep.py \
-      --base-draft configs/qwen2.5-vl-3b-msd.json \
-      --base-recipe examples/configs/qwen2.5-vl-3b-msd-68k-offline.yaml \
+    depth_root="$OUTPUT_ROOT/depth${depth}"
+    output="$depth_root/output"
+    complete_marker="$depth_root/.complete"
+    config="$GENERATED_ROOT/depth${depth}/train.yaml"
+
+    if ((RESUME)) && [[ -f "$complete_marker" ]]; then
+      echo "[train:depth${depth}] complete; skipping"
+      continue
+    fi
+    if ((!RESUME)) && [[ -d "$output" ]] && [[ -n "$(find "$output" -mindepth 1 -print -quit)" ]]; then
+      echo "depth${depth} output already exists at $output; pass --resume" >&2
+      exit 1
+    fi
+
+    "$PYTHON_BIN" "$SPECFORGE_DIR/scripts/materialize_msd_sweep.py" \
+      --base-draft "$SPECFORGE_DIR/configs/qwen2.5-vl-3b-msd.json" \
+      --base-recipe "$SPECFORGE_DIR/examples/configs/qwen2.5-vl-3b-msd-68k-offline.yaml" \
       --generated-root "$GENERATED_ROOT" --output-root "$OUTPUT_ROOT" \
       --depth "$depth" --target-model-path "$TARGET_MODEL_PATH" \
       --text-feature-root "$TEXT_FEATURE_ROOT" \
       --visual-feature-root "$VISUAL_FEATURE_ROOT" \
       --learning-rate "$LEARNING_RATE" --micro-batch-size "$MICRO_BATCH_SIZE" \
       --accumulation-steps "$ACCUMULATION_STEPS" --gpu-count "$GPU_COUNT"
-    config="$GENERATED_ROOT/depth${depth}/train.yaml"
-    output="$OUTPUT_ROOT/depth${depth}/output"
     resume_args=()
-    if ((RESUME)); then resume_args+=("training.resume_from=$output"); fi
+    if ((RESUME)) && [[ -d "$output" ]]; then
+      resume_args+=("training.resume_from=$output")
+    fi
     "$PYTHON_BIN" -m specforge.cli train --config "$config" "${resume_args[@]}"
+    mkdir -p "$depth_root"
+    touch "$complete_marker"
   done
 fi

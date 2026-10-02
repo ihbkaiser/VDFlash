@@ -195,6 +195,64 @@ def test_msd_capture_resume_preserves_existing_features(tmp_path: Path) -> None:
     assert "scripts/prepare_llava_caption_hidden_states.py --strategy msd" in result.stdout
 
 
+def train_env(tmp_path: Path) -> dict[str, str]:
+    text_features = tmp_path / "text-features"
+    visual_features = tmp_path / "visual-features"
+    target = tmp_path / "target"
+    text_features.mkdir()
+    visual_features.mkdir()
+    target.mkdir()
+    return {
+        "TARGET_MODEL_PATH": target.as_posix(),
+        "TEXT_FEATURE_ROOT": text_features.as_posix(),
+        "VISUAL_FEATURE_ROOT": visual_features.as_posix(),
+        "OUTPUT_ROOT": (tmp_path / "outputs").as_posix(),
+        "GENERATED_ROOT": (tmp_path / "generated").as_posix(),
+        "PYTHON_BIN": "/bin/echo",
+        "SPECFORGE_GPUS": "1",
+        "SPECFORGE_GLOBAL_BATCH_SIZE": "1",
+    }
+
+
+def test_msd_train_runs_depths_in_order_and_marks_completion(tmp_path: Path) -> None:
+    result = run_launcher("--phase", "train", env=train_env(tmp_path))
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.index("--depth 1") < result.stdout.index("--depth 3")
+    assert result.stdout.index("--depth 3") < result.stdout.index("--depth 5")
+    for depth in (1, 3, 5):
+        assert f"generated/depth{depth}/train.yaml" in result.stdout
+        assert (tmp_path / "outputs" / f"depth{depth}" / ".complete").is_file()
+
+
+def test_msd_train_rejects_existing_unfinished_output_without_resume(
+    tmp_path: Path,
+) -> None:
+    env = train_env(tmp_path)
+    partial = tmp_path / "outputs" / "depth1" / "output"
+    partial.mkdir(parents=True)
+    (partial / "partial-file").touch()
+
+    result = run_launcher("--phase", "train", env=env)
+
+    assert result.returncode == 1
+    assert "pass --resume" in result.stderr
+
+
+def test_msd_train_resume_skips_completed_depth(tmp_path: Path) -> None:
+    env = train_env(tmp_path)
+    marker = tmp_path / "outputs" / "depth1" / ".complete"
+    marker.parent.mkdir(parents=True)
+    marker.touch()
+
+    result = run_launcher("--phase", "train", "--resume", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert "[train:depth1] complete; skipping" in result.stdout
+    assert "generated/depth3/train.yaml" in result.stdout
+    assert "generated/depth5/train.yaml" in result.stdout
+
+
 def test_msd_materializer_creates_isolated_depth_configs(tmp_path: Path) -> None:
     module = _module()
     outputs = []
