@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ from src.workspace import resolve_namespace_paths
 
 from .dataset import build_prompt_question, load_vdc_manifest, write_jsonl
 from .paper_contract import load_contract
+from .raw_trace import decode_token_ids, enrich_round_trace
 from .runtime import (
     RuntimeUnavailableError,
     build_qwen2vl_video_processor,
@@ -313,6 +315,8 @@ def run(args: argparse.Namespace) -> int:
             except Exception as exc:  # noqa: BLE001 - transient video/OOM errors
                 last_exc = exc
                 print(f"  ERROR {sample.sample_id} attempt {attempt}: {exc}", flush=True)
+                if os.environ.get("MSD_DEBUG_TRACEBACK") == "1":
+                    traceback.print_exc()
                 if attempt == 1:
                     time.sleep(5)
             finally:
@@ -388,10 +392,11 @@ def _run_job(
         # budget instead of letting the processor pick an unbounded
         # resolution that OOMs the T4 prefill.
         max_pixels = args.max_pixels
+    prompt_question = build_prompt_question(sample, args.prompt_variant)
     batch = process_video(
         processor,
         sample.resolved_path(args.dataset_root),
-        build_prompt_question(sample, args.prompt_variant),
+        prompt_question,
         fps,
         max_pixels=max_pixels,
         max_frames=args.max_frames,
@@ -402,6 +407,8 @@ def _run_job(
     if not parity["valid"]:
         raise RuntimeError(f"native prefill parity failed for {sample.sample_id}: {parity}")
     target_tokens, ar_prefill, ar_e2e = _target_reference(base_model, batch, prepared.input_ids.shape[1], args.max_new_tokens)
+    prompt_input_ids = prepared.input_ids[0].detach().to("cpu").tolist()
+    prompt_input_text = decode_token_ids(processor, prompt_input_ids)
     rows: list[dict[str, Any]] = []
     conditions = ["full"] if args.condition == "full" else ["retention"] if args.condition == "retention" else ["full", "retention"]
     for condition in conditions:
@@ -473,6 +480,9 @@ def _run_job(
                 "series_id": length_series if paper_figure == "Figure 1(a)" else f"vdc_{args.selection}",
                 "sample_id": sample.sample_id,
                 "prompt_variant": args.prompt_variant,
+                "prompt_question": prompt_question,
+                "prompt_input_ids": prompt_input_ids,
+                "prompt_input_text": prompt_input_text,
                 "visual_value_mode": args.visual_value_mode,
                 "target_model": args.base_model,
                 "temperature": 0.0,
@@ -523,6 +533,18 @@ def _run_job(
                 "max_pixels": max_pixels,
                 "max_frames": args.max_frames,
             }
+            decode_token = lambda token_id: decode_token_ids(processor, [int(token_id)])
+            row["target_output_text"] = decode_token_ids(processor, target_tokens)
+            row["speculative_output_text"] = decode_token_ids(processor, speculative_tokens)
+            enriched_trace = enrich_round_trace(
+                row["acceptance_by_position"],
+                target_tokens,
+                speculative_tokens,
+                decode_token,
+            )
+            row["acceptance_rounds"] = enriched_trace["rounds"]
+            row["acceptance_position_records"] = enriched_trace["positions"]
+            row["acceptance_by_position"] = enriched_trace["positions"]
             rows.append(row)
             if lossless:
                 print(f"  {condition} {percentage:g}% lossless: yes ({common}/{len(target_tokens)} tokens)", flush=True)

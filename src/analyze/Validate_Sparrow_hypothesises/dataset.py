@@ -33,6 +33,13 @@ class VideoSample:
     width: int | None = None
     height: int | None = None
     task: str | None = None
+    candidates: tuple[str, ...] = ()
+    correct_option: str | None = None
+    reference_answer: str | None = None
+    natural_question: str | None = None
+    dataset_format: str | None = None
+    distractor_provenance: tuple[dict[str, Any], ...] = ()
+    option_provenance: tuple[dict[str, Any], ...] = ()
 
     @property
     def sample_id(self) -> str:
@@ -51,7 +58,18 @@ def build_prompt_question(sample: Any, prompt_variant: str = "natural") -> str:
     """Return the controlled question variant used by prompt-ablation runs."""
 
     if prompt_variant == "natural":
-        return str(sample.question)
+        return str(getattr(sample, "natural_question", None) or sample.question)
+    if prompt_variant in {"mcq", "mcq2"}:
+        try:
+            row = asdict(sample)
+        except TypeError:
+            row = dict(vars(sample))
+        for key in ("question", "candidates", "answer", "correct_option"):
+            if key not in row and hasattr(sample, key):
+                row[key] = getattr(sample, key)
+        if prompt_variant == "mcq2":
+            return build_vdc_mcq2_prompt(row)
+        return build_vdc_mcq_prompt(row)
     if prompt_variant == "answer_hint":
         return (
             f"{sample.question}\n\n"
@@ -72,6 +90,25 @@ def build_mvbench_prompt(row: dict[str, Any]) -> str:
         for index, candidate in enumerate(candidates)
     )
     return f"Question:{question}\nOption:\n{options}Only give the best option.\n"
+
+
+def build_vdc_mcq_prompt(row: dict[str, Any]) -> str:
+    """Build the MVBench-compatible prompt for a derived VDC-MCQ row."""
+
+    return build_mvbench_prompt(row)
+
+
+def build_vdc_mcq2_prompt(row: dict[str, Any]) -> str:
+    """Build an answer-eliciting version of the VDC-MCQ prompt."""
+
+    instruction = (
+        "Begin with the selected option in the form (A), (B), (C), or (D). "
+        "Then answer the question directly in 1–2 complete sentences using "
+        "concise details visible in the video. Do not copy or restate an entire option, "
+        "and do not output only the option label."
+    )
+    base_prompt = build_mvbench_prompt(row)
+    return base_prompt.removesuffix("Only give the best option.\n") + instruction + "\n"
 
 
 @dataclass(frozen=True)
@@ -120,6 +157,17 @@ def load_vdc_manifest(path: str | Path, dataset_root: str | Path | None = None) 
             total_frames=int(row["total_frames"]) if row.get("total_frames") is not None else None,
             width=int(row["width"]) if row.get("width") is not None else None,
             height=int(row["height"]) if row.get("height") is not None else None,
+            candidates=tuple(str(value) for value in row.get("candidates", [])),
+            correct_option=(str(row["correct_option"]) if row.get("correct_option") is not None else None),
+            reference_answer=(
+                str(row["reference_answer"]) if row.get("reference_answer") is not None else None
+            ),
+            natural_question=(
+                str(row["natural_question"]) if row.get("natural_question") is not None else None
+            ),
+            dataset_format=(str(row["dataset_format"]) if row.get("dataset_format") is not None else None),
+            distractor_provenance=tuple(row.get("distractor_provenance", [])),
+            option_provenance=tuple(row.get("option_provenance", [])),
         )
         if sample.sample_id in seen:
             raise ValueError(f"Duplicate video_name in manifest: {sample.sample_id}")

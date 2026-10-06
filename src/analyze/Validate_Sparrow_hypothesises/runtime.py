@@ -73,9 +73,52 @@ def model_device(model: Any) -> torch.device:
     """
 
     try:
+        # For an explicit model-parallel Qwen2-VL map, inputs belong on the
+        # embedding device rather than whichever submodule happens to be
+        # registered first (often the vision tower).
+        embed_tokens = getattr(getattr(model, "model", None), "embed_tokens", None)
+        if embed_tokens is not None:
+            return next(embed_tokens.parameters()).device
         return next(model.parameters()).device
     except StopIteration as exc:  # pragma: no cover - malformed external model
         raise RuntimeUnavailableError("model has no parameters") from exc
+
+
+def align_msd_draft_inputs(
+    hidden_states: torch.Tensor,
+    draft_input_ids: torch.Tensor,
+    token: torch.Tensor,
+    device: torch.device | str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Align MSD EAGLE inputs when the target decoder is model-parallel."""
+
+    return (
+        hidden_states.to(device),
+        draft_input_ids.to(device),
+        token.to(device),
+    )
+
+
+def msd_eagle_device(model: Any) -> torch.device:
+    """Return the device shared by MSD's draft embedding and target LM head."""
+
+    base_model = getattr(model, "base_model", model)
+    embed_tokens = getattr(getattr(base_model, "model", None), "embed_tokens", None)
+    if embed_tokens is not None:
+        try:
+            return next(embed_tokens.parameters()).device
+        except StopIteration:
+            pass
+    return model_device(base_model)
+
+
+def place_msd_eagle(model: Any) -> torch.device:
+    """Place MSD's draft module and rebuild its non-registered tree tensors."""
+
+    device = msd_eagle_device(model)
+    model.ea_layer.to(device)
+    model.ea_layer.init_tree()
+    return device
 
 
 def acceptance_round_record(
@@ -217,27 +260,40 @@ def prepare_qwen2vl_prefill(model: Any, batch: Any, device: torch.device | str |
     pixel_values_videos = _tensor(batch, "pixel_values_videos")
     pixel_values = _tensor(batch, "pixel_values")
 
+    visual_device = device
+    visual_module = getattr(model, "visual", None)
+    if visual_module is not None:
+        try:
+            visual_device = next(visual_module.parameters()).device
+        except StopIteration:
+            pass
     with torch.inference_mode():
         inputs_embeds = model.model.embed_tokens(input_ids)
         if pixel_values is not None:
-            image_values = pixel_values.to(dtype=model.visual.get_dtype())
-            image_embeds = model.visual(image_values, grid_thw=image_grid_thw)
+            image_values = pixel_values.to(device=visual_device, dtype=model.visual.get_dtype())
+            image_grid = image_grid_thw.to(visual_device) if image_grid_thw is not None else None
+            image_embeds = model.visual(image_values, grid_thw=image_grid)
             image_mask = (input_ids == model.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
             if int(image_mask[..., 0].sum()) != image_embeds.shape[0]:
                 raise ValueError("image token/features mismatch during native prefill")
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds.to(inputs_embeds.dtype))
+            inputs_embeds = inputs_embeds.masked_scatter(
+                image_mask, image_embeds.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+            )
         if pixel_values_videos is None:
             raise ValueError("video experiment requires processor key pixel_values_videos")
         if int(os.environ.get("VIDEO_DFLASH_DEBUG", "0")):
             print(f"[debug] grid={video_grid_thw.tolist() if video_grid_thw is not None else None} "
                   f"video_ids={(input_ids[0] == int(getattr(model.config, 'video_token_id'))).sum().item()}", flush=True)
-        video_values = pixel_values_videos.to(dtype=model.visual.get_dtype())
-        video_embeds = model.visual(video_values, grid_thw=video_grid_thw)
+        video_values = pixel_values_videos.to(device=visual_device, dtype=model.visual.get_dtype())
+        video_grid = video_grid_thw.to(visual_device) if video_grid_thw is not None else None
+        video_embeds = model.visual(video_values, grid_thw=video_grid)
         video_token_id = int(getattr(model.config, "video_token_id"))
         video_mask = (input_ids == video_token_id).unsqueeze(-1).expand_as(inputs_embeds)
         if int(video_mask[..., 0].sum()) != video_embeds.shape[0]:
             raise ValueError("video token/features mismatch during native prefill")
-        inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds.to(inputs_embeds.dtype))
+        inputs_embeds = inputs_embeds.masked_scatter(
+            video_mask, video_embeds.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+        )
         position_ids, rope_deltas = model.get_rope_index(input_ids, image_grid_thw, video_grid_thw, attention_mask)
 
     video_positions = (input_ids[0] == video_token_id).nonzero(as_tuple=False).flatten()
@@ -867,6 +923,8 @@ def _model_parallel_device_map(base_model_path: str) -> dict[str, int]:
 
     config = AutoConfig.from_pretrained(base_model_path, trust_remote_code=True)
     layer_count = int(config.num_hidden_layers)
+    visual_device = int(os.environ.get("MSD_MODEL_PARALLEL_VISUAL_DEVICE", "0"))
+    split_layer = os.environ.get("MSD_MODEL_PARALLEL_SPLIT_LAYER")
     prefix = min(
         int(os.environ.get("MSD_MODEL_PARALLEL_PREFIX_LAYERS", "3")),
         max(1, layer_count - 1),
@@ -876,17 +934,91 @@ def _model_parallel_device_map(base_model_path: str) -> dict[str, int]:
         max(1, layer_count - prefix),
     )
     mapping: dict[str, int] = {
-        "visual": 0,
+        "visual": visual_device,
         "model.embed_tokens": 0,
         "model.norm": 0,
         "model.rotary_emb": 0,
         "lm_head": 0,
     }
     for index in range(layer_count):
-        mapping[f"model.layers.{index}"] = (
-            0 if index < prefix or index >= layer_count - suffix else 1
-        )
+        if split_layer is not None:
+            split = max(0, min(layer_count, int(split_layer)))
+            mapping[f"model.layers.{index}"] = 0 if index < split else 1
+        else:
+            mapping[f"model.layers.{index}"] = (
+                0 if index < prefix or index >= layer_count - suffix else 1
+            )
     return mapping
+
+
+def _move_parallel_argument(value: Any, device: torch.device) -> Any:
+    """Move tensor-valued decoder arguments while preserving container shape."""
+
+    if isinstance(value, torch.Tensor):
+        return value.to(device)
+    if isinstance(value, tuple):
+        return tuple(_move_parallel_argument(item, device) for item in value)
+    if isinstance(value, list):
+        return [_move_parallel_argument(item, device) for item in value]
+    return value
+
+
+def install_msd_model_parallel_transfer_hooks(base_model: Any) -> None:
+    """Align non-positional decoder arguments with sharded Qwen2-VL layers.
+
+    Accelerate moves the positional hidden-state argument when a decoder layer
+    is placed on another GPU, but it does not move auxiliary tensors passed as
+    keyword arguments.  Qwen2-VL's attention then receives a mask or RoPE
+    tensor from GPU0 alongside queries from GPU1 and fails inside CUDA BMM.
+    Keep the custom MSD model intact and wrap each decoder layer so all tensor
+    arguments used by that layer share its device.  The hook is a no-op for a
+    single-device map.
+    """
+
+    qwen_model = getattr(base_model, "model", base_model)
+    layers = getattr(qwen_model, "layers", None)
+    if layers is None:
+        return
+    for layer in layers:
+        if getattr(layer, "_vdflash_parallel_transfer_hook", False):
+            continue
+        try:
+            layer_device = next(layer.parameters()).device
+        except StopIteration:
+            continue
+        original = getattr(layer, "_old_forward", None) or layer.forward
+
+        def wrapped(
+            hidden_states: torch.Tensor,
+            attention_mask: Any = None,
+            position_ids: Any = None,
+            past_key_value: Any = None,
+            cache_position: Any = None,
+            position_embeddings: Any = None,
+            *,
+            _original=original,
+            _device=layer_device,
+            **kwargs: Any,
+        ):
+            moved_kwargs = {
+                key: _move_parallel_argument(value, _device)
+                for key, value in kwargs.items()
+            }
+            return _original(
+                _move_parallel_argument(hidden_states, _device),
+                attention_mask=_move_parallel_argument(attention_mask, _device),
+                position_ids=_move_parallel_argument(position_ids, _device),
+                past_key_value=past_key_value,
+                cache_position=_move_parallel_argument(cache_position, _device),
+                position_embeddings=_move_parallel_argument(position_embeddings, _device),
+                **moved_kwargs,
+            )
+
+        if hasattr(layer, "_old_forward"):
+            layer._old_forward = wrapped
+        else:
+            layer.forward = wrapped
+        layer._vdflash_parallel_transfer_hook = True
 
 
 def load_msd_qwen2vl(
@@ -938,8 +1070,20 @@ def load_msd_qwen2vl(
     # torch.utils.checkpoint branch whose custom_forward drops use_cache and
     # returns a single-element tuple. eval() disables that branch.
     result.eval()
+    # EaModel initially places the draft on ``base_model.device``.  With a
+    # vision-on-GPU1 map that property can point at the vision tower, while
+    # draft embeddings and lm_head remain on GPU0.  Keep the EAGLE path on the
+    # embedding device so its input IDs, hidden states and head agree.
+    place_msd_eagle(result)
+    # ``init_tree`` stores plain tensor attributes (not registered buffers), so
+    # moving the module does not relocate the tree mask/position tensors that
+    # are created during EaModel construction.  Rebuild them after the final
+    # EAGLE device is known; otherwise a split decoder leaves RoPE inputs on
+    # the old last-layer device and fails in CUDA BMM.
+    result.ea_layer.init_tree()
     apply_msd_memory_patches()
     refresh_msd_memory_patch_hooks(result.base_model)
+    install_msd_model_parallel_transfer_hooks(result.base_model)
     vision_chunk_frames = int(os.environ.get("MSD_VISION_CHUNK_FRAMES", "8"))
     apply_chunked_video_vision(result.base_model, vision_chunk_frames)
     return result
@@ -1261,7 +1405,17 @@ def generate_msd_retention_video(
             keep_gpu = keep.to(device=hidden_states.device)
             compact_hidden = hidden_states[:, keep_gpu]
             draft_input_ids = prepared_draft.input_ids
-            extended_compact_ids = torch.cat((draft_input_ids, token.to(draft_input_ids.device)), dim=1)
+            try:
+                eagle_device = next(model.ea_layer.parameters()).device
+            except StopIteration:
+                eagle_device = draft_input_ids.device
+            compact_hidden, draft_input_ids, token = align_msd_draft_inputs(
+                compact_hidden,
+                draft_input_ids,
+                token,
+                eagle_device,
+            )
+            extended_compact_ids = torch.cat((draft_input_ids, token), dim=1)
 
         # Rebuild calls from update_inference_inputs pass the *full* growing
         # input_ids, but the draft's cached KV is the compacted one.  Remap

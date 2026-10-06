@@ -8,6 +8,7 @@ import torch
 import pytest
 
 from src.analyze.Validate_Sparrow_hypothesises.run_dflash_h21_h31 import (
+    _condition_specs,
     acceptance_by_position,
     build_prompt_regions,
     build_prompt_record,
@@ -76,6 +77,24 @@ def test_build_prompt_record_only_changes_question_variant():
     assert record["local_video_path"] == "v0.mp4"
     assert record["answer"] == "A person waves."
     assert record["question"].endswith("Reference information (oracle hint): A person waves.")
+
+
+def test_h21_uses_full_zero_cut_and_mcq_prompt_variant():
+    sample = SimpleNamespace(
+        video_name="v0",
+        question="Which description best matches the video?",
+        natural_question="Please describe the video.",
+        answer="A person waves.",
+        local_video_path="v0.mp4",
+        candidates=("A person waves.", "A person runs.", "A person sits.", "A person sleeps."),
+    )
+
+    record = build_prompt_record(sample, "mcq")
+    conditions = _condition_specs("h2_1")
+
+    assert [item["visual_condition"] for item in conditions] == ["full", "zero", "cut"]
+    assert record["question"].startswith("Question:Which description")
+    assert "(A) A person waves." in record["question"]
 
 
 def test_visual_keep_mask_retains_text_and_deterministic_visual_prefix():

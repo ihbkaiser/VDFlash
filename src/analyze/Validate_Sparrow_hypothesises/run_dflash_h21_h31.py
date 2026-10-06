@@ -36,6 +36,10 @@ from src.analyze.Validate_Sparrow_hypothesises.dflash_runtime import (
     find_visual_positions,
     input_fingerprint,
 )
+from src.analyze.Validate_Sparrow_hypothesises.raw_trace import (
+    decode_token_ids,
+    enrich_position_trace,
+)
 from src.analyze.Validate_Sparrow_hypothesises.run_dflash_experiments import (
     _calibration_settings,
     _prepare_prompt,
@@ -373,7 +377,7 @@ def _load_records(
 ) -> list[dict[str, Any]]:
     from src.analyze.Validate_Sparrow_hypothesises.run_dflash_experiments import _sample_record
 
-    if dataset == "vdc":
+    if dataset in {"vdc", "vdc_mcq"}:
         samples = load_vdc_manifest(manifest, video_root)
     elif dataset == "mvbench":
         samples = load_mvbench_manifest(manifest, video_root)
@@ -394,10 +398,19 @@ def _load_records(
             record["candidates"] = list(raw["candidates"])
             record["dataset_format"] = "mvbench"
             record["task"] = str(raw.get("task", ""))
+    elif dataset == "vdc_mcq":
+        for record in records:
+            record["dataset_format"] = "vdc_mcq"
     return records
 
 
 def _condition_specs(experiment: str) -> list[dict[str, Any]]:
+    if experiment == "h2_1":
+        return [
+            {"visual_condition": "full", "retention_percentage": 100.0},
+            {"visual_condition": "zero", "retention_percentage": 0.0},
+            {"visual_condition": "cut", "retention_percentage": 0.0},
+        ]
     if experiment == "e7":
         return [
             {"visual_condition": "full", "retention_percentage": 100.0},
@@ -440,10 +453,16 @@ def _run_one(
             "video_path": sample_record.get("local_video_path"),
             "candidates": sample_record.get("candidates"),
             "dataset_format": args.dataset,
+            "correct_option": sample_record.get("correct_option"),
+            "reference_answer": sample_record.get(
+                "reference_answer", sample_record.get("answer")
+            ),
+            "option_provenance": sample_record.get("option_provenance", []),
+            "distractor_provenance": sample_record.get("distractor_provenance", []),
         }
     )
     prompt_record["calibration_by_target"] = sample_record.get("calibration_by_target", {})
-    if args.dataset == "vdc":
+    if args.dataset in {"vdc", "vdc_mcq"}:
         prompt, visual_positions, fingerprint, settings = _prepare_prompt(
             processor=processor,
             target=target,
@@ -498,7 +517,7 @@ def _run_one(
     if visual_condition == "full":
         keep_mask = torch.ones(sequence_length, dtype=torch.bool)
 
-    capture_attention = bool(args.experiment == "e7" or args.capture_attention)
+    capture_attention = bool(args.experiment in {"e7", "h2_1"} or args.capture_attention)
     old_attention = getattr(getattr(draft, "config", None), "_attn_implementation", None)
     if capture_attention and getattr(draft, "config", None) is not None:
         draft.config._attn_implementation = "eager"
@@ -540,6 +559,8 @@ def _run_one(
         "experiment": (
             "e7_h21"
             if args.experiment == "e7"
+            else "h2_1_vdc_mcq"
+            if args.experiment == "h2_1"
             else "h3_1_position"
             if args.experiment == "h3_1"
             else "h3_2_depth_comparison"
@@ -552,12 +573,28 @@ def _run_one(
         "target_model": args.target_model,
         "draft_checkpoint": str(args.checkpoint),
         "draft_config": str(args.draft_config),
+        "max_new_tokens": int(args.max_new_tokens),
         "sample_id": str(sample_record["sample_id"]),
         "prompt_variant": prompt_variant,
+        "prompt_question": prompt_record.get("question"),
+        "prompt_input_ids": [
+            int(value) for value in prompt.inputs["input_ids"][0].detach().cpu().tolist()
+        ],
+        "prompt_input_text": decode_token_ids(
+            processor,
+            [int(value) for value in prompt.inputs["input_ids"][0].detach().cpu().tolist()],
+        ),
+        "correct_option": sample_record.get("correct_option"),
+        "candidates": sample_record.get("candidates", []),
+        "reference_answer": sample_record.get(
+            "reference_answer", sample_record.get("answer")
+        ),
+        "option_provenance": sample_record.get("option_provenance", []),
+        "distractor_provenance": sample_record.get("distractor_provenance", []),
         "visual_condition": visual_condition,
         "retention_percentage": retention,
         "target_visual_tokens": (
-            int(args.target_visual_tokens) if args.dataset == "vdc" else None
+            int(args.target_visual_tokens) if args.dataset in {"vdc", "vdc_mcq"} else None
         ),
         "actual_visual_tokens": len(visual_positions),
         "draft_context_visual_tokens": len(mapped_regions["visual"]),
@@ -597,6 +634,44 @@ def _run_one(
         "status": "ok",
     }
     metrics = result.get("metrics", {})
+    decode_token = lambda token_id: decode_token_ids(processor, [int(token_id)])
+    row["target_output_text"] = decode_token_ids(processor, target_tokens)
+    row["speculative_output_text"] = decode_token_ids(processor, speculative_tokens)
+    row["acceptance_by_position"] = enrich_position_trace(
+        row["acceptance_by_position"],
+        target_tokens,
+        speculative_tokens,
+        decode_token,
+    )
+    enriched_rounds = []
+    for round_record in row["acceptance_rounds"]:
+        positions = [int(value) for value in round_record.get("proposal_positions", [])]
+        enriched_rounds.append(
+            {
+                **round_record,
+                "proposal_token_ids": [
+                    speculative_tokens[position]
+                    for position in positions
+                    if 0 <= position < len(speculative_tokens)
+                ],
+                "proposal_token_text": [
+                    decode_token(speculative_tokens[position])
+                    for position in positions
+                    if 0 <= position < len(speculative_tokens)
+                ],
+                "target_token_ids": [
+                    target_tokens[position]
+                    for position in positions
+                    if 0 <= position < len(target_tokens)
+                ],
+                "target_token_text": [
+                    decode_token(target_tokens[position])
+                    for position in positions
+                    if 0 <= position < len(target_tokens)
+                ],
+            }
+        )
+    row["acceptance_rounds"] = enriched_rounds
     row["accepted_prefix_tokens"] = metrics.get("tau_proposal")
     row["accepted_effective_tokens"] = metrics.get("tau_effective")
     row["mean_accepted_proposals"] = metrics.get("mean_accepted_proposals")
@@ -644,11 +719,13 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     )
     output_files: dict[str, str] = {}
     try:
-        experiments = ("e7", "h3_1") if args.experiment == "all" else (args.experiment,)
+        experiments = ("e7", "h2_1", "h3_1") if args.experiment == "all" else (args.experiment,)
         for experiment in experiments:
             output_path = args.output_dir / (
                 "e7_dflash.jsonl"
                 if experiment == "e7"
+                else "h2_1_dflash.jsonl"
+                if experiment == "h2_1"
                 else "h3_1_dflash.jsonl"
                 if experiment == "h3_1"
                 else "h3_2_depth_dflash.jsonl"
@@ -659,6 +736,8 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                     existing.add(str(row.get("row_id", "")))
             if experiment == "e7":
                 variants = tuple(args.prompt_variants or ("natural", "answer_hint"))
+            elif experiment == "h2_1":
+                variants = tuple(args.prompt_variants or ("natural", "mcq"))
             else:
                 variants = ("natural",)
             rows_written = 0
@@ -696,6 +775,8 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                                 "experiment": (
                                     "e7_h21"
                                     if experiment == "e7"
+                                    else "h2_1_vdc_mcq"
+                                    if experiment == "h2_1"
                                     else "h3_1_position"
                                     if experiment == "h3_1"
                                     else "h3_2_depth_comparison"
@@ -707,6 +788,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                                 "target_model": args.target_model,
                                 "draft_checkpoint": str(args.checkpoint),
                                 "draft_config": str(args.draft_config),
+                                "max_new_tokens": int(args.max_new_tokens),
                                 "sample_id": str(sample_record["sample_id"]),
                                 "prompt_variant": variant,
                                 "visual_condition": condition["visual_condition"],
@@ -738,14 +820,14 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("experiment", choices=("e7", "h3_1", "h3_2", "all"))
+    parser.add_argument("experiment", choices=("e7", "h2_1", "h3_1", "h3_2", "all"))
     parser.add_argument("--target-model", default=DEFAULT_TARGET_MODEL)
     parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
     parser.add_argument("--draft-config", default=DEFAULT_DRAFT_CONFIG)
     parser.add_argument("--manifest", default=DEFAULT_MANIFEST)
     parser.add_argument("--video-root", default=DEFAULT_VIDEO_ROOT)
     parser.add_argument("--calibration", default=DEFAULT_CALIBRATION)
-    parser.add_argument("--dataset", choices=("vdc", "mvbench"), default="vdc")
+    parser.add_argument("--dataset", choices=("vdc", "vdc_mcq", "mvbench"), default="vdc")
     parser.add_argument(
         "--training-corpus",
         choices=("llava68k", "sharegpt68k", "unknown"),
@@ -765,7 +847,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--prompt-variants",
         nargs="+",
-        choices=("natural", "answer_hint"),
+        choices=("natural", "answer_hint", "mcq", "mcq2"),
         default=None,
         help="Optional E7 prompt subset; defaults to both variants.",
     )

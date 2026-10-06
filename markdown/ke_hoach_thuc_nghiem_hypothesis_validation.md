@@ -7,6 +7,14 @@ trước cách diễn giải kết quả. Đây là kế hoạch thực nghiệm
 quả. Các kết quả cũ trong `results/` chỉ được dùng làm exploratory evidence cho
 đến khi khớp đúng condition, cohort và audit của protocol này.
 
+## Phase boundary hiện tại
+
+Run hiện tại chỉ xây dựng manifest/schema và thu thập raw data đầy đủ. Không
+tính mean acc length, acc rate tổng hợp, `I_format`, early/late contrast, depth
+interaction, bootstrap CI, plot hoặc kết luận hypothesis trong Phase 1. Các
+metric runtime-native và token-level được ghi lại để Phase 2 phân tích sau khi
+đã audit completeness và target parity.
+
 ## 1. Câu hỏi trung tâm
 
 Visual information có thể đã được target model nén vào text-conditioned hidden
@@ -264,27 +272,29 @@ implement và pass unit test; vẫn cần full-cohort execution.
 VDC không cải thiện khi giảm visual tokens vì text prompt tự nhiên chưa đủ chứa
 visual semantics cần thiết hay không?
 
-### Thiết kế factorial
+### Thiết kế factorial đã hiệu chỉnh
 
-| Prompt | F | R | D |
+| Prompt | Full | Zero | Cut |
 |---|---:|---:|---:|
 | Natural VDC | ✓ | ✓ | ✓ |
-| Answer-augmented VDC | ✓ | ✓ | ✓ |
+| VDC-MCQ theo format MVBench | ✓ | ✓ | ✓ |
 
-Answer-augmented prompt sử dụng reference answer ở các mức 25%, 50% và 100%.
-Đây là leakage diagnostic, không phải benchmark result. Prompt length và vị trí
-answer hint phải được kiểm soát để tránh nhầm hiệu ứng sequence length với hiệu
-ứng semantic sufficiency.
+VDC-MCQ có câu hỏi đóng và các candidate options theo đúng template
+`Question/Option/(A)...` của MVBench. Reference caption chỉ được dùng để tạo và
+kiểm tra candidate đúng; không được nối reference answer vào prompt. Nhánh
+`answer_hint` cũ là oracle diagnostic lịch sử, không phải điều kiện H2.1 mới.
+Question/options/order phải giữ nguyên giữa Full, Zero và Cut.
 
 ### Metric
 
-Primary interaction:
+Primary format interaction:
 
 \[
-I_{answer}=
-[\tau_{eff}(D)-\tau_{eff}(F)]_{augmented}
+I_{format}(C)=
+[\tau_{eff}(C)-\tau_{eff}(Full)]_{VDC-MCQ}
 -
-[\tau_{eff}(D)-\tau_{eff}(F)]_{natural}.
+[\tau_{eff}(C)-\tau_{eff}(Full)]_{natural},
+\quad C\in\{Zero,Cut\}.
 \]
 
 Guardrails:
@@ -296,22 +306,22 @@ Guardrails:
 
 ### Decision rule
 
-Ủng hộ H2.1 nếu:
+Ủng hộ answer-leakage explanation nếu:
 
-- trong natural VDC, D/R không cải thiện F vượt qua equivalence margin;
-- trong answer-augmented VDC, D/R cải thiện acceptance;
-- interaction (I_{answer}) dương và vượt margin.
+- VDC-MCQ làm giảm rõ ràng visual-ablation penalty hoặc chuyển sang cùng chiều
+  với MVBench;
+- interaction `I_format` vượt equivalence margin;
+- correct-option accuracy, target parity và sample coverage không suy giảm.
 
-Nếu natural VDC cũng cải thiện, H2.1 không được ủng hộ. Nếu cả hai prompt type
-đều không cải thiện, cần xem xét lại denominator mechanism hoặc positional/KV
-confound.
+Nếu VDC-MCQ không đổi hướng, answer leakage một mình chưa đủ giải thích khác
+biệt MVBench/VDC. Không dùng raw acceptance length giữa caption tự do và MCQ như
+metric chất lượng vì hai task có độ dài output khác nhau.
 
 ### Data dependency
 
 `RUNNABLE_NOW` về evaluation data: VDC-50 hiện có 50 video, `test.jsonl`,
 `subset_manifest.jsonl` và calibration files. Reference answers nằm trong test
-data nên có thể dựng answer-augmented diagnostic. Không cần full training data cho
-E3.
+data nên có thể dựng và audit VDC-MCQ. Không cần full training data cho E3.
 
 ## 7. Experiment E4 — H3.1: acceptance theo vị trí answer
 
@@ -343,13 +353,15 @@ là vị trí bắt đầu round. Proposal thứ (r) được gán vào answer p
 
 ### Metric
 
-Primary position interaction:
+H3.1 dùng MSD với retention chính xác `100, 50, 25, 0%`; target giữ full
+visual, chỉ draft được compact. `100%` là baseline và `0%` là endpoint không
+visual. Primary position interaction:
 
 \[
 I_{position}=\Delta_{late}-\Delta_{early},
 \]
 
-trong đó \(\Delta\) là reduced-minus-full acceptance rate.
+trong đó \(\Delta\) là `retention-0` trừ `retention-100` acceptance rate.
 
 Phân tích ở cả absolute positions và normalized bins: 0–10%, 10–25%, 25–50%,
 50–75%, 75–100%.
@@ -373,9 +385,8 @@ H3.1 được hỗ trợ mạnh hơn.
 ### Data dependency
 
 `RUNNABLE_DIAGNOSTIC`: VDC-50 và MSD runtime hiện đủ để chạy acceptance study.
-Runtime đã bổ sung `acceptance_by_position`, nhưng log hiện ghi proposal
-positions/fallback positions chứ chưa lưu đầy đủ proposal/target token IDs như
-protocol tối đa ở trên; cần coi token-level correctness là phần mở rộng nếu cần.
+Runtime phải lưu `acceptance_by_position` cùng proposal/target token IDs để có
+thể tái dựng vị trí answer; không thay primary MSD sweep bằng DFlash Zero/Cut.
 
 Không cần training data mới nếu chỉ đánh giá MSD hiện tại.
 
@@ -413,8 +424,9 @@ Không được thay đổi đồng thời `num_draft_layers` và `num_target_fe
 
 ### Evaluation
 
-Mỗi DFlash depth chạy F, R và D/Z. MSD được giữ làm external baseline để so sánh
-mô tả; nguyên nhân nhân quả về depth chỉ được kết luận từ DFlash 1/3/5.
+Mỗi DFlash depth `1, 3, 5` chạy Full, Zero và Cut trên cả VDC/MVBench, tách
+riêng hai corpus LLaVA68K/ShareGPT68K. MSD chỉ là external reference để mô tả;
+nguyên nhân nhân quả về depth chỉ được kết luận trong DFlash 1/3/5.
 
 ### Metric
 
@@ -439,10 +451,10 @@ Guardrails:
 
 ### Decision rule
 
-Ủng hộ H3.2 nếu depth tăng làm visual interaction tăng: model nhiều layers có lợi
-thế rõ hơn trong full visual so với zero visual. Nếu depth cải thiện đồng đều cả
-full và zero visual, đó là language-modeling gain, chưa phải visual-understanding
-gain.
+Ủng hộ H3.2 trong phạm vi DFlash nếu depth tăng làm visual interaction
+`Full−Zero` tăng trong cùng corpus. Nếu depth cải thiện đồng đều cả Full và Zero,
+đó là language-modeling gain, chưa phải visual-understanding gain. Kết quả này
+không đủ để khẳng định trực tiếp “MSD kém vì chỉ có một layer”.
 
 ### Data dependency
 

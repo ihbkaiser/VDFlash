@@ -62,3 +62,7 @@ docs/superpowers/
 .jspace/
 data/
 .serena/
+
+
+HUGGING_FACE.md
+*.orig
