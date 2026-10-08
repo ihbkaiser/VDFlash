@@ -561,6 +561,81 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 strategy_kwargs=runtime(corrupt_model),
             )
 
+    def test_msd_legacy_omitted_embedding_resumes_from_matching_provenance(self):
+        import torch.nn as nn
+
+        from specforge.algorithms.common.providers import (
+            MODEL_PROVENANCE_CONTRACT_KEY,
+            OMITTED_STATE_FINGERPRINT_CONTRACT_KEY,
+            StepRuntimeConfig,
+            checkpoint_key_fingerprint,
+        )
+
+        class Draft(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = nn.Parameter(torch.zeros(1))
+                self.embed_tokens = nn.Embedding(4, 1)
+                self.embed_tokens.requires_grad_(False)
+
+        class Composite(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.draft_model = Draft()
+
+        def runtime(model):
+            allowed_missing = {"embed_tokens.weight"}
+            return StepRuntimeConfig(
+                options={},
+                resume_contract={
+                    MODEL_PROVENANCE_CONTRACT_KEY: (
+                        ("target_model", ("reference", "fixture-v1")),
+                    ),
+                    OMITTED_STATE_FINGERPRINT_CONTRACT_KEY: (
+                        checkpoint_key_fingerprint(
+                            model.draft_model,
+                            allowed_missing,
+                        )
+                    ),
+                },
+                allowed_missing_checkpoint_keys=allowed_missing,
+            )
+
+        workdir = tempfile.mkdtemp(prefix="trainer_resume_legacy_msd_embedding_")
+        feat_dir = _write_feature_files(os.path.join(workdir, "features"), n=4)
+        source_model = Composite()
+        source, _, _ = self._make_trainer(
+            os.path.join(workdir, "source"),
+            feat_dir=feat_dir,
+            max_steps=1,
+            model=source_model,
+            strategy_kwargs=runtime(source_model),
+        )
+        self.assertEqual(source.fit(), 1)
+        checkpoint = os.path.join(workdir, "source", "rz-step1")
+        state_path = os.path.join(checkpoint, "training_state.pt")
+        state = torch.load(state_path, map_location="cpu", weights_only=False)
+        state["strategy"] = "msd"
+        state["draft_state_dict"].pop("embed_tokens.weight")
+        state.pop(OMITTED_STATE_FINGERPRINT_CONTRACT_KEY)
+        torch.save(state, state_path)
+
+        resumed_model = Composite()
+        with torch.no_grad():
+            resumed_model.draft_model.embed_tokens.weight.copy_(
+                source_model.draft_model.embed_tokens.weight
+            )
+        resumed, _, _ = self._make_trainer(
+            os.path.join(workdir, "resumed"),
+            feat_dir=feat_dir,
+            max_steps=2,
+            resume_from=checkpoint,
+            model=resumed_model,
+            strategy_kwargs=runtime(resumed_model),
+            spec_name="msd",
+        )
+        self.assertEqual(resumed.global_step, 1)
+
     def test_bound_algorithm_resume_contract_is_saved_and_validated(self):
         from specforge.algorithms.common.providers import StepRuntimeConfig
 

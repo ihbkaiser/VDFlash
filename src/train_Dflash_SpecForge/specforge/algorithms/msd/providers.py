@@ -94,6 +94,21 @@ def resume_contract(config, draft_model, _training_model):
     }
 
 
+def allowed_missing_checkpoint_keys(_config, draft_model, _training_model):
+    """Allow reconstruction of MSD's frozen target-copied token embedding."""
+
+    embedding_parameters = [
+        parameter
+        for name, parameter in draft_model.named_parameters()
+        if "embed_tokens" in name
+    ]
+    if not embedding_parameters or any(
+        parameter.requires_grad for parameter in embedding_parameters
+    ):
+        return no_missing_checkpoint_keys(_config, draft_model, _training_model)
+    return frozenset(key for key in draft_model.state_dict() if "embed_tokens" in key)
+
+
 def build_draft(config, draft_config):
     from specforge.algorithms.model_providers import build_registered_draft
 
@@ -168,7 +183,7 @@ def algorithm_providers() -> AlgorithmProviders:
             build=build_step,
             options=step_options,
             resume_contract=resume_contract,
-            allowed_missing_checkpoint_keys=no_missing_checkpoint_keys,
+            allowed_missing_checkpoint_keys=allowed_missing_checkpoint_keys,
             uses_external_target_head=True,
         ),
         model=ModelProvider(

@@ -345,6 +345,56 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 allowed_missing_checkpoint_keys={"embed_tokens.weight"},
             )
 
+    def test_msd_allows_only_its_frozen_checkpoint_omitted_embedding(self):
+        import torch.nn as nn
+
+        class Draft(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = SimpleNamespace(
+                    num_hidden_layers=1,
+                    hidden_size=4,
+                    vocab_size=8,
+                )
+                self.embed_tokens = nn.Embedding(8, 4)
+                self.proj = nn.Linear(4, 4)
+
+        config = SimpleNamespace(
+            training=SimpleNamespace(
+                msd_feature_loss_weight=1.0,
+                msd_soft_loss_weight=0.1,
+                msd_noise_width=0.2,
+                msd_total_epochs=40,
+                msd_curriculum_seed=0,
+            )
+        )
+        step = self.registry.resolve("msd").providers.step
+        draft = Draft()
+        draft.embed_tokens.requires_grad_(False)
+
+        runtime = step.bind_runtime(
+            config,
+            draft,
+            draft,
+            model_provenance={"target_model": ("reference", "model-id")},
+        )
+
+        self.assertEqual(
+            runtime.allowed_missing_checkpoint_keys,
+            frozenset({"embed_tokens.weight"}),
+        )
+        self.assertIn(
+            OMITTED_STATE_FINGERPRINT_CONTRACT_KEY,
+            runtime.resume_contract,
+        )
+
+        draft.embed_tokens.requires_grad_(True)
+        trainable_runtime = step.bind_runtime(config, draft, draft)
+        self.assertEqual(
+            trainable_runtime.allowed_missing_checkpoint_keys,
+            frozenset(),
+        )
+
     def test_step_options_are_canonical_resume_metadata(self):
         runtime = StepRuntimeConfig(
             options={"objective_scale": 0.5},

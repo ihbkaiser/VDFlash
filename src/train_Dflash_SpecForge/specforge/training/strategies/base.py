@@ -494,10 +494,19 @@ class MSDTrainStrategy(DraftTrainStrategy):
         )
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
+        embedding_parameters = [
+            parameter
+            for name, parameter in self.msd_model.named_parameters()
+            if "embed_tokens" in name
+        ]
+        omit_embedding = embedding_parameters and all(
+            not parameter.requires_grad for parameter in embedding_parameters
+        )
         return {
             key.replace("draft_model.", ""): value
             for key, value in state_dict.items()
-            if "embed_tokens" not in key and "target_head" not in key
+            if not (omit_embedding and "embed_tokens" in key)
+            and "target_head" not in key
         }
 
 

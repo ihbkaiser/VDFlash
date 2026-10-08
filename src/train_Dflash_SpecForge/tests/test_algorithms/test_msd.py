@@ -324,6 +324,18 @@ def test_msd_train_strategy_returns_finite_named_objective_terms() -> None:
     assert head.weight.grad is None
     assert draft.embed_tokens.weight.grad is None
 
+    checkpoint_state = {
+        f"draft_model.{key}": value for key, value in draft.state_dict().items()
+    }
+    checkpoint_state["target_head.weight"] = head.weight
+    frozen_state = strategy.checkpoint_state_filter(checkpoint_state)
+    assert "embed_tokens.weight" not in frozen_state
+    assert "target_head.weight" not in frozen_state
+
+    draft.embed_tokens.requires_grad_(True)
+    trainable_state = strategy.checkpoint_state_filter(checkpoint_state)
+    assert "embed_tokens.weight" in trainable_state
+
 
 def _write_msd_record(root: str, index: int, length: int = 3) -> None:
     torch.save(

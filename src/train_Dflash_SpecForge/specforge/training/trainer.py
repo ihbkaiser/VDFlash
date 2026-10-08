@@ -297,6 +297,16 @@ class Trainer:
                 "world_size": world_size,
                 **persisted_contract,
             }
+            draft_state_keys = set(model.draft_model.state_dict())
+            saved_draft_state_keys = set(state.get("draft_state_dict", {}))
+            legacy_msd_omitted_fingerprint = (
+                algorithm_name == "msd"
+                and OMITTED_STATE_FINGERPRINT_CONTRACT_KEY not in state
+                and MODEL_PROVENANCE_CONTRACT_KEY in state
+                and MODEL_PROVENANCE_CONTRACT_KEY in custom_checkpoint_extra
+                and draft_state_keys - saved_draft_state_keys
+                == allowed_missing_checkpoint_keys
+            )
             for key, current in resume_contract.items():
                 persisted = state.get(key)
                 persisted_available = key in state
@@ -330,6 +340,10 @@ class Trainer:
                     key in custom_checkpoint_extra
                     and key not in state
                     and key != "dflash_hidden_state_metadata"
+                    and not (
+                        key == OMITTED_STATE_FINGERPRINT_CONTRACT_KEY
+                        and legacy_msd_omitted_fingerprint
+                    )
                 ):
                     raise ValueError(
                         f"checkpoint {resume_from} does not record required "
