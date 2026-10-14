@@ -346,3 +346,13 @@ Use `--limit 1` for a smoke run, or `--skip-msd`, `--skip-attention` and
 row, losslessness, and coverage gates all pass. Composite figures and statistics are written under
 `results/sparrow_validation/report/` (or the directory passed to
 `report --output-dir`).
+
+## Reverse text-to-visual transfer with trained MSD
+
+The reverse-transfer experiment is a separate, actual-MSD evaluation. It uses
+the frozen Qwen2-VL target only to produce the teacher features required by
+the trained `model.ea_layer`; candidate logits come from the draft hidden
+state projected through the frozen target LM head. It does not use target
+answer logits or a random/standalone draft. See
+[`MSD_REVERSE_TRANSFER.md`](MSD_REVERSE_TRANSFER.md) for the architecture
+contract, E1--E6 matrix, D4 caveat, Modal smoke command, and report format.

@@ -22,6 +22,8 @@ from transformers.generation.logits_process import (
 
 class temp_cache:
     use_msd = False
+    visual_mode = "full"
+    chain_mode = False
     sample_accept_token = []
     sample_reject_token = []
     answer_file = None
@@ -39,6 +41,8 @@ class temp_cache:
     @classmethod
     def reset(cls):
         cls.use_msd = False
+        cls.visual_mode = "full"
+        cls.chain_mode = False
         cls.sample_accept_token = []
         cls.sample_reject_token = []
         cls.total_time = 0
@@ -528,7 +532,14 @@ def get_input_embeds_qwenvl(input_ids, model):
 
     return input_embeds
 
-def get_input_embeds_qwen2vl(input_ids, pixel_values, image_grid_thw, model):
+def get_input_embeds_qwen2vl(
+    input_ids,
+    pixel_values,
+    image_grid_thw,
+    model,
+    pixel_values_videos=None,
+    video_grid_thw=None,
+):
     with torch.no_grad():
         inputs_embeds = model.model.embed_tokens(input_ids)
         if pixel_values is not None:
@@ -548,6 +559,26 @@ def get_input_embeds_qwen2vl(input_ids, pixel_values, image_grid_thw, model):
             )
             image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+        if pixel_values_videos is not None:
+            pixel_values_videos = pixel_values_videos.type(model.visual.get_dtype())
+            video_embeds = model.visual(
+                pixel_values_videos, grid_thw=video_grid_thw
+            )
+            n_video_tokens = (input_ids == model.config.video_token_id).sum().item()
+            n_video_features = video_embeds.shape[0]
+            if n_video_tokens != n_video_features:
+                raise ValueError(
+                    "Video features and video tokens do not match: "
+                    f"tokens: {n_video_tokens}, features {n_video_features}"
+                )
+            video_mask = (
+                (input_ids == model.config.video_token_id)
+                .unsqueeze(-1)
+                .expand_as(inputs_embeds)
+                .to(inputs_embeds.device)
+            )
+            video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
     return inputs_embeds
 

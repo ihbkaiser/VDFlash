@@ -11,6 +11,7 @@ import requests
 import yaml
 
 import lmms_eval.tasks._task_utils.file_utils as file_utils
+from loguru import logger as eval_logger
 
 try:
     import sglang as sgl
@@ -25,6 +26,10 @@ try:
     )
 except ImportError:
     eval_logger.debug("SGLang is not installed. If you want to use llava_sglang, please install it using pip install 'sglang[all]' ")
+
+    def function(fn):
+        """Keep SGLang-only task helpers importable when SGLang is absent."""
+        return fn
 
 with open(Path(__file__).parent / "_default_template_yaml", "r") as f:
     raw_data = f.readlines()
@@ -45,8 +50,6 @@ HF_HOME = os.environ["HF_HOME"]
 cache_dir = config["dataset_kwargs"]["cache_dir"]
 cache_dir = os.path.join(HF_HOME, cache_dir)
 cache_dir = os.path.join(cache_dir, "Test_Videos")
-
-from loguru import logger as eval_logger
 
 DETAILED_CAPTION_PROMPTS = [
     "Please imagine the video based on the sequence of frames, and provide a faithfully detailed description of this video in more than three sentences.",
@@ -163,6 +166,19 @@ def vdc_doc_to_visual(doc):
         video_path = video_path.replace("mp4", "MP4")
     elif os.path.exists(video_path.replace("mp4", "mkv")):
         video_path = video_path.replace("mp4", "mkv")
+    elif os.getenv("MSD_VDC_ALLOW_FALLBACK", "0") == "1":
+        candidates = sorted(
+            path for path in Path(cache_dir).iterdir()
+            if path.suffix.lower() in {".mp4", ".mkv"}
+        )
+        if not candidates:
+            sys.exit(f"video path:{video_path} does not exist, please check")
+        eval_logger.warning(
+            "VDC smoke fallback: %s is unavailable; using %s instead",
+            video_path,
+            candidates[0],
+        )
+        video_path = str(candidates[0])
     else:
         sys.exit(f"video path:{video_path} does not exist, please check")
     return [video_path]

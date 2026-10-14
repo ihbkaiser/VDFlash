@@ -186,6 +186,35 @@ class Model(nn.Module):
         # with torch.no_grad():
         from eagle.model.utils import temp_cache
 
+        # Cut mode only changes the drafter.  Visual rows are removed before
+        # its layers create a KV cache, while their original positions remain
+        # in the explicit position-id tensor.
+        if (
+            temp_cache.use_msd
+            and getattr(temp_cache, "visual_mode", "full") == "cut"
+            and inputs_embeds is not None
+            and input_ids is not None
+            and input_ids.dim() == 2
+            and input_ids.shape[1] == inputs_embeds.shape[1]
+        ):
+            visual_mask = self._qwen_visual_mask(input_ids)
+            if visual_mask.any():
+                keep = ~visual_mask[0]
+                if position_ids is None:
+                    position_ids = torch.arange(
+                        input_ids.shape[1], device=input_ids.device, dtype=torch.long
+                    )[keep].unsqueeze(0)
+                elif position_ids.dim() == 2:
+                    position_ids = position_ids[:, keep]
+                else:
+                    position_ids = position_ids[..., keep]
+                input_ids = input_ids[:, keep]
+                inputs_embeds = inputs_embeds[:, keep]
+                hidden_states = hidden_states[:, keep]
+                image_tokens_num = None
+                batch_size, seq_length, _ = hidden_states.shape
+                seq_length_with_past = seq_length
+
         if any(p.requires_grad for p in self.embed_tokens.parameters()):
             # Iterate over each input_ids in the batch
             new_inputs_embeds_list = []
@@ -323,6 +352,7 @@ class Model(nn.Module):
             hidden_states = self.fc(torch.cat((inputs_embeds, hidden_states), dim=-1))
 
         all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
 
         if self.rotary_emb is not None:
@@ -367,32 +397,54 @@ class Model(nn.Module):
 
             hidden_states = layer_outputs[0]
 
+            if output_attentions:
+                all_self_attns += (layer_outputs[1],)
+
             if use_cache:
                 next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
 
         if use_cache:
-            return hidden_states, next_decoder_cache
-
-        return hidden_states
+            output = (hidden_states, next_decoder_cache)
+        else:
+            output = (hidden_states,)
+        if output_attentions:
+            output += (all_self_attns,)
+        return output[0] if len(output) == 1 else output
 
     def reset_kv(self):
         self.stable_kv = None
 
+    @staticmethod
+    def _qwen_visual_mask(input_ids):
+        """Return the visual-token mask used by the Qwen2-VL draft path."""
+
+        return (input_ids == 151655) | (input_ids == 151656)
+
     @torch.no_grad()
-    def topK_genrate(self, hidden_states, input_ids, head, logits_processor, inputs_embeds=None):
+    def topK_genrate(
+        self,
+        hidden_states,
+        input_ids,
+        head,
+        logits_processor,
+        inputs_embeds=None,
+        return_stats=False,
+    ):
 
         input_ids = input_ids.to(hidden_states.device)
-        total_tokens = self.total_tokens
-        depth = self.depth
-        top_k = self.top_k
+        from eagle.model.utils import temp_cache
+
+        chain_mode = bool(getattr(temp_cache, "chain_mode", False))
+        total_tokens = 6 if chain_mode else self.total_tokens
+        depth = 5 if chain_mode else self.depth
+        top_k = 1 if chain_mode else self.top_k
+        stats = []
 
         sample_token = input_ids[:, -1]
 
         if inputs_embeds != None:
             new_embed = self.embed_tokens(sample_token).unsqueeze(dim=0).to(inputs_embeds.device)
             inputs_embeds = torch.cat((inputs_embeds[:,1:],new_embed),dim=1)
-        from eagle.model.utils import temp_cache
-
         scores_list = []
         parents_list = []
         ss_token = []
@@ -407,19 +459,92 @@ class Model(nn.Module):
 
         self.reset()
 
+        visual_positions = torch.nonzero(
+            self._qwen_visual_mask(input_ids[0]), as_tuple=False
+        ).flatten()
+
+        def collect_stats(log_probs, attentions):
+            if not return_stats:
+                return
+            if log_probs.dim() == 3:
+                log_probs = log_probs[0, 0]
+            else:
+                log_probs = log_probs[0]
+            probs = log_probs.float().exp()
+            top_values, top_indices = torch.topk(probs, k=2)
+            visual_mass = None
+            if attentions and visual_positions.numel() > 0:
+                attention = attentions[-1]
+                if attention is not None and attention.shape[-1] > int(visual_positions.max()):
+                    visual_mass = float(
+                        attention[0, :, -1, visual_positions.to(attention.device)].sum().item()
+                    )
+            stats.append(
+                {
+                    "draft_token": int(top_indices[0].item()),
+                    "draft_prob": float(top_values[0].item()),
+                    "draft_margin": float((top_values[0] - top_values[1]).item()),
+                    "draft_entropy": float(-(probs * log_probs.float()).sum().item()),
+                    "draft_attention_mass": visual_mass,
+                    "_draft_log_probs": log_probs.detach(),
+                }
+            )
+
+        tree_mask_init = self.tree_mask_init
+        position_ids_init = self.position_ids
+        if chain_mode:
+            tree_mask_init = torch.eye(
+                top_k, device=self.embed_tokens.weight.device
+            )[None, None]
+            position_ids_init = torch.zeros(
+                top_k, device=self.embed_tokens.weight.device, dtype=torch.long
+            )
+
         if hasattr(self, "stable_kv") and self.stable_kv is not None:
             kv_len = self.stable_kv[0][0].shape[2]
             if -200 in input_ids:
                 kv_len -= 575
-            out_hidden, past_key_values = self(hidden_states, input_ids=input_ids[:, kv_len:],
-                                               past_key_values=self.stable_kv, use_cache=True, inputs_embeds=inputs_embeds)
+            cache_input_ids = input_ids
+            cache_position_ids = None
+            if (
+                getattr(temp_cache, "visual_mode", "full") == "cut"
+                and input_ids.dim() == 2
+            ):
+                visual_mask = self._qwen_visual_mask(input_ids)
+                if visual_mask.any():
+                    keep = ~visual_mask[0]
+                    cache_input_ids = input_ids[:, keep]
+                    cache_position_ids = torch.arange(
+                        input_ids.shape[1], device=input_ids.device, dtype=torch.long
+                    )[keep][kv_len:].unsqueeze(0)
+            forward_output = self(
+                hidden_states,
+                input_ids=cache_input_ids[:, kv_len:],
+                past_key_values=self.stable_kv,
+                use_cache=True,
+                inputs_embeds=inputs_embeds,
+                position_ids=cache_position_ids,
+                output_attentions=return_stats,
+            )
         else:
             image_tokens_num = []
             if -200 in input_ids:
                 image_tokens_num = [576]
             elif 151652 in input_ids:
                 image_tokens_num = [(input_ids == 151655).sum().item()]
-            out_hidden, past_key_values = self(hidden_states, input_ids=input_ids, use_cache=True, inputs_embeds=inputs_embeds, image_tokens_num=image_tokens_num)
+            forward_output = self(
+                hidden_states,
+                input_ids=input_ids,
+                use_cache=True,
+                inputs_embeds=inputs_embeds,
+                image_tokens_num=image_tokens_num,
+                output_attentions=return_stats,
+            )
+
+        if return_stats:
+            out_hidden, past_key_values, attentions = forward_output
+        else:
+            out_hidden, past_key_values = forward_output
 
         self.stable_kv = past_key_values
         last_hidden = out_hidden[:, -1]
@@ -427,6 +552,8 @@ class Model(nn.Module):
         last_headout = head(last_hidden)
 
         last_p = self.logsoftmax(last_headout)
+        if return_stats:
+            collect_stats(last_p, attentions)
         top = torch.topk(last_p, top_k, dim=-1)
         topk_index, topk_p = top.indices, top.values
         scores = topk_p[0]
@@ -435,16 +562,26 @@ class Model(nn.Module):
         ss_token.append(topk_index)
         input_ids = topk_index
         input_hidden = last_hidden[None].repeat(1, top_k, 1)
-        tree_mask = self.tree_mask_init
+        tree_mask = tree_mask_init
         topk_cs_index = torch.arange(top_k, device=self.embed_tokens.weight.device)
 
         # 4
         for i in range(depth):
             self.tree_mask = tree_mask
-            position_ids = len_posi + self.position_ids
+            position_ids = len_posi + position_ids_init
 
-            out_hidden, past_key_values = self(input_hidden, input_ids=input_ids, past_key_values=past_key_values,
-                                               position_ids=position_ids, use_cache=True)
+            forward_output = self(
+                input_hidden,
+                input_ids=input_ids,
+                past_key_values=past_key_values,
+                position_ids=position_ids,
+                use_cache=True,
+                output_attentions=return_stats,
+            )
+            if return_stats:
+                out_hidden, past_key_values, attentions = forward_output
+            else:
+                out_hidden, past_key_values = forward_output
             len_posi += 1
 
             # with Timer("sort1"):
@@ -456,6 +593,8 @@ class Model(nn.Module):
 
             last_headout = head(out_hidden[0])
             last_p = self.logsoftmax(last_headout)
+            if return_stats:
+                collect_stats(last_p, attentions)
 
             top = torch.topk(last_p, top_k, dim=-1)
             topk_index, topk_p = top.indices, top.values
@@ -477,7 +616,7 @@ class Model(nn.Module):
 
             ss_token.append(topk_index)
             scores_list.append(cu_scores)
-            tree_mask = torch.cat((tree_mask[:, :, out_ids], self.tree_mask_init), dim=3)
+            tree_mask = torch.cat((tree_mask[:, :, out_ids], tree_mask_init), dim=3)
 
             # if self.threshold < 0 and cu_scores.max() < self.threshold:
             #     break
@@ -553,6 +692,8 @@ class Model(nn.Module):
         del mask_index, mask_index_list, noleaf_index, noleaf_num, leaf_num, max_depth, rid
         tree_position_ids = tree_position_ids.to(hidden_states.device)
 
+        if return_stats:
+            return draft_tokens, retrieve_indices, tree_mask, tree_position_ids, stats
         return draft_tokens, retrieve_indices, tree_mask, tree_position_ids
 
     @torch.no_grad()

@@ -112,6 +112,24 @@ def parse_eval_args() -> argparse.Namespace:
         help="If True, use msd for inference",
     )
     parser.add_argument(
+        "--msd_visual_mode",
+        choices=["full", "cut"],
+        default=None,
+        help="Qwen2-VL MSD drafter visual mode",
+    )
+    parser.add_argument(
+        "--msd_chain_mode",
+        action="store_true",
+        default=False,
+        help="Enable the six-token top-1 diagnostic chain",
+    )
+    parser.add_argument(
+        "--log_draft_stats",
+        type=str,
+        default=None,
+        help="Write teacher-forced MSD draft statistics as JSONL",
+    )
+    parser.add_argument(
         "--batch_size",
         "-b",
         type=str,
@@ -277,6 +295,15 @@ def parse_eval_args() -> argparse.Namespace:
         help="Sets trust_remote_code to True to execute code to create HF Datasets from the Hub",
     )
     args = parser.parse_args()
+    model_overrides = []
+    if args.msd_visual_mode is not None:
+        model_overrides.append(f"msd_visual_mode={args.msd_visual_mode}")
+    if args.msd_chain_mode:
+        model_overrides.append("msd_chain_mode=true")
+    if args.log_draft_stats is not None:
+        model_overrides.append(f"log_draft_stats={args.log_draft_stats}")
+    if model_overrides:
+        args.model_args = ",".join(filter(None, [args.model_args, *model_overrides]))
     return args
 
 

@@ -208,6 +208,34 @@ class EaModel(nn.Module):
             return outputs, hidden_states
 
     @torch.no_grad()
+    def diagnostic_chain(self, input_ids, inputs_embeds, target_hidden_states, visual_mode):
+        """Run a six-token top-1 draft chain for teacher-forced diagnostics."""
+
+        from .utils import temp_cache
+
+        previous_mode = getattr(temp_cache, "visual_mode", "full")
+        previous_chain = getattr(temp_cache, "chain_mode", False)
+        try:
+            temp_cache.use_msd = True
+            temp_cache.visual_mode = visual_mode
+            temp_cache.chain_mode = True
+            self.ea_layer.reset_kv()
+            draft_input_ids = torch.cat((input_ids, input_ids[:, -1:]), dim=1)
+            result = self.ea_layer.topK_genrate(
+                target_hidden_states.clone(),
+                draft_input_ids,
+                self.base_model.lm_head,
+                None,
+                inputs_embeds=inputs_embeds.clone(),
+                return_stats=True,
+            )
+            return result[0], result[4]
+        finally:
+            temp_cache.visual_mode = previous_mode
+            temp_cache.chain_mode = previous_chain
+            self.ea_layer.reset_kv()
+
+    @torch.no_grad()
     def msdgenerate(
             self,
             input_ids,
@@ -310,6 +338,18 @@ class EaModel(nn.Module):
                 break
             if input_ids.shape[1] > max_length:
                 break
+        # A verified candidate path can contain tokens after EOS in the same
+        # round.  Do not expose those suffix tokens to the caller.
+        stop_ids = {self.tokenizer.eos_token_id}
+        if hasattr(self.tokenizer, "eod_id"):
+            stop_ids.add(self.tokenizer.eod_id)
+        stop_end = input_ids.shape[1]
+        for row in range(input_ids.shape[0]):
+            generated = input_ids[row, input_len:].tolist()
+            stop_positions = [i for i, token_id in enumerate(generated) if token_id in stop_ids]
+            if stop_positions:
+                stop_end = min(stop_end, input_len + stop_positions[0] + 1)
+        input_ids = input_ids[:, :stop_end]
         if not log:
             return input_ids
         else:

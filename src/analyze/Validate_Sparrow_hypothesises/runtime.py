@@ -696,6 +696,16 @@ def apply_msd_memory_patches() -> None:
         )
         attn_output = attn_weights.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, -1)
+        if attn_output.shape[-1] != self.o_proj.in_features:
+            raise RuntimeError(
+                "MSD draft SDPA shape mismatch: "
+                f"query={tuple(query_states.shape)}, "
+                f"key={tuple(key_states.shape)}, "
+                f"value={tuple(value_states.shape)}, "
+                f"sdpa={tuple(attn_weights.shape)}, "
+                f"flattened={tuple(attn_output.shape)}, "
+                f"o_proj={tuple(self.o_proj.weight.shape)}"
+            )
         attn_output = self.o_proj(attn_output)
         return attn_output, None, past_key_value
 

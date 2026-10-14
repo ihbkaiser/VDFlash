@@ -1,5 +1,7 @@
 import base64
+import json
 from io import BytesIO
+from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import decord
@@ -46,11 +48,16 @@ class Qwen2_VL_MSD(lmms):
         max_num_frames: int = 32,
         msd_model: str = None,
         use_msd: bool = False,
+        msd_visual_mode: str = "full",
+        msd_chain_mode: bool = False,
+        log_draft_stats: Optional[str] = None,
         **kwargs,
     ) -> None:
         super().__init__()
         # Do not use kwargs for now
         assert kwargs == {}, f"Unexpected kwargs: {kwargs}"
+        if msd_visual_mode not in {"full", "cut"}:
+            raise ValueError("msd_visual_mode must be 'full' or 'cut'")
 
         accelerator = Accelerator()
         if accelerator.num_processes > 1:
@@ -91,6 +98,15 @@ class Qwen2_VL_MSD(lmms):
         self.batch_size_per_gpu = int(batch_size)
         self.use_cache = use_cache
         self.use_msd = use_msd
+        self.msd_visual_mode = msd_visual_mode
+        self.msd_chain_mode = msd_chain_mode
+        self.log_draft_stats = log_draft_stats
+        self._diagnostic_sample_count = 0
+        self._stats_handle = None
+        if self.log_draft_stats:
+            stats_path = Path(self.log_draft_stats)
+            stats_path.parent.mkdir(parents=True, exist_ok=True)
+            self._stats_handle = stats_path.open("a", encoding="utf-8")
 
         if accelerator.num_processes > 1:
             assert accelerator.distributed_type in [
@@ -160,6 +176,200 @@ class Qwen2_VL_MSD(lmms):
             for j in i:
                 new_list.append(j)
         return new_list
+
+    def _target_rope_ids(self, input_ids, image_grid_thw=None, video_grid_thw=None):
+        return self.model.base_model.get_rope_index(
+            input_ids=input_ids,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            attention_mask=None,
+        )[0]
+
+    def _target_forward(self, inputs_embeds, position_ids, attention_mask=None):
+        outputs = self.model.base_model.model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=False,
+            output_attentions=False,
+        )
+        return self.model.base_model.lm_head(outputs[0])
+
+    def _target_visual_necessity(
+        self, prompt_ids, prompt_embeds, target_ids, image_grid_thw=None, video_grid_thw=None
+    ):
+        prompt_len = prompt_ids.shape[1]
+        generated = target_ids[:, prompt_len:]
+        if generated.shape[1] == 0:
+            return []
+        token_embeds = self.model.base_model.model.embed_tokens(generated)
+        full_embeds = torch.cat((prompt_embeds, token_embeds), dim=1)
+        position_ids = self._target_rope_ids(target_ids, image_grid_thw, video_grid_thw)
+        full_logits = self._target_forward(full_embeds, position_ids)
+
+        seq_len = full_embeds.shape[1]
+        min_value = torch.finfo(full_embeds.dtype).min
+        masked = torch.full(
+            (1, 1, seq_len, seq_len),
+            min_value,
+            dtype=full_embeds.dtype,
+            device=full_embeds.device,
+        )
+        masked[0, 0] = torch.tril(torch.zeros((seq_len, seq_len), device=full_embeds.device))
+        visual_positions = torch.nonzero(
+            (prompt_ids[0] == 151655) | (prompt_ids[0] == 151656),
+            as_tuple=False,
+        ).flatten()
+        if visual_positions.numel() > 0:
+            masked[0, 0, prompt_len:, visual_positions] = min_value
+        masked_logits = self._target_forward(
+            full_embeds, position_ids, attention_mask=masked
+        )
+
+        first = max(prompt_len - 1, 0)
+        last = seq_len - 1
+        full_probs = torch.softmax(full_logits[:, first:last], dim=-1)
+        masked_probs = torch.softmax(masked_logits[:, first:last], dim=-1)
+        necessity = 0.5 * torch.abs(full_probs - masked_probs).sum(dim=-1)
+        return [float(value) for value in necessity[0].detach().cpu()]
+
+    def _write_draft_stats(self, rows):
+        if self._stats_handle is None:
+            return
+        for row in rows:
+            self._stats_handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        self._stats_handle.flush()
+
+    @torch.no_grad()
+    def _collect_teacher_forced_stats(
+        self,
+        prompt_ids,
+        prompt_embeds,
+        target_ids,
+        task,
+        sample_id,
+        image_grid_thw=None,
+        video_grid_thw=None,
+    ):
+        prompt_len = prompt_ids.shape[1]
+        target_necessity = self._target_visual_necessity(
+            prompt_ids,
+            prompt_embeds,
+            target_ids,
+            image_grid_thw,
+            video_grid_thw,
+        )
+        generated_len = target_ids.shape[1] - prompt_len
+        rows = []
+        for generated_count in range(1, generated_len + 1):
+            prefix_ids = target_ids[:, : prompt_len + generated_count]
+            generated_prefix = target_ids[:, prompt_len : prompt_len + generated_count]
+            prefix_embeds = torch.cat(
+                (
+                    prompt_embeds,
+                    self.model.base_model.model.embed_tokens(generated_prefix),
+                ),
+                dim=1,
+            )
+            prefix_position_ids = self._target_rope_ids(
+                prefix_ids, image_grid_thw, video_grid_thw
+            )
+            prefix_outputs = self.model.base_model.model(
+                inputs_embeds=prefix_embeds,
+                position_ids=prefix_position_ids,
+                use_cache=False,
+                output_attentions=False,
+            )
+            prefix_hidden = prefix_outputs[0]
+
+            mode_data = {}
+            for mode in ("full", "cut"):
+                draft_tokens, draft_stats = self.model.diagnostic_chain(
+                    prefix_ids, prefix_embeds, prefix_hidden, mode
+                )
+                draft_ids = draft_tokens[:, 1:]
+                candidate_embeds = torch.cat(
+                    (
+                        prefix_embeds,
+                        self.model.base_model.model.embed_tokens(draft_ids),
+                    ),
+                    dim=1,
+                )
+                candidate_ids = torch.cat((prefix_ids, draft_ids), dim=1)
+                candidate_position_ids = self._target_rope_ids(
+                    candidate_ids, image_grid_thw, video_grid_thw
+                )
+                target_logits = self._target_forward(
+                    candidate_embeds, candidate_position_ids
+                )
+                first = prefix_embeds.shape[1] - 1
+                target_logits = target_logits[:, first : first + len(draft_stats)]
+                target_probs = torch.softmax(target_logits.float(), dim=-1)[0]
+                records = []
+                for depth, (draft_id, stat, target_prob) in enumerate(
+                    zip(draft_ids[0], draft_stats, target_probs), start=1
+                ):
+                    q = stat["_draft_log_probs"].float().exp()
+                    p = target_prob.float()
+                    target_token = int(torch.argmax(p).item())
+                    records.append(
+                        {
+                            "draft_token": int(draft_id.item()),
+                            "draft_prob": float(stat["draft_prob"]),
+                            "draft_margin": float(stat["draft_margin"]),
+                            "draft_entropy": float(stat["draft_entropy"]),
+                            "draft_attention_mass": stat["draft_attention_mass"],
+                            "target_greedy_token": target_token,
+                            "target_entropy": float(
+                                -(p * torch.log(p.clamp_min(1e-12))).sum().item()
+                            ),
+                            "target_tv": float(0.5 * torch.abs(p - q).sum().item()),
+                            "argmax_match": int(int(draft_id.item()) == target_token),
+                        }
+                    )
+                mode_data[mode] = records
+
+            for depth, (full, cut) in enumerate(
+                zip(mode_data["full"], mode_data["cut"]), start=1
+            ):
+                token_string = self.tokenizer.decode(
+                    [cut["draft_token"]], skip_special_tokens=False
+                )
+                necessity_index = min(generated_count, len(target_necessity)) - 1
+                rows.append(
+                    {
+                        "sample_id": str(sample_id),
+                        "task": str(task),
+                        "t": generated_count,
+                        "j": depth,
+                        "token_string": token_string,
+                        "token_string_full": self.tokenizer.decode(
+                            [full["draft_token"]], skip_special_tokens=False
+                        ),
+                        "draft_top1_token_full": full["draft_token"],
+                        "draft_top1_token_cut": cut["draft_token"],
+                        "draft_prob_full": full["draft_prob"],
+                        "draft_prob_cut": cut["draft_prob"],
+                        "draft_margin_full": full["draft_margin"],
+                        "draft_margin_cut": cut["draft_margin"],
+                        "draft_entropy_full": full["draft_entropy"],
+                        "draft_entropy_cut": cut["draft_entropy"],
+                        "draft_attention_mass_full": full["draft_attention_mass"],
+                        "target_greedy_token_full": full["target_greedy_token"],
+                        "target_greedy_token_cut": cut["target_greedy_token"],
+                        "target_entropy_full": full["target_entropy"],
+                        "target_entropy_cut": cut["target_entropy"],
+                        "target_tv_full": full["target_tv"],
+                        "target_tv_cut": cut["target_tv"],
+                        "argmax_match_full": full["argmax_match"],
+                        "argmax_match_cut": cut["argmax_match"],
+                        "necessity": target_necessity[necessity_index]
+                        if target_necessity
+                        else 0.0,
+                    }
+                )
+        self._write_draft_stats(rows)
+        return rows
 
     def generate_until(self, requests: List[Instance]) -> List[str]:
         res = []
@@ -273,7 +483,14 @@ class Qwen2_VL_MSD(lmms):
             pad_token_id = self.tokenizer.pad_token_id
 
             from eagle.model.utils import get_input_embeds_qwen2vl
-            input_embeds = get_input_embeds_qwen2vl(inputs.input_ids, inputs.pixel_values, inputs.image_grid_thw, self.model.base_model)
+            input_embeds = get_input_embeds_qwen2vl(
+                inputs.input_ids,
+                getattr(inputs, "pixel_values", None),
+                getattr(inputs, "image_grid_thw", None),
+                self.model.base_model,
+                getattr(inputs, "pixel_values_videos", None),
+                getattr(inputs, "video_grid_thw", None),
+            )
             # cont = self.model.generate(
             #     **inputs,
             #     eos_token_id=self.tokenizer.eos_token_id,
@@ -286,10 +503,96 @@ class Qwen2_VL_MSD(lmms):
             #     use_cache=self.use_cache,
             # )
 
+            from eagle.model.utils import temp_cache
+
+            def run_msd(mode):
+                temp_cache.use_msd = True
+                temp_cache.visual_mode = mode
+                temp_cache.chain_mode = False
+                return self.model.msdgenerate(
+                    inputs.input_ids,
+                    inputs_embeds=input_embeds.clone(),
+                    temperature=0,
+                    max_new_tokens=512,
+                )
+
             if self.use_msd:
-                output_ids = self.model.msdgenerate(inputs.input_ids, inputs_embeds=input_embeds, temperature=0, max_new_tokens=512)
+                target_ids = None
+                if self.log_draft_stats or self._diagnostic_sample_count < 20:
+                    target_ids = self.model.naivegenerate(
+                        inputs.input_ids,
+                        inputs_embeds=input_embeds.clone(),
+                        temperature=0,
+                        max_new_tokens=512,
+                    )
+                if self._diagnostic_sample_count < 20:
+                    full_ids = run_msd("full")
+                    cut_ids = run_msd("cut")
+                    prompt_len = inputs.input_ids.shape[1]
+                    decode_generated = lambda ids: self.tokenizer.decode(
+                        ids[0, prompt_len:].tolist(),
+                        skip_special_tokens=True,
+                        clean_up_tokenization_spaces=False,
+                    )
+                    target_text = decode_generated(target_ids)
+                    full_text = decode_generated(full_ids)
+                    cut_text = decode_generated(cut_ids)
+                    full_equal = full_text == target_text
+                    cut_equal = cut_text == target_text
+                    if not full_equal or not cut_equal:
+                        token_debug = {}
+                        for name, ids in (
+                            ("target", target_ids),
+                            ("full", full_ids),
+                            ("cut", cut_ids),
+                        ):
+                            suffix = ids[0, prompt_len : prompt_len + 20].tolist()
+                            token_debug[name] = {
+                                "ids": suffix,
+                                "pieces": [
+                                    self.tokenizer.decode(
+                                        [token_id],
+                                        skip_special_tokens=False,
+                                        clean_up_tokenization_spaces=False,
+                                    )
+                                    for token_id in suffix
+                                ],
+                            }
+                        raise AssertionError(
+                            "MSD visual modes must match plain target greedy decoding: "
+                            f"full_equal={full_equal}, cut_equal={cut_equal}, "
+                            f"full_shape={tuple(full_ids.shape)}, cut_shape={tuple(cut_ids.shape)}, "
+                            f"target_shape={tuple(target_ids.shape)}, "
+                            f"target_text={target_text[:160]!r}, full_text={full_text[:160]!r}, "
+                            f"cut_text={cut_text[:160]!r}, "
+                            f"eos_token_id={self.tokenizer.eos_token_id}, "
+                            f"eod_token_id={getattr(self.tokenizer, 'eod_id', None)}, "
+                            f"token_debug={token_debug}"
+                        )
+                    self._diagnostic_sample_count += inputs.input_ids.shape[0]
+                    output_ids = full_ids if self.msd_visual_mode == "full" else cut_ids
+                else:
+                    output_ids = run_msd(self.msd_visual_mode)
+
+                if self.log_draft_stats:
+                    stats_targets = target_ids if target_ids is not None else output_ids
+                    for sample_index in range(inputs.input_ids.shape[0]):
+                        self._collect_teacher_forced_stats(
+                            inputs.input_ids[sample_index : sample_index + 1],
+                            input_embeds[sample_index : sample_index + 1],
+                            stats_targets[sample_index : sample_index + 1],
+                            task,
+                            f"{task}:{doc_id[sample_index]}",
+                            image_grid_thw=getattr(inputs, "image_grid_thw", None),
+                            video_grid_thw=getattr(inputs, "video_grid_thw", None),
+                        )
             else:
-                output_ids = self.model.naivegenerate(inputs.input_ids, inputs_embeds=input_embeds, temperature=0, max_new_tokens=512)
+                output_ids = self.model.naivegenerate(
+                    inputs.input_ids,
+                    inputs_embeds=input_embeds.clone(),
+                    temperature=0,
+                    max_new_tokens=512,
+                )
 
             generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, output_ids)]
 
