@@ -4,7 +4,9 @@ Generate phase: draft proposals form the scored output tokens. The target
 refreshes conditioning features on the draft prefix. An optional seed-control
 mode uses one common target-greedy token and excludes it from scoring. The
 sensitivity phase compares proposals on identical teacher-forced prefixes;
-acceptance remains a separate verified-decoding phase.
+acceptance remains a separate verified-decoding phase. The target-bonus option
+appends a target-greedy token after each complete draft block without verifying
+the draft proposals.
 """
 
 from __future__ import annotations
@@ -206,6 +208,8 @@ def _write_protocol_and_check(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def run_preflight(args: argparse.Namespace) -> dict[str, Any]:
+    if getattr(args, "target_bonus_per_block", False) and args.feature_refresh != "refresh":
+        raise ValueError("--target-bonus-per-block requires --feature-refresh refresh")
     records = _selected_records(args)
     checkpoint = Path(args.checkpoint)
     if checkpoint.is_dir():
@@ -250,7 +254,7 @@ def _error_rollout(
 ) -> dict[str, Any]:
     # Keep paths, prompt content, and exception text out of durable artifacts.
     return {
-        "schema_version": 1,
+        "schema_version": 2 if target_bonus_per_block else 1,
         "experiment": "dflash_free_running",
         "row_id": row_id,
         "attempt": attempt,
@@ -307,6 +311,8 @@ def _load_models(args: argparse.Namespace, *, with_draft: bool) -> tuple[Any, An
 
 
 def run_generation(args: argparse.Namespace) -> dict[str, Any]:
+    if getattr(args, "target_bonus_per_block", False) and args.feature_refresh != "refresh":
+        raise ValueError("--target-bonus-per-block requires --feature-refresh refresh")
     records = _selected_records(args)
     protocol = _write_protocol_and_check(args)
     protocol_sha256 = protocol_fingerprint(protocol)
