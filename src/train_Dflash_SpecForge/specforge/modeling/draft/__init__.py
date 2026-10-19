@@ -1,12 +1,24 @@
 from .base import Eagle3DraftModel
-from .dflash import (
-    DFlashDraftModel,
-    build_target_layer_ids,
-    extract_context_feature,
-    sample,
-)
-from .domino import DominoDraftModel
-from .dspark import DSparkDraftModel
+try:
+    from .dflash import (
+        DFlashDraftModel,
+        build_target_layer_ids,
+        extract_context_feature,
+        sample,
+    )
+except (ImportError, ModuleNotFoundError):
+    DFlashDraftModel = None
+    build_target_layer_ids = None
+    extract_context_feature = None
+    sample = None
+try:
+    from .domino import DominoDraftModel
+except (ImportError, ModuleNotFoundError):
+    DominoDraftModel = None
+try:
+    from .dspark import DSparkDraftModel
+except (ImportError, ModuleNotFoundError):
+    DSparkDraftModel = None
 from .registry import DRAFT_REGISTRY, available_drafts, register_draft, resolve_draft
 
 

@@ -359,6 +359,9 @@ def run(args: argparse.Namespace) -> int:
         rows = [row for row in rows if row["row_id"] not in job_ids] + job_rows
         # Incremental write: a killed stage can resume without losing work.
         write_jsonl(args.output, rows)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     print(f"Wrote {len(rows)} MSD rows to {args.output}")
     try:
         lock_handle.close()

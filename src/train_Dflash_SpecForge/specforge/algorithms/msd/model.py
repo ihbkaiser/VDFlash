@@ -49,7 +49,7 @@ def decouple_msd_inputs(
         raise ValueError("visual_token_mask must have shape [B, S]")
 
     text_inputs = fusion_projection(
-        torch.cat((conditioning_hidden_state, next_token_embeddings), dim=-1)
+        torch.cat((next_token_embeddings, conditioning_hidden_state), dim=-1)
     )
     if text_inputs.shape != conditioning_hidden_state.shape:
         raise ValueError("fusion_projection must map 2 * hidden_size to hidden_size")

@@ -193,6 +193,14 @@ def _apply_transformers_compat() -> None:
 
         hf_utils.is_flash_attn_2_available = lambda: False
 
+    try:
+        import av
+
+        if not hasattr(av, "AVError"):
+            av.AVError = getattr(av, "FFmpegError", Exception)
+    except Exception:
+        pass
+
 
 _apply_transformers_compat()
 

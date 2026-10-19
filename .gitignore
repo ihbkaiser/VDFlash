@@ -70,3 +70,14 @@ data/
 
 HUGGING_FACE.md
 *.orig
+
+dataset/
+
+markdown/
+
+markdown/tasks/
+
+!markdown/
+markdown/*
+!markdown/hypothesis_text_consistency_visual_context/
+!markdown/hypothesis_text_consistency_visual_context/**
