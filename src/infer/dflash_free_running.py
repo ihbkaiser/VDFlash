@@ -38,6 +38,8 @@ class FreeRunningResult:
     feature_refresh: str
     excluded_prefix_tokens: int = 0
     target_seed_token_id: int | None = None
+    target_bonus_per_block: bool = False
+    target_bonus_tokens: int = 0
     stop_reason: str = "max_new_tokens"
     blocks: list[dict[str, Any]] = field(default_factory=list)
     target_feature_calls: int = 0
@@ -56,11 +58,19 @@ class FreeRunningResult:
     def as_dict(self) -> dict[str, Any]:
         """Describe raw generation without reporting acceptance or tau."""
         return {
-            "generation_mode": "unverified_draft_rollout",
+            "generation_mode": (
+                "unverified_draft_rollout_with_target_bonus"
+                if self.target_bonus_per_block
+                else "unverified_draft_rollout"
+            ),
             "initial_anchor": self.initial_anchor,
             "feature_refresh": self.feature_refresh,
+            "target_bonus_per_block": self.target_bonus_per_block,
+            "target_bonus_tokens": int(self.target_bonus_tokens),
             "verification_calls": 0,
-            "target_selected_output_tokens": int(self.excluded_prefix_tokens),
+            "target_selected_output_tokens": int(
+                self.excluded_prefix_tokens + self.target_bonus_tokens
+            ),
             "target_seed_token_id": self.target_seed_token_id,
             "target_feature_calls": int(self.target_feature_calls),
             "num_output_tokens": self.num_output_tokens,
@@ -98,6 +108,7 @@ class FreeRunningDFlashDecoder(InstrumentedDFlashDecoder):
         prefill_target_hidden_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
         feature_refresh: str = "refresh",
         initial_anchor: str = "last_prompt_token",
+        target_bonus_per_block: bool = False,
     ) -> FreeRunningResult:
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
             raise ValueError("input_ids must have shape [1, sequence]")
@@ -109,6 +120,8 @@ class FreeRunningDFlashDecoder(InstrumentedDFlashDecoder):
             raise ValueError("max_new_tokens must be non-negative")
         if feature_refresh not in {"refresh", "frozen"}:
             raise ValueError("feature_refresh must be 'refresh' or 'frozen'")
+        if target_bonus_per_block and feature_refresh != "refresh":
+            raise ValueError("target_bonus_per_block requires feature_refresh='refresh'")
         if initial_anchor not in {"last_prompt_token", "target_greedy_seed"}:
             raise ValueError("initial_anchor must be 'last_prompt_token' or 'target_greedy_seed'")
         block_size = int(self.draft.block_size)
@@ -136,6 +149,7 @@ class FreeRunningDFlashDecoder(InstrumentedDFlashDecoder):
             num_input_tokens=prompt_length,
             initial_anchor=initial_anchor,
             feature_refresh=feature_refresh,
+            target_bonus_per_block=bool(target_bonus_per_block),
         )
         if max_new_tokens == 0:
             return result
@@ -246,18 +260,76 @@ class FreeRunningDFlashDecoder(InstrumentedDFlashDecoder):
                 )
 
             remaining = max_new_tokens - result.num_output_tokens
-            emitted = proposals[:, :remaining]
+            draft_emitted = proposals[:, :remaining]
             eos_offset = next(
                 (
                     index
-                    for index, token_id in enumerate(emitted[0].tolist())
+                    for index, token_id in enumerate(draft_emitted[0].tolist())
                     if int(token_id) in stop_ids
                 ),
                 None,
             )
             if eos_offset is not None:
-                emitted = emitted[:, :eos_offset + 1]
+                draft_emitted = draft_emitted[:, :eos_offset + 1]
                 result.stop_reason = "eos"
+
+            emitted = draft_emitted
+            target_bonus_token_id = None
+            bonus_was_eos = False
+            target_refresh_done = False
+
+            has_full_draft_block = draft_emitted.shape[1] == block_size - 1
+            room_for_bonus = remaining > draft_emitted.shape[1]
+            if (
+                target_bonus_per_block
+                and eos_offset is None
+                and has_full_draft_block
+                and room_for_bonus
+            ):
+                # Process the old anchor and all draft proposals. The final
+                # target logit selects one bonus token; the proposals remain
+                # unverified and are never replaced or rolled back.
+                refresh_ids = torch.cat([block[:, :1], draft_emitted], dim=1)
+                refresh_positions = all_positions[
+                    ..., anchor_position:anchor_position + refresh_ids.shape[1]
+                ]
+                refresh_kwargs = {
+                    "input_ids": refresh_ids,
+                    "position_ids": refresh_positions,
+                    "past_key_values": target_cache,
+                    "cache_position": torch.arange(
+                        anchor_position,
+                        anchor_position + refresh_ids.shape[1],
+                        device=self.device,
+                    ),
+                    "use_cache": True,
+                    "logits_to_keep": 1,
+                    "return_dict": True,
+                }
+                tick = _now(self.device)
+                refreshed_output, new_context = self._target_forward_with_context(
+                    refresh_kwargs
+                )
+                result.feature_refresh_s += _now(self.device) - tick
+                result.target_feature_calls += 1
+                target_cache = getattr(refreshed_output, "past_key_values", target_cache)
+                target_bonus = refreshed_output.logits[:, -1:, :].argmax(dim=-1).to(
+                    device=self.device, dtype=torch.long
+                )
+                target_bonus_token_id = int(target_bonus.item())
+                result.target_bonus_tokens += 1
+                emitted = torch.cat([draft_emitted, target_bonus], dim=1)
+                bonus_was_eos = target_bonus_token_id in stop_ids
+                if bonus_was_eos:
+                    result.stop_reason = "eos"
+                del refreshed_output
+
+                context = torch.cat([context, new_context], dim=1)
+                context_positions = torch.cat(
+                    [context_positions, refresh_positions.to(device=self.draft_device)],
+                    dim=-1,
+                )
+                target_refresh_done = True
 
             result.blocks.append(
                 {
@@ -267,20 +339,29 @@ class FreeRunningDFlashDecoder(InstrumentedDFlashDecoder):
                     ),
                     "anchor_token_id": int(block[0, 0].item()),
                     "proposed_token_ids": proposals[0].detach().cpu().tolist(),
+                    "draft_emitted_token_ids": draft_emitted[0].detach().cpu().tolist(),
+                    "target_bonus_token_id": target_bonus_token_id,
                     "emitted_token_ids": emitted[0].detach().cpu().tolist(),
-                    "is_partial_block": int(emitted.shape[1]) < block_size - 1,
+                    "is_partial_block": int(draft_emitted.shape[1]) < block_size - 1,
                     "is_terminal": bool(
                         eos_offset is not None
+                        or bonus_was_eos
                         or result.num_output_tokens + emitted.shape[1] >= max_new_tokens
                     ),
-                    "target_tokens_selected": 0,
+                    "target_tokens_selected": int(target_bonus_token_id is not None),
                 }
             )
             result.output_ids = torch.cat([result.output_ids, emitted], dim=1)
 
-            if eos_offset is not None or result.num_output_tokens >= max_new_tokens:
+            if (
+                eos_offset is not None
+                or bonus_was_eos
+                or result.num_output_tokens >= max_new_tokens
+            ):
                 break
             if feature_refresh == "frozen":
+                continue
+            if target_refresh_done:
                 continue
 
             # Leave the final newly proposed token as the next anchor. Refresh

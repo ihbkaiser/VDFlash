@@ -214,6 +214,7 @@ def make_protocol(
     target_attention: str,
     device_map: str,
     allow_out_of_tolerance: bool,
+    target_bonus_per_block: bool = False,
 ) -> dict[str, Any]:
     model_path = Path(target_model).expanduser()
     local_model = model_path.is_dir()
@@ -249,7 +250,7 @@ def make_protocol(
             f"{seed}:{sample_id}".encode("utf-8")
         ).digest(),
     )[:max(0, int(review_samples))]
-    return {
+    protocol = {
         "schema_version": SCHEMA_VERSION,
         "generation_mode": "unverified_draft_rollout",
         "coherence_rubric_version": "text_coherence_v2_with_repetition",
@@ -290,6 +291,11 @@ def make_protocol(
         "proposal_logits_source": "draft_hidden_through_shared_target_lm_head",
         "visual_intervention": "draft_target_hidden_rows_only_target_keeps_full_video",
     }
+    if target_bonus_per_block:
+        protocol["generation_mode"] = "unverified_draft_rollout_with_target_bonus"
+        protocol["target_bonus_per_block"] = True
+        protocol["target_bonus_rule"] = "target_greedy_after_full_15_token_draft_block_v1"
+    return protocol
 
 
 def verify_or_create_protocol(path: str | Path, protocol: Mapping[str, Any]) -> None:

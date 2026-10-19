@@ -96,6 +96,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sensitivity-limit", type=int, default=10)
     parser.add_argument("--feature-refresh", choices=("refresh", "frozen"), default="refresh")
     parser.add_argument(
+        "--target-bonus-per-block",
+        action="store_true",
+        help="Append one greedy target token after each full 15-token draft block; do not verify proposals.",
+    )
+    parser.add_argument(
         "--initial-anchor-control",
         choices=("prompt_tail", "target_greedy_seed"),
         default="prompt_tail",
@@ -193,6 +198,7 @@ def _write_protocol_and_check(args: argparse.Namespace) -> dict[str, Any]:
         target_attention=args.target_attention,
         device_map=args.device_map,
         allow_out_of_tolerance=args.allow_out_of_tolerance,
+        target_bonus_per_block=bool(getattr(args, "target_bonus_per_block", False)),
     )
     verify_or_create_protocol(protocol_path, protocol)
     args._run_protocol_cache = protocol
@@ -239,7 +245,8 @@ def run_preflight(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _error_rollout(
-    *, sample: dict[str, Any], retention: int, row_id: str, attempt: int, error: Exception
+    *, sample: dict[str, Any], retention: int, row_id: str, attempt: int,
+    error: Exception, target_bonus_per_block: bool = False,
 ) -> dict[str, Any]:
     # Keep paths, prompt content, and exception text out of durable artifacts.
     return {
@@ -252,7 +259,13 @@ def _error_rollout(
         "condition": CONDITION_NAMES[retention],
         "status": "error",
         "error_type": type(error).__name__,
-        "generation_mode": "unverified_draft_rollout",
+        "generation_mode": (
+            "unverified_draft_rollout_with_target_bonus"
+            if target_bonus_per_block
+            else "unverified_draft_rollout"
+        ),
+        "target_bonus_per_block": bool(target_bonus_per_block),
+        "target_bonus_tokens": 0,
         "verification_calls": 0,
     }
 
@@ -298,6 +311,7 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
     protocol = _write_protocol_and_check(args)
     protocol_sha256 = protocol_fingerprint(protocol)
     output_path = Path(args.output_dir) / "raw_rollouts.jsonl"
+    target_bonus_per_block = bool(getattr(args, "target_bonus_per_block", False))
     existing_rows = read_jsonl(output_path) if output_path.is_file() else []
     if existing_rows and not args.resume:
         raise FileExistsError("raw_rollouts.jsonl exists; pass --resume or use a new output directory")
@@ -340,7 +354,8 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
             positions = prompt[1] if prompt else []
             fingerprint = prompt[2] if prompt else str(sample.get("input_fingerprint", ""))
             for retention in _free_running_retentions(args):
-                row_id = f"{sample_id}:free-running:{args.feature_refresh}:{args.initial_anchor_control}:retention-{retention}"
+                bonus_tag = ":target-bonus" if target_bonus_per_block else ""
+                row_id = f"{sample_id}:free-running:{args.feature_refresh}:{args.initial_anchor_control}:retention-{retention}{bonus_tag}"
                 previous = latest.get(row_id)
                 if previous and (previous.get("status") == "ok" or not args.retry_errors):
                     skipped += 1
@@ -350,6 +365,7 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
                     row = _error_rollout(
                         sample=sample, retention=retention, row_id=row_id,
                         attempt=attempt, error=prompt_error,
+                        target_bonus_per_block=target_bonus_per_block,
                     )
                     row["protocol_sha256"] = protocol_sha256
                 else:
@@ -365,6 +381,7 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
                             stop_token_ids=stop_ids,
                             context_keep_mask=keep_mask,
                             feature_refresh=args.feature_refresh,
+                            target_bonus_per_block=target_bonus_per_block,
                             initial_anchor=(
                                 "target_greedy_seed"
                                 if args.initial_anchor_control == "target_greedy_seed"
@@ -374,8 +391,9 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
                         output_start = result.num_input_tokens + result.excluded_prefix_tokens
                         output_ids = result.output_ids[0, output_start:]
                         prediction = _decode_text(processor, output_ids)
+                        rollout_metadata = result.as_dict()
                         row = {
-                            "schema_version": 1,
+                            "schema_version": 2 if target_bonus_per_block else 1,
                             "experiment": "dflash_free_running",
                             "row_id": row_id,
                             "attempt": attempt,
@@ -383,7 +401,9 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
                             "question": str(sample.get("question", "")),
                             "input_fingerprint": fingerprint,
                             "status": "ok" if prediction else "empty_output",
-                            "generation_mode": "unverified_draft_rollout",
+                            "generation_mode": rollout_metadata["generation_mode"],
+                            "target_bonus_per_block": target_bonus_per_block,
+                            "target_bonus_tokens": result.target_bonus_tokens,
                             "feature_refresh": args.feature_refresh,
                             "initial_anchor": result.initial_anchor,
                             "target_seed_token_id": result.target_seed_token_id,
@@ -398,14 +418,17 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
                             "stop_reason": result.stop_reason,
                             "target_feature_calls": result.target_feature_calls,
                             "target_forward_logits_used_for_proposals": 0,
+                            "target_forward_logits_used_for_target_bonus": result.target_bonus_tokens,
                             "target_seed_selected_from_target_logits": result.target_seed_token_id is not None,
                             "proposal_logits_source": "draft_hidden_through_shared_target_lm_head",
                             "verification_calls": 0,
-                            "target_selected_output_tokens": result.excluded_prefix_tokens,
+                            "target_selected_output_tokens": (
+                                result.excluded_prefix_tokens + result.target_bonus_tokens
+                            ),
                             "prediction_token_ids": output_ids.detach().cpu().tolist(),
                             "prediction": prediction,
                             "blocks": result.blocks,
-                            "timing": result.as_dict()["timing"],
+                            "timing": rollout_metadata["timing"],
                             "target_model": protocol["target_model"],
                             "checkpoint": protocol["checkpoint"],
                             "draft_config_sha256": protocol["draft_config_sha256"],
@@ -415,6 +438,7 @@ def run_generation(args: argparse.Namespace) -> dict[str, Any]:
                         row = _error_rollout(
                             sample=sample, retention=retention, row_id=row_id,
                             attempt=attempt, error=exc,
+                            target_bonus_per_block=target_bonus_per_block,
                         )
                 row.setdefault("protocol_sha256", protocol_sha256)
                 append_jsonl(output_path, row)
