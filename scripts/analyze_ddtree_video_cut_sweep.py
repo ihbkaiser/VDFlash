@@ -406,9 +406,16 @@ def plot_metric(
     axes[0].set_ylabel(ylabel)
     handles, labels = axes[0].get_legend_handles_labels()
     if handles:
-        fig.legend(handles, labels, loc="upper center", ncol=2, frameon=False)
-    fig.suptitle(title, y=1.04)
-    fig.tight_layout()
+        fig.legend(
+            handles,
+            labels,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.935),
+            ncol=2,
+            frameon=False,
+        )
+    fig.suptitle(title, y=0.99)
+    fig.tight_layout(rect=(0, 0, 1, 0.84))
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output, dpi=170, bbox_inches="tight")
     plt.close(fig)

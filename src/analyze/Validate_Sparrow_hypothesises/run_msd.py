@@ -431,7 +431,11 @@ def _run_job(
                         f"Missing attention scores for {score_key}; run the Figure 2 runner first "
                         "or use --selection uniform"
                     )
-            draft = prepared if condition == "full" else compact_qwen2vl_prefill(prepared, percentage, scores)
+            draft = (
+                prepared
+                if condition == "full"
+                else compact_qwen2vl_prefill(prepared, percentage, scores, policy=args.selection)
+            )
             if condition == "full":
                 speculative_ids, trace = generate_msd_full_video(
                     model,
@@ -633,7 +637,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retention-percentages", type=float, nargs="+", default=None)
     parser.add_argument(
         "--selection",
-        choices=("uniform", "top_attention", "last_instruction", "all_text"),
+        choices=("uniform", "suffix", "prefix", "top_attention", "last_instruction", "all_text"),
         default="uniform",
         help="How retention keeps visual tokens. last_instruction/all_text consume Figure 2 scores; top_attention is an alias for last_instruction.",
     )

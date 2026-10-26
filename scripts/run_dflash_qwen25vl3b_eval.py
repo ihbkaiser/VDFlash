@@ -45,6 +45,27 @@ def sha256_tokens(tokens: list[int]) -> str:
     return hashlib.sha256(json.dumps(tokens).encode("utf-8")).hexdigest()[:16]
 
 
+def select_visual_positions(
+    visual_count: int,
+    percentage: float,
+    policy: str = "suffix",
+) -> list[int]:
+    """Select indices of visual tokens to retain according to retention policy."""
+    if visual_count == 0 or percentage <= 0:
+        return []
+    if percentage >= 100.0:
+        return list(range(visual_count))
+    keep = max(1, round(visual_count * percentage / 100.0))
+    if policy in ("suffix", "tail"):
+        return list(range(visual_count - keep, visual_count))
+    elif policy in ("prefix", "head"):
+        return list(range(keep))
+    elif policy == "uniform":
+        return sorted({min(visual_count - 1, (index * visual_count) // keep) for index in range(keep)})
+    else:
+        raise ValueError(f"Unknown visual retention policy: {policy}")
+
+
 def load_dataset_records(manifest_path: str | Path, dataset_root: str | Path) -> list[dict[str, Any]]:
     manifest_file = Path(manifest_path)
     records = []
@@ -104,13 +125,14 @@ def run_benchmark_for_dataset(
     limit: int | None = None,
     max_new_tokens: int = 128,
     retention_percentages: list[float] | None = None,
+    retention_policy: str = "suffix",
 ):
     if retention_percentages is None:
-        retention_percentages = [100.0, 50.0, 25.0, 0.0]
+        retention_percentages = [100.0, 50.0, 25.0, 5.0, 0.0]
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    jsonl_output = output_dir / f"dflash_retention_{dataset_name.lower()}.jsonl"
-    csv_output = output_dir / f"draft_iterations_{dataset_name.lower()}.csv"
+    jsonl_output = output_dir / f"dflash_retention_{retention_policy}_{dataset_name.lower()}.jsonl"
+    csv_output = output_dir / f"draft_iterations_{retention_policy}_{dataset_name.lower()}.csv"
 
     # Resume handling
     existing_rows: set[str] = set()
@@ -154,7 +176,7 @@ def run_benchmark_for_dataset(
 
         all_done = True
         for ret in retention_percentages:
-            row_id = f"{sample_id}:dflash:depth{depth}:retention-{int(ret)}"
+            row_id = f"{sample_id}:dflash:depth{depth}:{retention_policy}:retention-{int(ret)}"
             if row_id not in existing_rows:
                 all_done = False
                 break
@@ -221,16 +243,23 @@ def run_benchmark_for_dataset(
 
             # 2. Run DFlash Speculative Decoding for each retention percentage
             for ret in retention_percentages:
-                row_id = f"{sample_id}:dflash:depth{depth}:retention-{int(ret)}"
+                row_id = f"{sample_id}:dflash:depth{depth}:{retention_policy}:retention-{int(ret)}"
                 if row_id in existing_rows:
                     continue
 
                 if ret >= 100.0:
                     keep_mask = None
                     actual_visual_tokens = len(visual_positions)
+                elif ret <= 0.0:
+                    actual_visual_tokens = 0
+                    keep_mask = torch.ones(prompt_len, dtype=torch.bool, device="cuda:0")
+                    for p_idx in visual_positions:
+                        keep_mask[p_idx] = False
                 else:
-                    keep_count = int(round(len(visual_positions) * ret / 100.0))
-                    kept_positions = set(visual_positions[:keep_count]) if keep_count > 0 else set()
+                    local_kept = select_visual_positions(
+                        len(visual_positions), ret, policy=retention_policy
+                    )
+                    kept_positions = {visual_positions[i] for i in local_kept}
                     actual_visual_tokens = len(kept_positions)
                     keep_mask = torch.ones(prompt_len, dtype=torch.bool, device="cuda:0")
                     for p_idx in visual_positions:
@@ -279,6 +308,7 @@ def run_benchmark_for_dataset(
                     "dataset": dataset_name,
                     "drafter": "dflash",
                     "draft_depth": depth,
+                    "selection_policy": retention_policy,
                     "retention_percentage": ret,
                     "actual_visual_tokens": actual_visual_tokens,
                     "full_visual_tokens": len(visual_positions),
@@ -335,22 +365,28 @@ def main():
     parser.add_argument("--checkpoint", default="dataset/qwen25vl-3b-depth1-depth3/qwen25vl-3b-dflash-llava68k-h32-depth3-latest/training_state.pt")
     parser.add_argument("--draft-config", default="src/train_Dflash_SpecForge/configs/qwen2.5-vl-3b-dflash-h32-depth3.json")
     parser.add_argument("--depth", type=int, default=3)
-    parser.add_argument("--dataset", choices=["vidhalluc", "videochair", "both"], default="both")
-    parser.add_argument("--output-dir", type=Path, default=Path("results/dflash_eval_20261013"))
+    parser.add_argument("--dataset", choices=["vidhalluc", "videochair", "vdc", "both", "all"], default="all")
+    parser.add_argument("--policy", choices=["suffix", "prefix", "uniform"], default="suffix")
+    parser.add_argument("--retention-levels", type=str, default="100,50,25,5,0")
+    parser.add_argument("--output-dir", type=Path, default=Path("results/dflash_eval_qwen25vl3b"))
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--max-new-tokens", type=int, default=64)
+    parser.add_argument("--max-new-tokens", type=int, default=128)
     args = parser.parse_args()
+
+    retention_percentages = [float(x.strip()) for x in args.retention_levels.split(",") if x.strip()]
 
     print("=================================================================")
     print(" DFLASH MULTI-GPU BENCHMARK ON QWEN2.5-VL-3B (RTX 3090 + RTX A4000)")
     print("=================================================================")
-    print(f"Target Model: {args.target_model}")
-    print(f"Checkpoint:   {args.checkpoint}")
-    print(f"Draft Config: {args.draft_config}")
-    print(f"Draft Depth:  {args.depth}")
-    print(f"Dataset:      {args.dataset}")
-    print(f"Output Dir:   {args.output_dir}")
-    print(f"Limit:        {args.limit}")
+    print(f"Target Model:     {args.target_model}")
+    print(f"Checkpoint:       {args.checkpoint}")
+    print(f"Draft Config:     {args.draft_config}")
+    print(f"Draft Depth:      {args.depth}")
+    print(f"Policy:           {args.policy}")
+    print(f"Retention Levels: {retention_percentages}")
+    print(f"Dataset:          {args.dataset}")
+    print(f"Output Dir:       {args.output_dir}")
+    print(f"Limit:            {args.limit}")
     print("=================================================================")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -376,17 +412,28 @@ def main():
     print(f"Draft loaded in {load_s:.2f}s on cuda:1! Total VRAM: GPU 0 = {torch.cuda.memory_allocated(0)/1e9:.2f} GB, GPU 1 = {torch.cuda.memory_allocated(1)/1e9:.2f} GB")
 
     datasets_to_run = []
-    if args.dataset in {"vidhalluc", "both"}:
+    if args.dataset in {"vidhalluc", "both", "all"}:
         datasets_to_run.append((
             "vidhalluc",
             "dataset/VidHalluc/test.jsonl",
             "dataset/VidHalluc",
         ))
-    if args.dataset in {"videochair", "both"}:
+    if args.dataset in {"videochair", "both", "all"}:
         datasets_to_run.append((
             "videochair",
             "dataset/VideoChair/test.jsonl",
             "dataset/VideoChair",
+        ))
+    if args.dataset in {"vdc", "all"}:
+        vdc_manifest = (
+            "dataset/VideoDetailCaption/test.jsonl"
+            if Path("dataset/VideoDetailCaption/test.jsonl").exists()
+            else "dataset/VideoDetailCaption/test_100.jsonl"
+        )
+        datasets_to_run.append((
+            "vdc",
+            vdc_manifest,
+            "dataset/VideoDetailCaption",
         ))
 
     for name, manifest, root in datasets_to_run:
@@ -402,6 +449,8 @@ def main():
             depth=args.depth,
             limit=args.limit,
             max_new_tokens=args.max_new_tokens,
+            retention_percentages=retention_percentages,
+            retention_policy=args.policy,
         )
 
     print("\n=================================================================")

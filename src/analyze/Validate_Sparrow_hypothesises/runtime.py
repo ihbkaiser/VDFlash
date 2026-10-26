@@ -130,10 +130,10 @@ def acceptance_round_record(
 ) -> dict[str, Any]:
     """Map one speculative round to absolute answer-token positions.
 
-    ``accept_length`` is the number of draft proposals accepted by the
-    vendored EAGLE loop.  The loop then emits one additional target token as
-    the fallback/next-token position, so that token is recorded separately
-    rather than being counted as a draft acceptance.
+    The vendored EAGLE candidate sequence starts each round with a target
+    selected root token, followed by ``accept_length`` accepted draft
+    proposals.  The root belongs to the current output position; the accepted
+    proposals follow it.
     """
 
     if prompt_length < 0 or current_length < prompt_length:
@@ -145,11 +145,58 @@ def acceptance_round_record(
         "round_index": int(round_index),
         "answer_position_start": int(answer_start),
         "accepted_proposal_count": int(accept_length),
-        "accepted_proposal_positions": list(range(answer_start, answer_start + accept_length)),
-        "fallback_position": int(answer_start + accept_length),
+        "accepted_proposal_positions": list(
+            range(answer_start + 1, answer_start + accept_length + 1)
+        ),
+        "fallback_position": int(answer_start),
         "absolute_position_start": int(current_length),
         "emitted_token_count": int(accept_length + 1),
     }
+
+
+def cap_msd_acceptance_to_remaining(
+    logits: torch.Tensor,
+    *,
+    best_candidate: int | torch.Tensor,
+    accept_length: int | torch.Tensor,
+    sample_p: torch.Tensor,
+    remaining_tokens: int,
+) -> tuple[int, torch.Tensor, bool]:
+    """Clip a speculative round so it commits at most the remaining output.
+
+    The round appends one target-selected root plus ``accept_length`` draft
+    proposals. If clipping is needed, the next target token distribution must
+    be taken from the verifier row after the retained prefix.
+    """
+
+    if remaining_tokens <= 0:
+        raise ValueError("remaining_tokens must be positive")
+    accepted = int(accept_length.item()) if isinstance(accept_length, torch.Tensor) else int(accept_length)
+    candidate = int(best_candidate.item()) if isinstance(best_candidate, torch.Tensor) else int(best_candidate)
+    if accepted < 0:
+        raise ValueError("accept_length must be non-negative")
+    emitted = accepted + 1
+    stop_after_round = emitted >= remaining_tokens
+    if emitted > remaining_tokens:
+        accepted = remaining_tokens - 1
+        sample_p = logits[candidate, accepted]
+    return accepted, sample_p, stop_after_round
+
+
+@contextmanager
+def use_msd_author_mode():
+    """Enable the author checkpoint's inference path for one decode only."""
+
+    try:
+        from eagle.model.utils import temp_cache
+    except ImportError as exc:  # pragma: no cover - checked by Colab preflight
+        raise RuntimeUnavailableError("MSD EAGLE must be importable before inference") from exc
+    previous = temp_cache.use_msd
+    temp_cache.use_msd = True
+    try:
+        yield
+    finally:
+        temp_cache.use_msd = previous
 
 
 def move_batch_to_device(batch: Any, device: torch.device | str) -> Any:
@@ -209,13 +256,13 @@ def select_visual_positions(
     visual_count: int,
     percentage: float,
     scores: Sequence[float] | None = None,
+    policy: str = "uniform",
 ) -> torch.Tensor:
     """Return deterministic local visual indices for a draft context.
 
     If attention scores are supplied, ties are resolved by the original
-    position.  Without scores, positions are spread uniformly; this is useful
-    only as an explicit baseline and is never labelled ``Last Instr.`` or
-    ``All Text``.
+    position.  Without scores, positions follow policy: 'suffix', 'prefix',
+    or 'uniform'.
     """
 
     if visual_count < 0 or not 0 <= percentage <= 100:
@@ -230,8 +277,15 @@ def select_visual_positions(
             raise ValueError("scores length must equal visual_count")
         order = sorted(range(visual_count), key=lambda index: (-float(scores[index]), index))
         return torch.tensor(sorted(order[:keep]), dtype=torch.long)
-    positions = sorted({min(visual_count - 1, (index * visual_count) // keep) for index in range(keep)})
-    return torch.tensor(positions, dtype=torch.long)
+    if policy in ("suffix", "tail"):
+        return torch.arange(visual_count - keep, visual_count, dtype=torch.long)
+    elif policy in ("prefix", "head"):
+        return torch.arange(keep, dtype=torch.long)
+    elif policy == "uniform":
+        positions = sorted({min(visual_count - 1, (index * visual_count) // keep) for index in range(keep)})
+        return torch.tensor(positions, dtype=torch.long)
+    else:
+        raise ValueError(f"Unknown visual retention policy: {policy}")
 
 
 def make_visual_mask(total_tokens: int, visual_positions: Sequence[int]) -> torch.Tensor:
@@ -324,6 +378,7 @@ def compact_qwen2vl_prefill(
     prepared: PreparedPrefill,
     percentage: float,
     scores: Sequence[float] | None = None,
+    policy: str = "uniform",
 ) -> PreparedPrefill:
     """Build the draft-side context for the Figure 1(b) retention sweep.
 
@@ -337,7 +392,7 @@ def compact_qwen2vl_prefill(
     if not 0 <= percentage <= 100:
         raise ValueError("percentage must be in [0, 100]")
     visual = prepared.video_positions.detach().to("cpu")
-    selected_local = select_visual_positions(int(visual.numel()), percentage, scores)
+    selected_local = select_visual_positions(int(visual.numel()), percentage, scores, policy=policy)
     selected_global = visual[selected_local] if selected_local.numel() else visual[:0]
     keep = torch.ones(prepared.input_ids.shape[1], dtype=torch.bool, device=prepared.input_ids.device)
     visual_mask = torch.zeros_like(keep)
@@ -1182,7 +1237,11 @@ def _video_tree_decoding(model, tree_candidates, past_key_values, tree_position_
 
 
 @contextmanager
-def patched_msd_video_path(model: Any, prepared: PreparedPrefill):
+def patched_msd_video_path(
+    model: Any,
+    prepared: PreparedPrefill,
+    max_new_tokens: int | None = None,
+):
     """Temporarily make the original MSD loop aware of Qwen2-VL positions."""
 
     try:
@@ -1201,14 +1260,36 @@ def patched_msd_video_path(model: Any, prepared: PreparedPrefill):
         "prefill_seconds": None,
         "verification_start": None,
         "verification_end": None,
+        "max_new_tokens": max_new_tokens,
+        "committed_output_tokens": 0,
+        "stop_after_round": False,
     }
 
     def evaluate_with_trace(*args, **kwargs):
         result = old_evaluate(*args, **kwargs)
+        if max_new_tokens is not None:
+            logits = kwargs.get("logits", args[0] if args else None)
+            best_candidate, accept_length, sample_p = result
+            remaining = max_new_tokens - capture["committed_output_tokens"]
+            accept_length, sample_p, stop_after_round = cap_msd_acceptance_to_remaining(
+                logits,
+                best_candidate=best_candidate,
+                accept_length=accept_length,
+                sample_p=sample_p,
+                remaining_tokens=remaining,
+            )
+            capture["stop_after_round"] = stop_after_round
+            result = (best_candidate, accept_length, sample_p)
         capture["trace"].append(int(result[1]))
         return result
 
     old_update = ea_module.update_inference_inputs
+    old_topk = model.ea_layer.topK_genrate
+
+    def topk_until_output_cap(*args: Any, **kwargs: Any):
+        if capture["stop_after_round"]:
+            return None, None, None, None
+        return old_topk(*args, **kwargs)
 
     def update_with_position_trace(*args: Any, **kwargs: Any):
         input_ids = kwargs.get("input_ids", args[0] if args else None)
@@ -1223,7 +1304,16 @@ def patched_msd_video_path(model: Any, prepared: PreparedPrefill):
                 round_index=len(capture["acceptance_by_position"]),
             )
         )
-        return old_update(*args, **kwargs)
+        result = old_update(*args, **kwargs)
+        committed_tokens = int(result[5])
+        capture["committed_output_tokens"] = committed_tokens
+        if capture["stop_after_round"] and max_new_tokens is not None:
+            # Keep the output at exactly the requested size while satisfying
+            # EaModel.msdgenerate's strict-greater-than stop condition.
+            result = list(result)
+            result[5] = max_new_tokens + 1
+            result = tuple(result)
+        return result
 
     def initialize_with_timing(*args, **kwargs):
         if torch.cuda.is_available():
@@ -1238,6 +1328,7 @@ def patched_msd_video_path(model: Any, prepared: PreparedPrefill):
     model._video_prefill_position_ids = prepared.position_ids
     model._video_rope_delta = prepared.rope_deltas
     model.forward = types.MethodType(_video_forward, model)
+    model.ea_layer.topK_genrate = topk_until_output_cap
 
     def tree_decoding_with_timing(*args: Any, **kwargs: Any):
         if capture["verification_start"] is None:
@@ -1258,6 +1349,7 @@ def patched_msd_video_path(model: Any, prepared: PreparedPrefill):
         yield capture
     finally:
         model.forward = old_forward
+        model.ea_layer.topK_genrate = old_topk
         lm_head_context.__exit__(None, None, None)
         model._video_prefill_position_ids = None
         model._video_rope_delta = None
@@ -1311,8 +1403,10 @@ def generate_msd_full_video(
         if zero_visual_values
         else nullcontext()
     )
-    with value_context:
-        with patched_msd_video_path(model, prepared) as capture:
+    with use_msd_author_mode(), value_context:
+        with patched_msd_video_path(
+            model, prepared, max_new_tokens=max_new_tokens
+        ) as capture:
             output = model.msdgenerate(
                 prepared.input_ids,
                 inputs_embeds=prepared.inputs_embeds,
@@ -1384,8 +1478,10 @@ def generate_msd_retention_video(
         if zero_visual_values
         else nullcontext()
     )
-    with value_context:
-        with patched_msd_video_path(model, prepared_full) as capture:
+    with use_msd_author_mode(), value_context:
+        with patched_msd_video_path(
+            model, prepared_full, max_new_tokens=max_new_tokens
+        ) as capture:
             model.ea_layer.reset_kv()
             past_key_values, past_key_values_data, current_length_data = ea_module.initialize_past_key_values(
                 model.base_model,
@@ -1433,6 +1529,8 @@ def generate_msd_retention_video(
             original_topk = model.ea_layer.topK_genrate
 
             def compacted_topk(*args: Any, **kwargs: Any):
+                if capture["stop_after_round"]:
+                    return None, None, None, None
                 inputs_embeds = kwargs.get("inputs_embeds", args[4] if len(args) > 4 else None)
                 if inputs_embeds is not None:
                     # First call: the compacted context (with real visual features).
@@ -1510,7 +1608,7 @@ def generate_msd_retention_video(
                         break
                     if hasattr(model.tokenizer, "eod_id") and model.tokenizer.eod_id in input_ids[0, input_len:].tolist():
                         break
-                    if new_token > max_new_tokens:
+                    if new_token >= max_new_tokens:
                         break
                     if input_ids.shape[1] > max_length:
                         break

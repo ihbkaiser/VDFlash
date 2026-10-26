@@ -264,6 +264,37 @@ class Qwen3DFlashAttention(nn.Module):
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+
+        # Keep the cache dense and gather only the keys/values used by this
+        # attention call. This lets the verifier change its selected context
+        # between rounds without rebuilding or losing the full DFlash KV bank.
+        context_keep_indices = getattr(self, "context_keep_indices", None)
+        if context_keep_indices is not None:
+            context_length = int(k.shape[-2]) - int(q_len)
+            indices = context_keep_indices.to(device=k.device, dtype=torch.long)
+            if indices.ndim != 1 or indices.numel() == 0:
+                raise ValueError("context_keep_indices must be a non-empty vector")
+            context_keys = k[..., :context_length, :].index_select(-2, indices)
+            context_values = v[..., :context_length, :].index_select(-2, indices)
+            noise_keys = k[..., context_length:, :]
+            noise_values = v[..., context_length:, :]
+            k = torch.cat((context_keys, noise_keys), dim=-2)
+            v = torch.cat((context_values, noise_values), dim=-2)
+            if attention_mask is not None:
+                if not torch.is_tensor(attention_mask) or attention_mask.ndim < 3:
+                    raise ValueError(
+                        "selected context requires a tensor attention mask with a key axis"
+                    )
+                if attention_mask.shape[-1] != context_length + q_len:
+                    raise ValueError(
+                        "attention mask key length does not match the cached context and draft block"
+                    )
+                mask_context = attention_mask[..., :context_length].index_select(
+                    -1, indices.to(device=attention_mask.device)
+                )
+                attention_mask = torch.cat(
+                    (mask_context, attention_mask[..., context_length:]), dim=-1
+                )
         valid_queries = None
         if self.config._attn_implementation == "flex_attention":
             kernel_options = dict(kwargs.pop("kernel_options", None) or {})

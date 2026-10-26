@@ -41,14 +41,29 @@ def sha256_tokens(tokens: list[int]) -> str:
     return hashlib.sha256(json.dumps(tokens).encode("utf-8")).hexdigest()[:16]
 
 
-def select_uniform_visual_positions(visual_count: int, percentage: float) -> list[int]:
+def select_visual_positions(
+    visual_count: int,
+    percentage: float,
+    policy: str = "suffix",
+) -> list[int]:
+    """Select indices of visual tokens to retain according to retention policy."""
     if visual_count == 0 or percentage <= 0:
         return []
     if percentage >= 100.0:
         return list(range(visual_count))
     keep = max(1, round(visual_count * percentage / 100.0))
-    positions = sorted({min(visual_count - 1, (index * visual_count) // keep) for index in range(keep)})
-    return positions
+    if policy in ("suffix", "tail"):
+        return list(range(visual_count - keep, visual_count))
+    elif policy in ("prefix", "head"):
+        return list(range(keep))
+    elif policy == "uniform":
+        return sorted({min(visual_count - 1, (index * visual_count) // keep) for index in range(keep)})
+    else:
+        raise ValueError(f"Unknown visual retention policy: {policy}")
+
+
+def select_uniform_visual_positions(visual_count: int, percentage: float) -> list[int]:
+    return select_visual_positions(visual_count, percentage, policy="uniform")
 
 
 def load_dataset_records(manifest_path: str | Path, dataset_root: str | Path) -> list[dict[str, Any]]:
@@ -116,6 +131,12 @@ class MSDSpeculativeEngine:
     def decode_token(self, token_id: int) -> str:
         return self.processor.tokenizer.decode([token_id])
 
+    def _get_rope_index(self, **kwargs):
+        fn = getattr(self.target, "get_rope_index", getattr(getattr(self.target, "model", None), "get_rope_index", None))
+        if fn is None:
+            raise AttributeError("Neither target nor target.model has get_rope_index")
+        return fn(**kwargs)
+
     @torch.inference_mode()
     def run_autoregressive(
         self,
@@ -127,8 +148,8 @@ class MSDSpeculativeEngine:
             torch.cuda.synchronize(self.device)
         t_start = time.perf_counter()
 
-        pos_ids, _ = self.target.get_rope_index(
-            batch["input_ids"],
+        pos_ids, _ = self._get_rope_index(
+            input_ids=batch["input_ids"],
             image_grid_thw=batch.get("image_grid_thw"),
             video_grid_thw=batch.get("video_grid_thw"),
             attention_mask=batch.get("attention_mask"),
@@ -179,14 +200,15 @@ class MSDSpeculativeEngine:
         visual_positions_in_prompt: list[int],
         max_new_tokens: int,
         target_ground_truth_ids: list[int] | None = None,
+        retention_policy: str = "suffix",
     ) -> dict[str, Any]:
         """Run MSD speculative decoding with visual token retention compaction."""
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         t_start = time.perf_counter()
 
-        pos_ids, rope_deltas = self.target.get_rope_index(
-            batch["input_ids"],
+        pos_ids, rope_deltas = self._get_rope_index(
+            input_ids=batch["input_ids"],
             image_grid_thw=batch.get("image_grid_thw"),
             video_grid_thw=batch.get("video_grid_thw"),
             attention_mask=batch.get("attention_mask"),
@@ -205,7 +227,9 @@ class MSDSpeculativeEngine:
         t0 = out.logits[:, -1, :].argmax(dim=-1).item()
 
         # Build Draft KV Cache with visual retention compaction
-        local_kept = select_uniform_visual_positions(len(visual_positions_in_prompt), retention_percentage)
+        local_kept = select_visual_positions(
+            len(visual_positions_in_prompt), retention_percentage, policy=retention_policy
+        )
         kept_positions = {visual_positions_in_prompt[i] for i in local_kept}
         prune_positions = [pos for pos in visual_positions_in_prompt if pos not in kept_positions]
 
@@ -277,7 +301,7 @@ class MSDSpeculativeEngine:
         while answer_pos < max_new_tokens and curr_tok not in self.stop_token_ids:
             # Draft proposes K=2 tokens
             # Proposal 1
-            tok_emb = self.target.model.embed_tokens(torch.tensor([[curr_tok]], device=self.device))
+            tok_emb = self.target.get_input_embeddings()(torch.tensor([[curr_tok]], device=self.device))
             vis_mask = torch.zeros(1, 1, dtype=torch.bool, device=self.device)
             d_pids_1 = torch.tensor([[[kv_len - 1 + delta]]] * 3, device=self.device)
             d_h1 = self.draft(
@@ -290,7 +314,7 @@ class MSDSpeculativeEngine:
             c1 = self.target.lm_head(d_h1).argmax(dim=-1)[0, 0].item()
 
             # Proposal 2
-            tok_emb2 = self.target.model.embed_tokens(torch.tensor([[c1]], device=self.device))
+            tok_emb2 = self.target.get_input_embeddings()(torch.tensor([[c1]], device=self.device))
             d_pids_2 = torch.tensor([[[kv_len + delta]]] * 3, device=self.device)
             d_h2 = self.draft(
                 conditioning_hidden_state=d_h1,
@@ -561,16 +585,18 @@ def run_benchmark_for_config(
     limit: int | None = None,
     max_new_tokens: int = 128,
     overwrite: bool = False,
+    retention_policy: str = "suffix",
+    retention_percentages: list[float] | None = None,
 ):
     device = torch.device(f"cuda:{gpu_id}")
-    print(f"\n[{dataset_name} | Depth {depth} | GPU {gpu_id}] Initializing Benchmark...")
+    print(f"\n[{dataset_name} | Depth {depth} | Policy {retention_policy} | GPU {gpu_id}] Initializing Benchmark...")
     print(f"Target: {target_model_path}")
     print(f"Checkpoint: {checkpoint_path}")
     print(f"Output: {output_dir}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    jsonl_output = output_dir / f"msd_retention_{dataset_name.lower()}.jsonl"
-    csv_output = output_dir / "draft_iterations_detailed.csv"
+    jsonl_output = output_dir / f"msd_retention_{retention_policy}_{dataset_name.lower()}.jsonl"
+    csv_output = output_dir / f"draft_iterations_{retention_policy}_{dataset_name.lower()}.csv"
 
     if overwrite:
         if jsonl_output.exists():
@@ -617,23 +643,25 @@ def run_benchmark_for_config(
 
     state = resolve_training_state(checkpoint_path)
     draft = materialize_draft(state, tmp_cfg_path)
-    draft.embed_tokens.weight.data.copy_(target.model.embed_tokens.weight.data)
+    input_embeds = target.get_input_embeddings().weight.data
+    draft.embed_tokens.weight.data.copy_(input_embeds)
     draft.to(device=device, dtype=torch.bfloat16).eval()
 
     engine = MSDSpeculativeEngine(target, draft, processor, device, proposal_count=2)
     from qwen_vl_utils import process_vision_info
 
-    retention_percentages = [100.0, 50.0, 25.0, 0.0]
+    if retention_percentages is None:
+        retention_percentages = [100.0, 50.0, 25.0, 5.0, 0.0]
 
     for sample_idx, sample in enumerate(records):
         sample_id = sample["sample_id"]
         video_path = sample["video_path"]
         question = sample["question"]
 
-        # Check if all 4 retention rows for this sample already exist
+        # Check if all retention rows for this sample already exist
         all_done = True
         for ret in retention_percentages:
-            row_id = f"{sample_id}:native:uniform:retention-{int(ret)}"
+            row_id = f"{sample_id}:native:{retention_policy}:retention-{int(ret)}"
             if row_id not in existing_rows:
                 all_done = False
                 break
@@ -699,9 +727,9 @@ def run_benchmark_for_config(
         target_hash = sha256_tokens(target_ids)
         ar_e2e_s = ar_prefill_s + ar_decode_s
 
-        # 2. Run Speculative Decoding across the 4 retention percentages
+        # 2. Run Speculative Decoding across the retention percentages
         for ret in retention_percentages:
-            row_id = f"{sample_id}:native:uniform:retention-{int(ret)}"
+            row_id = f"{sample_id}:native:{retention_policy}:retention-{int(ret)}"
             if row_id in existing_rows:
                 continue
 
@@ -711,6 +739,7 @@ def run_benchmark_for_config(
                 visual_positions_in_prompt=vis_positions,
                 max_new_tokens=max_new_tokens,
                 target_ground_truth_ids=target_ids,
+                retention_policy=retention_policy,
             )
 
             spec_ids = spec_res["speculative_output_ids"]
@@ -727,8 +756,8 @@ def run_benchmark_for_config(
                 "sample_id": sample_id,
                 "condition": "retention",
                 "paper_figure": "Figure 1(b)",
-                "series_id": "vdc_uniform",
-                "selection_policy": "uniform",
+                "series_id": f"{dataset_name.lower()}_{retention_policy}",
+                "selection_policy": retention_policy,
                 "retention_percentage": float(ret),
                 "target_model": "Qwen/Qwen2.5-VL-3B-Instruct",
                 "draft_depth": depth,
@@ -804,9 +833,14 @@ def main():
     parser.add_argument("--depth", type=int, choices=[3, 5], required=True)
     parser.add_argument("--dataset", choices=["vidhalluc", "videochair", "vdc", "all"], default="all")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--policy", choices=["suffix", "prefix", "uniform"], default="suffix")
+    parser.add_argument("--retention-levels", type=str, default="100,50,25,5,0")
+    parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--output-base", type=Path, default=Path("results/msd_eval_qwen25vl3b"))
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing output files")
     args = parser.parse_args()
+
+    retention_percentages = [float(x.strip()) for x in args.retention_levels.split(",") if x.strip()]
 
     target_path = "/path/to/local-resource"
     ckpt_path = f"dataset/qwen25vl-3b-msd-checkpoints/qwen25vl-3b-msd-depth{args.depth}-latest/training_state.pt"
@@ -825,7 +859,11 @@ def main():
             root = "dataset/VideoChair"
             max_new = 128
         elif ds == "vdc":
-            manifest = "dataset/VideoDetailCaption/test_100.jsonl"
+            manifest = (
+                "dataset/VideoDetailCaption/test.jsonl"
+                if Path("dataset/VideoDetailCaption/test.jsonl").exists()
+                else "dataset/VideoDetailCaption/test_100.jsonl"
+            )
             root = "dataset/VideoDetailCaption"
             max_new = 128
 
@@ -842,6 +880,8 @@ def main():
             limit=args.limit,
             max_new_tokens=max_new,
             overwrite=args.overwrite,
+            retention_policy=args.policy,
+            retention_percentages=retention_percentages,
         )
 
 

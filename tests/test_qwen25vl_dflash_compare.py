@@ -29,6 +29,11 @@ from src.infer.qwen25vl_dflash_compare import (
     summarize_dflash_attention,
     validate_report_success,
 )
+from src.infer.verify_attention_selectors import (
+    causal_mean_attention,
+    reduce_attention_scores,
+    select_top_context_indices,
+)
 
 
 class _CaptureLayer(nn.Module):
@@ -85,6 +90,47 @@ def test_extract_context_feature_moves_selected_layers_to_requested_device():
     assert selected.shape == (1, 2, 6)
     assert torch.equal(selected[..., :3], hidden_states[1])
     assert torch.equal(selected[..., 3:], hidden_states[2])
+
+
+def test_causal_mean_attention_masks_future_keys_and_normalizes_prefix():
+    query = torch.tensor([[[[1.0], [1.0]]]])
+    key = torch.tensor([[[[0.0], [0.0], [0.0], [20.0]]]])
+
+    attention = causal_mean_attention(
+        query,
+        key,
+        past_length=1,
+        query_count=2,
+    )
+
+    assert attention.shape == (1, 2, 3)
+    assert torch.allclose(attention.sum(dim=-1), torch.ones(1, 2))
+    assert torch.equal(attention[0, 0, 2:], torch.zeros(1))
+
+
+def test_selector_reductions_and_top_context_indices():
+    layer18 = torch.tensor(
+        [[[0.05, 0.80, 0.03, 0.04, 0.03, 0.02, 0.02, 0.01],
+          [0.10, 0.05, 0.05, 0.65, 0.05, 0.04, 0.03, 0.03],
+          [0.02, 0.03, 0.85, 0.03, 0.02, 0.02, 0.01, 0.02]]]
+    )
+    layer35 = torch.tensor(
+        [[[0.01, 0.01, 0.01, 0.02, 0.03, 0.04, 0.08, 0.80]]]
+    )
+
+    m0 = reduce_attention_scores("M0", layer18, layer35)
+    m1 = reduce_attention_scores("M1", layer18, layer35)
+    m2 = reduce_attention_scores("M2", layer18, layer35, pool_kernel=3)
+    m3 = reduce_attention_scores("M3", layer18, layer35, pool_kernel=3)
+    m5 = reduce_attention_scores("M5", layer18, layer35)
+
+    assert int(m0.argmax(dim=-1).item()) == 2
+    assert int(m1.argmax(dim=-1).item()) == 2
+    assert int(m5.argmax(dim=-1).item()) == 7
+    assert not torch.equal(m2, m3)
+    selected = select_top_context_indices(m1[0], budget=2)
+    assert selected.tolist() == [1, 2]
+    assert select_top_context_indices(m1[0], budget=20).tolist() == list(range(8))
 
 
 def test_visual_hidden_ablation_masks_only_selected_layers_and_visual_positions():

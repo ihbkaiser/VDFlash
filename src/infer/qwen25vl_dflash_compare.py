@@ -35,6 +35,12 @@ from src.infer.qwen25vl_dflash_parallel import (
     build_qwen25vl_model_parallel_map,
     parse_max_memory,
 )
+from src.infer.verify_attention_selectors import (
+    ATTENTION_METHODS,
+    causal_mean_attention,
+    reduce_attention_scores,
+    select_top_context_indices,
+)
 from src.workspace import resolve_workspace_path, workspace_path
 
 
@@ -136,6 +142,107 @@ def _concat_captured_target_hidden(
     if missing:
         raise RuntimeError(f"target forward did not capture hidden states for layers {missing}")
     return torch.cat([captured[int(layer_id)] for layer_id in layer_ids], dim=-1)
+
+
+@contextmanager
+def _capture_target_verification_queries(
+    target: Any,
+    layer_ids: list[int] | tuple[int, ...],
+    *,
+    device: torch.device | str,
+) -> Iterator[dict[int, torch.Tensor]]:
+    """Capture the target's actual post-M-RoPE query states at selected layers."""
+
+    from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+        apply_multimodal_rotary_pos_emb,
+    )
+
+    layers = _target_decoder_layers(target)
+    normalized_ids = [int(layer_id) for layer_id in layer_ids]
+    if len(set(normalized_ids)) != len(normalized_ids):
+        raise ValueError("target attention layer IDs must be unique")
+    if any(layer_id < 0 or layer_id >= len(layers) for layer_id in normalized_ids):
+        raise ValueError(
+            f"target attention layer IDs must be within [0, {len(layers) - 1}]"
+        )
+
+    captured: dict[int, torch.Tensor] = {}
+    handles = []
+    try:
+        for layer_id in normalized_ids:
+            attention = getattr(layers[layer_id], "self_attn", None)
+            if attention is None or not hasattr(attention, "q_proj"):
+                raise AttributeError(
+                    f"target layer {layer_id} does not expose a Qwen attention q_proj"
+                )
+            projected_query: dict[str, torch.Tensor] = {}
+
+            def q_hook(_module: Any, _inputs: Any, output: Any, *, _store=projected_query):
+                if not torch.is_tensor(output):
+                    raise TypeError("target q_proj did not return a tensor")
+                _store["query"] = output.detach()
+
+            def attention_hook(
+                module: Any,
+                args: tuple[Any, ...],
+                kwargs: dict[str, Any],
+                _output: Any,
+                *,
+                _layer_id=layer_id,
+                _store=projected_query,
+            ):
+                query = _store.pop("query", None)
+                if query is None:
+                    raise RuntimeError(
+                        f"target layer {_layer_id} query projection was not captured"
+                    )
+                hidden_states = kwargs.get("hidden_states")
+                if hidden_states is None and args:
+                    hidden_states = args[0]
+                position_embeddings = kwargs.get("position_embeddings")
+                if position_embeddings is None and len(args) > 7:
+                    position_embeddings = args[7]
+                if hidden_states is None or position_embeddings is None:
+                    raise RuntimeError(
+                        f"target layer {_layer_id} is missing hidden states or M-RoPE embeddings"
+                    )
+                batch_size, query_length = hidden_states.shape[:2]
+                head_dim = int(module.head_dim)
+                query = query.view(batch_size, query_length, -1, head_dim).transpose(1, 2)
+                cos, sin = position_embeddings
+                query, _ = apply_multimodal_rotary_pos_emb(
+                    query,
+                    query,
+                    cos,
+                    sin,
+                    module.rope_scaling["mrope_section"],
+                )
+                captured[_layer_id] = query.detach().to(device=device)
+
+            handles.append(attention.q_proj.register_forward_hook(q_hook))
+            handles.append(
+                attention.register_forward_hook(attention_hook, with_kwargs=True)
+            )
+        yield captured
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+def _target_cache_key_states(cache: Any, layer_id: int) -> torch.Tensor:
+    """Read post-RoPE target keys from a Transformers cache layer."""
+
+    try:
+        key_states, _value_states = cache[int(layer_id)]
+    except (IndexError, KeyError, TypeError) as exc:
+        raise RuntimeError(
+            f"target KV cache does not expose keys for layer {layer_id}"
+        ) from exc
+    if not torch.is_tensor(key_states) or key_states.ndim != 4:
+        raise RuntimeError(
+            f"target KV keys at layer {layer_id} must have [batch, heads, sequence, dim] shape"
+        )
+    return key_states
 
 
 def _module_device(module: Any, fallback: torch.device) -> torch.device:
@@ -388,6 +495,7 @@ class SpeculativeDecodeResult:
     prefill_s: float = 0.0
     draft_s: float = 0.0
     verify_s: float = 0.0
+    selection_s: float = 0.0
     decode_s: float = 0.0
     end_to_end_s: float = 0.0
     peak_memory_bytes: int = 0
@@ -453,6 +561,7 @@ class SpeculativeDecodeResult:
                 "prefill_s": float(self.prefill_s),
                 "draft_s": float(self.draft_s),
                 "verify_s": float(self.verify_s),
+                "selection_s": float(self.selection_s),
                 "decode_s": float(self.decode_s),
                 "end_to_end_s": float(self.end_to_end_s),
                 "tokens_per_second": self.num_output_tokens / max(self.end_to_end_s, 1e-12),
@@ -472,12 +581,26 @@ class InstrumentedDFlashDecoder:
         device: torch.device,
         draft_device: torch.device | str | None = None,
         token_decoder: Callable[[list[int]], str] | None = None,
+        attention_selector: str | None = None,
+        context_budget: int = 512,
+        attention_mid_layer: int = 18,
+        attention_deep_layer: int = 35,
     ):
         self.target = target
         self.draft = draft
         self.device = torch.device(device)
         self.draft_device = torch.device(draft_device or device)
         self.token_decoder = token_decoder
+        self.attention_selector = (
+            str(attention_selector).upper() if attention_selector is not None else None
+        )
+        if self.attention_selector is not None and self.attention_selector not in ATTENTION_METHODS:
+            raise ValueError(f"attention_selector must be one of {ATTENTION_METHODS}")
+        if context_budget <= 0:
+            raise ValueError("context_budget must be positive")
+        self.context_budget = int(context_budget)
+        self.attention_mid_layer = int(attention_mid_layer)
+        self.attention_deep_layer = int(attention_deep_layer)
 
     def _decode_token_ids(self, token_ids: list[int]) -> str:
         if self.token_decoder is None:
@@ -564,6 +687,10 @@ class InstrumentedDFlashDecoder:
                     "prefill_target_context_keep_mask must keep at least one position"
                 )
         cut_context = prefill_target_context_keep_mask is not None
+        if self.attention_selector is not None and cut_context:
+            raise ValueError(
+                "verify-attention selectors currently require an uncompressed target context"
+            )
         max_length = prompt_length + int(max_new_tokens)
         block_size = int(self.draft.block_size)
         mask_token_id = int(self.draft.mask_token_id)
@@ -666,6 +793,16 @@ class InstrumentedDFlashDecoder:
         rounds: list[dict[str, Any]] = []
         draft_s = 0.0
         verify_s = 0.0
+        selection_s = 0.0
+        active_context_indices: torch.Tensor | None = None
+        draft_attention_modules = [
+            getattr(layer, "self_attn", None)
+            for layer in getattr(self.draft, "layers", ())
+        ]
+        if self.attention_selector is not None:
+            for attention in draft_attention_modules:
+                if attention is not None:
+                    attention.context_keep_indices = None
         while start < max_length:
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = all_positions[..., start : start + block_size]
@@ -692,14 +829,30 @@ class InstrumentedDFlashDecoder:
                 ].to(device=self.draft_device)
                 draft_past_key_values = draft_cache
                 draft_use_cache = True
-            draft_hidden = self.draft(
-                target_hidden=target_hidden,
-                noise_embedding=noise_embedding,
-                position_ids=draft_position_ids,
-                past_key_values=draft_past_key_values,
-                use_cache=draft_use_cache,
-                is_causal=False,
+            draft_context_length = (
+                _cache_length(draft_cache) + int(target_hidden.shape[1])
+                if not cut_context
+                else int(target_hidden.shape[1])
             )
+            selected_for_draft = active_context_indices
+            if self.attention_selector is not None:
+                for attention in draft_attention_modules:
+                    if attention is not None:
+                        attention.context_keep_indices = selected_for_draft
+            try:
+                draft_hidden = self.draft(
+                    target_hidden=target_hidden,
+                    noise_embedding=noise_embedding,
+                    position_ids=draft_position_ids,
+                    past_key_values=draft_past_key_values,
+                    use_cache=draft_use_cache,
+                    is_causal=False,
+                )
+            finally:
+                if self.attention_selector is not None:
+                    for attention in draft_attention_modules:
+                        if attention is not None:
+                            attention.context_keep_indices = None
             if not cut_context:
                 _crop_cache(draft_cache, start)
             proposals = self.draft._sample_draft_tokens(
@@ -710,19 +863,32 @@ class InstrumentedDFlashDecoder:
             draft_s += _now(self.device) - draft_started
             block_output_ids[:, 1:] = proposals
 
+            verify_past_length = _cache_length(target_cache)
+            verification_queries: dict[int, torch.Tensor] = {}
+            verify_kwargs = {
+                "input_ids": block_output_ids,
+                "position_ids": block_position_ids,
+                "past_key_values": target_cache,
+                "cache_position": torch.arange(
+                    start, start + block_output_ids.shape[1], device=self.device
+                ),
+                "use_cache": True,
+                "return_dict": True,
+            }
             verify_started = _now(self.device)
-            target_output, new_target_hidden = self._target_forward_with_context(
-                {
-                    "input_ids": block_output_ids,
-                    "position_ids": block_position_ids,
-                    "past_key_values": target_cache,
-                    "cache_position": torch.arange(
-                        start, start + block_output_ids.shape[1], device=self.device
-                    ),
-                    "use_cache": True,
-                    "return_dict": True,
-                }
-            )
+            if self.attention_selector is None:
+                target_output, new_target_hidden = self._target_forward_with_context(
+                    verify_kwargs
+                )
+            else:
+                with _capture_target_verification_queries(
+                    self.target,
+                    [self.attention_mid_layer, self.attention_deep_layer],
+                    device=self.device,
+                ) as verification_queries:
+                    target_output, new_target_hidden = self._target_forward_with_context(
+                        verify_kwargs
+                    )
             verify_s += _now(self.device) - verify_started
             target_calls += 1
             if getattr(target_output, "past_key_values", None) is not None:
@@ -747,6 +913,48 @@ class InstrumentedDFlashDecoder:
                 target_hidden = torch.cat([target_hidden, new_target_hidden], dim=1)
             else:
                 target_hidden = new_target_hidden
+            selection_metadata = {
+                "method": self.attention_selector or "dense",
+                "context_tokens_available": int(draft_context_length),
+                "context_tokens_used": int(
+                    selected_for_draft.numel()
+                    if selected_for_draft is not None
+                    else draft_context_length
+                ),
+                "dense_bootstrap": bool(
+                    self.attention_selector is not None
+                    and selected_for_draft is None
+                ),
+            }
+            if self.attention_selector is not None:
+                selection_started = _now(self.device)
+                query_count = accepted + 1
+                layer18_attention = causal_mean_attention(
+                    verification_queries[self.attention_mid_layer],
+                    _target_cache_key_states(target_cache, self.attention_mid_layer),
+                    past_length=verify_past_length,
+                    query_count=query_count,
+                )
+                layer35_attention = causal_mean_attention(
+                    verification_queries[self.attention_deep_layer],
+                    _target_cache_key_states(target_cache, self.attention_deep_layer),
+                    past_length=verify_past_length,
+                    query_count=query_count,
+                )
+                token_scores = reduce_attention_scores(
+                    self.attention_selector,
+                    layer18_attention,
+                    layer35_attention,
+                )[0]
+                active_context_indices = select_top_context_indices(
+                    token_scores,
+                    self.context_budget,
+                ).to(device=self.draft_device)
+                selection_s += _now(self.device) - selection_started
+                selection_metadata["next_context_tokens_selected"] = int(
+                    active_context_indices.numel()
+                )
+                selection_metadata["next_context_budget"] = self.context_budget
             stop_hit = any(
                 int(token_id) in stop_ids
                 for token_id in output_ids[0, prompt_length : min(start + 1, max_length)].tolist()
@@ -772,6 +980,7 @@ class InstrumentedDFlashDecoder:
                     "next_anchor_text": self._decode_token_ids(
                         [next_anchor_token_id]
                     ),
+                    "context_selection": selection_metadata,
                     "is_partial_block": int(proposals.shape[1]) < block_size - 1,
                     "is_terminal": bool(stop_hit or start >= max_length - 1),
                 }
@@ -789,6 +998,7 @@ class InstrumentedDFlashDecoder:
             prefill_s=prefill_s,
             draft_s=draft_s,
             verify_s=verify_s,
+            selection_s=selection_s,
             decode_s=decode_s,
             end_to_end_s=end_to_end_s,
         )

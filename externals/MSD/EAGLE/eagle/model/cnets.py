@@ -36,6 +36,36 @@ from eagle.model.choices import *
 from eagle.model.utils import prepare_logits_processor
 
 
+QWEN2VL_VIDEO_TOKEN_ID = 151656
+
+
+def _prepare_msd_video_embeddings(input_ids, inputs_embeds, embed_tokens):
+    """Use draft text embeddings while preserving target video-pad features."""
+
+    token_embeddings = embed_tokens(input_ids)
+    video_mask = input_ids == QWEN2VL_VIDEO_TOKEN_ID
+    if video_mask.any() and inputs_embeds is None:
+        raise ValueError("target video embeddings are required at video-pad positions")
+    if inputs_embeds is not None:
+        if inputs_embeds.shape[:-1] != input_ids.shape:
+            raise ValueError(
+                "target video embeddings must align with the draft input IDs"
+            )
+        token_embeddings[video_mask] = inputs_embeds[video_mask].to(
+            dtype=token_embeddings.dtype
+        )
+    return token_embeddings, video_mask
+
+
+def _fuse_msd_video_hidden(fc, inputs_embeds, hidden_states, video_mask):
+    """Fuse target and draft states, then retain target features at video pads."""
+
+    new_hidden_state = fc(torch.cat((inputs_embeds, hidden_states), dim=-1))
+    if video_mask.any():
+        new_hidden_state[video_mask] = inputs_embeds[video_mask]
+    return new_hidden_state
+
+
 
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
@@ -110,7 +140,7 @@ class Model(nn.Module):
 
         if config.model_type == "llava":
             self.layers = nn.ModuleList([LlamaDecoderLayer(config, index) for index in range(config.num_hidden_layers)])
-            self.rotary_emb = None 
+            self.rotary_emb = None
         elif config.model_type == "qwen2_vl":
             self.layers = nn.ModuleList([Qwen2VLDecoderLayer(config, index) for index in range(config.num_hidden_layers)])
             self.rotary_emb = Qwen2VLRotaryEmbedding(config=config)
@@ -234,6 +264,10 @@ class Model(nn.Module):
                 inputs_embeds = torch.cat(
                     (inputs_ids_embeds[:,:indice], inputs_embeds[:, indice:indice + image_tokens_num[0]], inputs_ids_embeds[:,indice:]), dim=1
                 )
+            elif QWEN2VL_VIDEO_TOKEN_ID in input_ids:
+                inputs_embeds, _video_mask = _prepare_msd_video_embeddings(
+                    input_ids, inputs_embeds, self.embed_tokens
+                )
             elif 151652 in input_ids and image_tokens_num != None:    # qwen2_vl
                 indice = torch.where(input_ids == 151652)[1].item() + 1
                 inputs_ids_embeds = self.embed_tokens(
@@ -304,6 +338,14 @@ class Model(nn.Module):
                 cat_tensor = torch.cat((inputs_embeds, new_hidden_state), dim=-1)
                 new_hidden_state = self.fc(cat_tensor)
                 new_hidden_state[indice : indice + image_tokens_num[0]] = temp_image_tensor
+            elif QWEN2VL_VIDEO_TOKEN_ID in input_ids:
+                video_mask = input_ids == QWEN2VL_VIDEO_TOKEN_ID
+                new_hidden_state = _fuse_msd_video_hidden(
+                    self.fc,
+                    inputs_embeds,
+                    hidden_states,
+                    video_mask,
+                )
             elif 151652 in input_ids and image_tokens_num != None:
                 ori_input_ids = input_ids
                 indice = torch.where(ori_input_ids == 151652)[0].item() + 1
@@ -317,7 +359,7 @@ class Model(nn.Module):
                 new_hidden_state = self.fc(torch.cat((inputs_embeds, hidden_states), dim=-1))
 
             hidden_states = new_hidden_state.unsqueeze(0)
-        
+
         else:
             inputs_embeds = inputs_embeds.to(hidden_states.device)
             hidden_states = self.fc(torch.cat((inputs_embeds, hidden_states), dim=-1))
@@ -417,6 +459,10 @@ class Model(nn.Module):
             image_tokens_num = []
             if -200 in input_ids:
                 image_tokens_num = [576]
+            elif QWEN2VL_VIDEO_TOKEN_ID in input_ids:
+                image_tokens_num = [
+                    (input_ids == QWEN2VL_VIDEO_TOKEN_ID).sum().item()
+                ]
             elif 151652 in input_ids:
                 image_tokens_num = [(input_ids == 151655).sum().item()]
             out_hidden, past_key_values = self(hidden_states, input_ids=input_ids, use_cache=True, inputs_embeds=inputs_embeds, image_tokens_num=image_tokens_num)
