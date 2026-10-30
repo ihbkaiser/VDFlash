@@ -264,7 +264,10 @@ echo "[dspark:phase1-capture] GPUs=$GPU_COUNT batch/rank=$CAPTURE_BATCH_SIZE max
     --sglang-disable-radix-cache
 )
 PHASE1_COUNT=$(feature_count "$PHASE1_FEATURE_ROOT")
-((PHASE1_COUNT > 0)) || { echo "Phase 1 DSpark capture produced no feature records" >&2; exit 1; }
+[[ "$PHASE1_COUNT" == "$NUM_SAMPLES" ]] || {
+  echo "Phase 1 DSpark capture produced $PHASE1_COUNT records; expected exactly $NUM_SAMPLES" >&2
+  exit 1
+}
 
 echo "[dspark] preparing LLaVA manifest"
 mkdir -p "$(dirname "$MANIFEST")" "$PHASE2_FEATURE_ROOT"
@@ -297,7 +300,10 @@ echo "[dspark:phase2-capture] GPUs=$GPU_COUNT batch/rank=$CAPTURE_BATCH_SIZE max
     --sglang-mem-fraction-static "$SGLANG_MEM_FRACTION"
 )
 PHASE2_COUNT=$(feature_count "$PHASE2_FEATURE_ROOT")
-((PHASE2_COUNT > 0)) || { echo "Phase 2 DSpark capture produced no feature records" >&2; exit 1; }
+[[ "$PHASE2_COUNT" == "$NUM_SAMPLES" ]] || {
+  echo "Phase 2 DSpark capture produced $PHASE2_COUNT records; expected exactly $NUM_SAMPLES" >&2
+  exit 1
+}
 
 export SPECFORGE_DSPARK_DEPTH="$DSPARK_DEPTH"
 export SPECFORGE_DSPARK_BLOCK_SIZE="$DSPARK_BLOCK_SIZE"

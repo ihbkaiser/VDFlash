@@ -414,17 +414,21 @@ train_phase() {
       echo "Phase 1 DSpark checkpoint not found: $PHASE1_CHECKPOINT" >&2
       exit 1
     }
-    train_args+=("model.draft_checkpoint_path=$PHASE1_CHECKPOINT")
   fi
   if ((RESUME)); then
     if [[ -e "$latest" ]]; then
       train_args+=("training.resume_from=$run_output")
     else
       echo "[dspark:$phase] no checkpoint exists; starting a new run"
+      if [[ "$phase" == phase2 ]]; then
+        train_args+=("model.draft_checkpoint_path=$PHASE1_CHECKPOINT")
+      fi
     fi
   elif [[ -e "$latest" ]]; then
     echo "checkpoint already exists at $latest; pass --resume or choose another SPECFORGE_OUTPUT_ROOT" >&2
     exit 1
+  elif [[ "$phase" == phase2 ]]; then
+    train_args+=("model.draft_checkpoint_path=$PHASE1_CHECKPOINT")
   fi
 
   echo "[dspark:$phase] layers=$TARGET_LAYER_IDS depth=$DSPARK_DEPTH block=$DSPARK_BLOCK_SIZE samples=$expected max_steps=$max_steps GPUs=$GPU_COUNT micro=$MICRO_BATCH_SIZE accumulation=$ACCUMULATION_STEPS output=$run_output"
