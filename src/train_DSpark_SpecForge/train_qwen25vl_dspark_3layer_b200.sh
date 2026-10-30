@@ -232,7 +232,7 @@ resolve_config phase2 "$PHASE2_CONFIG"
 
 echo "[dspark] preparing ShareGPT records"
 bash "$REPO_ROOT/src/train_Dflash_SpecForge/train_qwen25vl_dflash_sharegpt_68k.sh" \
-  --env-file "$ENV_FILE" --models 3b --phase data
+  --models 3b --phase data
 [[ -s "$SHAREGPT_DATA" ]] || { echo "converted ShareGPT file missing: $SHAREGPT_DATA" >&2; exit 1; }
 
 mkdir -p "$PHASE1_FEATURE_ROOT" "$DS_ARTIFACT_ROOT/phase1/cache"
