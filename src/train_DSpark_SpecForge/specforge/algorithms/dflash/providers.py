@@ -1,0 +1,350 @@
+"""Built-in DFlash registration and executable providers."""
+
+from __future__ import annotations
+
+from functools import partial
+
+from specforge.algorithms.common.defaults import (
+    empty_options,
+    no_missing_checkpoint_keys,
+)
+from specforge.algorithms.common.providers import (
+    AlgorithmProviders,
+    DraftConfigProvider,
+    ModelProvider,
+    OfflineCaptureLayout,
+    OfflineDataProvider,
+    ServerCaptureLayout,
+    ServerStreamingProvider,
+    StepProvider,
+    TargetDerivedDraftDefaults,
+    make_registration,
+)
+from specforge.algorithms.contracts import (
+    AlgorithmCapabilities,
+    AlgorithmSpec,
+    DraftRequirement,
+    FeatureContract,
+    FeatureMode,
+    OfflineStorageContract,
+)
+from specforge.data.loss_mask import has_consecutive_supervised_tokens
+
+ALGORITHM_NAME = "dflash"
+DRAFT_ARCHITECTURE = "DFlashDraftModel"
+NORMALIZER_ID = "dflash_family_offline_v1"
+QWEN25VL_NORMALIZER_ID = "dflash_qwen25vl_offline_v1"
+
+
+def build_collator(*args, **kwargs):
+    from specforge.algorithms.common.dflash_family_data import build_collator as impl
+
+    return impl(*args, **kwargs)
+
+
+def build_offline_normalizer(*args, **kwargs):
+    from specforge.algorithms.common.dflash_family_data import (
+        build_offline_normalizer as impl,
+    )
+
+    return impl(*args, **kwargs)
+
+
+def build_offline_reader(*args, **kwargs):
+    from specforge.algorithms.common.dflash_family_data import build_offline_reader as impl
+
+    return impl(*args, **kwargs)
+
+
+def build_qwen25vl_offline_normalizer(*args, **kwargs):
+    from specforge.algorithms.common.dflash_family_data import (
+        build_qwen25vl_offline_normalizer as impl,
+    )
+
+    return impl(*args, **kwargs)
+
+
+def build_qwen25vl_collator(*args, **kwargs):
+    from specforge.algorithms.common.dflash_family_data import (
+        build_qwen25vl_collator as impl,
+    )
+
+    return impl(*args, **kwargs)
+
+
+def build_step(wrapped_model, *, target_head=None, **_options):
+    del target_head
+    from specforge.training.strategies.base import DFlashTrainStrategy
+
+    return DFlashTrainStrategy(wrapped_model)
+
+
+def resume_contract(config, draft_model, training_model):
+    """Persist resolved DFlash architecture, sampling, and loss semantics."""
+
+    target_layer_ids = tuple(
+        int(layer_id) for layer_id in draft_model.target_layer_ids
+    )
+    raw_hidden_size = getattr(draft_model.config, "hidden_size", None)
+    hidden_size = (
+        int(raw_hidden_size)
+        if isinstance(raw_hidden_size, int) and raw_hidden_size > 0
+        else None
+    )
+    input_modality = getattr(getattr(config, "model", None), "input_modality", "")
+    dflash_config = getattr(draft_model.config, "dflash_config", None) or {}
+    is_qwen25vl = input_modality == "qwen2_5_vl" or (
+        isinstance(dflash_config, dict) and "mrope_section" in dflash_config
+    )
+    layer_indexing = (
+        "qwen25vl_hf_decoder_zero_based"
+        if is_qwen25vl
+        else "target_decoder_zero_based"
+    )
+    phase_value = getattr(
+        getattr(config, "data", None), "hidden_state_phase", None
+    )
+    phase = phase_value.strip() if isinstance(phase_value, str) else ""
+    dtype = getattr(draft_model.config, "dtype", None)
+    hidden_state_metadata = {
+        "target_layer_ids": target_layer_ids,
+        "layer_indexing": layer_indexing,
+        "num_layers": len(target_layer_ids),
+        "hidden_size": hidden_size,
+        "feature_dim": (
+            len(target_layer_ids) * hidden_size if hidden_size is not None else None
+        ),
+        "phase": phase or "unspecified",
+        "capture_method": "dflash",
+        "target_model": getattr(
+            getattr(config, "model", None), "target_model_path", None
+        ),
+        "target_model_revision": None,
+        "dtype": str(dtype) if dtype is not None else None,
+        "schema_version": 1,
+    }
+
+    return {
+        "dflash_draft_num_hidden_layers": int(
+            getattr(draft_model.config, "num_hidden_layers", len(target_layer_ids))
+        ),
+        "dflash_target_layer_ids": target_layer_ids,
+        "dflash_hidden_state_metadata": hidden_state_metadata,
+        "dflash_block_size": int(training_model.block_size),
+        "dflash_mask_token_id": int(training_model.mask_token_id),
+        "dflash_attention_backend": str(training_model.attention_backend),
+        "dflash_num_anchors": int(training_model.num_anchors),
+        "dflash_loss_decay_gamma": training_model.loss_decay_gamma,
+        "dflash_loss_type": str(training_model.loss_type),
+        "dflash_dpace_alpha": float(training_model.dpace_alpha),
+    }
+
+
+def resolve_dflash_kernels(config):
+    if not config.model.use_liger_kernel:
+        return None
+    if config.training.strategy != "dflash":
+        raise ValueError(
+            "model.use_liger_kernel is currently supported only with "
+            "training.strategy=dflash"
+        )
+
+    from specforge.modeling.draft.dflash_kernels import load_liger_dflash_kernels
+
+    return load_liger_dflash_kernels()
+
+
+def build_draft(config, draft_config):
+    from specforge.algorithms.model_providers import build_dflash_draft
+
+    return build_dflash_draft(
+        config,
+        draft_config,
+        resolve_dflash_kernels(config),
+    )
+
+
+def build_training_model(config, draft_model, draft_config, target_config, tokenizer):
+    from specforge.algorithms.model_providers import build_dflash_model
+
+    return build_dflash_model(
+        config,
+        draft_model,
+        draft_config,
+        target_config,
+        tokenizer,
+    )
+
+
+def resolve_capture_layers(config, draft_config, target_config):
+    from specforge.algorithms.model_providers import resolve_dflash_capture_layers
+
+    return resolve_dflash_capture_layers(config, draft_config, target_config)
+
+
+def populate_target_defaults(payload, target_config, config):
+    from specforge.algorithms.model_providers import populate_dflash_generated_config
+
+    return populate_dflash_generated_config(payload, target_config, config)
+
+
+def apply_draft_overrides(config, draft_config):
+    from specforge.algorithms.model_providers import apply_dflash_overrides
+
+    return apply_dflash_overrides(config, draft_config)
+
+
+def minimum_loss_tokens(config, draft_config):
+    from specforge.algorithms.model_providers import dflash_min_loss_tokens
+
+    return dflash_min_loss_tokens(config, draft_config)
+
+
+def needs_input_tools(config, draft_model):
+    from specforge.algorithms.model_providers import dflash_needs_input_tools
+
+    return dflash_needs_input_tools(config, draft_model)
+
+
+def algorithm_spec() -> AlgorithmSpec:
+    ready = {"input_ids", "loss_mask", "hidden_states"}
+    qwen25vl_ready = ready | {"position_ids"}
+    return AlgorithmSpec(
+        name=ALGORITHM_NAME,
+        draft=DraftRequirement(
+            compatible_architectures={DRAFT_ARCHITECTURE},
+            default_architecture=DRAFT_ARCHITECTURE,
+            supported_overrides={"num_hidden_layers", "block_size"},
+        ),
+        feature_contracts=(
+            FeatureContract(
+                mode=FeatureMode.OFFLINE,
+                modality="text",
+                required_tensors=ready,
+                storage=OfflineStorageContract(
+                    format="specforge_hidden_states_v1",
+                    required_tensors=ready,
+                    normalizer=NORMALIZER_ID,
+                ),
+            ),
+            FeatureContract(
+                mode=FeatureMode.OFFLINE,
+                modality="qwen2_5_vl",
+                required_tensors=qwen25vl_ready,
+                storage=OfflineStorageContract(
+                    format="specforge_hidden_states_qwen25vl_v1",
+                    required_tensors=qwen25vl_ready,
+                    normalizer=QWEN25VL_NORMALIZER_ID,
+                ),
+            ),
+            FeatureContract(
+                mode=FeatureMode.STREAMING,
+                modality="text",
+                required_tensors=ready,
+            ),
+        ),
+        capabilities=AlgorithmCapabilities(
+            attention_backends={"eager", "sdpa", "flex_attention"},
+        ),
+    )
+
+
+def algorithm_providers() -> AlgorithmProviders:
+    collator = build_collator
+    qwen25vl_collator = build_qwen25vl_collator
+    return AlgorithmProviders(
+        algorithm_name=ALGORITHM_NAME,
+        step=StepProvider(
+            build=build_step,
+            options=empty_options,
+            resume_contract=resume_contract,
+            allowed_missing_checkpoint_keys=no_missing_checkpoint_keys,
+            uses_external_target_head=False,
+        ),
+        model=ModelProvider(
+            draft_config=DraftConfigProvider(
+                architecture=DRAFT_ARCHITECTURE,
+                expected_auto_map_model="dflash.DFlashDraftModel",
+                target_defaults=TargetDerivedDraftDefaults(
+                    model_type="qwen3",
+                    num_hidden_layers=1,
+                    populate=populate_target_defaults,
+                ),
+                apply_overrides=apply_draft_overrides,
+            ),
+            build_draft=build_draft,
+            build_training_model=build_training_model,
+            resolve_capture_layers=resolve_capture_layers,
+            minimum_loss_tokens=minimum_loss_tokens,
+            needs_input_tools=needs_input_tools,
+            default_dataloader_num_workers=8,
+            loss_mask_filter=has_consecutive_supervised_tokens,
+        ),
+        offline=(
+            OfflineDataProvider(
+                modality="text",
+                normalizer_id=NORMALIZER_ID,
+                capture_layout=OfflineCaptureLayout(
+                    capture_method="dflash",
+                    aux_feature="hidden_states",
+                    last_hidden_feature=None,
+                    passthrough=(
+                        ("input_ids", "input_ids"),
+                        ("loss_mask", "loss_mask"),
+                    ),
+                ),
+                build_reader=partial(build_offline_reader, ALGORITHM_NAME),
+                build_normalizer=build_offline_normalizer,
+                build_collator=collator,
+            ),
+            OfflineDataProvider(
+                modality="qwen2_5_vl",
+                normalizer_id=QWEN25VL_NORMALIZER_ID,
+                capture_layout=OfflineCaptureLayout(
+                    capture_method="dflash",
+                    aux_feature="hidden_states",
+                    last_hidden_feature=None,
+                    passthrough=(
+                        ("input_ids", "input_ids"),
+                        ("loss_mask", "loss_mask"),
+                        ("position_ids", "position_ids"),
+                    ),
+                ),
+                build_reader=partial(
+                    build_offline_reader,
+                    ALGORITHM_NAME,
+                    feature_keys=(
+                        "input_ids",
+                        "loss_mask",
+                        "hidden_states",
+                        "position_ids",
+                    ),
+                ),
+                build_normalizer=build_qwen25vl_offline_normalizer,
+                build_collator=qwen25vl_collator,
+            ),
+        ),
+        server_streaming=(
+            ServerStreamingProvider(
+                modality="text",
+                capture_method="dflash",
+                target_representation=None,
+                layout=ServerCaptureLayout(
+                    aux_feature="hidden_states",
+                    last_hidden_feature=None,
+                    passthrough=(
+                        ("input_ids", "input_ids", ()),
+                        ("loss_mask", "loss_mask", ()),
+                    ),
+                ),
+                build_collator=collator,
+            ),
+        ),
+    )
+
+
+def create_registration():
+    return make_registration(algorithm_spec(), algorithm_providers())
+
+
+__all__ = ["algorithm_providers", "algorithm_spec", "create_registration"]

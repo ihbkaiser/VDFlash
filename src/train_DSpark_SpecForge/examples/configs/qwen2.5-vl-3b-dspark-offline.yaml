@@ -1,0 +1,53 @@
+model:
+  target_model_path: /path/to/Qwen2.5-VL-3B-Instruct
+  draft_model_config: configs/qwen2.5-vl-3b-dspark.json
+  target_backend: sglang
+  input_modality: qwen2_5_vl
+  embedding_key: model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+  mask_token_id: 151669
+  torch_dtype: bfloat16
+
+data:
+  hidden_states_path: /path/to/dflash-cache
+  hidden_state_phase: phase1
+  max_length: 2048
+  chat_template: qwen
+  train_only_last_turn: true
+  dataloader_num_workers: 8
+  cache_dir: ./artifacts/dspark/cache
+
+training:
+  strategy: dspark
+  num_epochs: 6
+  max_steps: 10000
+  batch_size: 1
+  accumulation_steps: 32
+  learning_rate: 6.0e-4
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  attention_backend: flex_attention
+  num_anchors: 512
+  objective_chunk_blocks: 32
+  loss_decay_gamma: 4.0
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  fsdp_sharding: NO_SHARD
+  save_interval: 1000
+  max_checkpoints: 3
+  log_interval: 100
+  dist_timeout: 30
+  seed: 42
+
+tracking:
+  report_to: none
+
+run_id: qwen25vl-3b-dspark-offline
+output_dir: ./outputs/qwen25vl-3b-dspark-offline
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 2
