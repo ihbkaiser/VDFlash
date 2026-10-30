@@ -20,7 +20,9 @@ bash src/train_DSpark_SpecForge/train_qwen25vl_dspark_3layer_b200.sh
 
 This prepares the ShareGPT conversion and LLaVA manifest, captures DSpark
 features for both phases into a separate `dspark_depth3_layers_...` artifact
-tree, then trains Phase 1 followed by Phase 2 warm-started from Phase 1. It
+tree under the sibling `qwen25_dspark_3layer` directory, then trains Phase 1
+followed by Phase 2 warm-started from Phase 1. Checkpoints are saved under
+`qwen25_dspark_3layer/outputs/dspark_depth3_layers_...`. It
 defaults to GPUs `0,1` and target taps `26,28,30,32,34`; the draft depth is three
 DSpark decoder layers. Choose `spread` (`1,9,17,25,33`), `high_only`
 (`26,28,30,32,34`), or `middle_high` (`17,19,25,33,34`) with `--layer-set`.
