@@ -108,6 +108,13 @@ def parse_args():
         help="Offline draft strategy (default: eagle3)",
     )
     model_group.add_argument(
+        "--input-modality",
+        type=str,
+        default="text",
+        choices=("text", "qwen2_5_vl", "multimodal"),
+        help="Input provider modality for the selected offline strategy.",
+    )
+    model_group.add_argument(
         "--draft-model-config",
         type=str,
         default=None,
@@ -367,6 +374,7 @@ def resolve_offline_capture_plan(
     model = {
         "target_model_path": args.target_model_path,
         "draft_model_config": getattr(args, "draft_model_config", None),
+        "input_modality": args.input_modality,
         "trust_remote_code": args.trust_remote_code,
         "cache_dir": getattr(args, "cache_dir", None),
     }
@@ -724,6 +732,22 @@ class HiddenStatesGenerator:
                 "attention_mask": batch["attention_mask"][valid_indices_in_batch],
                 "loss_mask": batch["loss_mask"][valid_indices_in_batch],
             }
+            if any(
+                source_key == "position_ids"
+                for _feature_name, source_key in self.capture_layout.passthrough
+            ):
+                # Text-only Qwen2.5-VL examples use identical positions on all
+                # three MRoPE axes. The multimodal capture path supplies its
+                # image-aware positions from the processor instead.
+                text_positions = (
+                    filtered_batch["attention_mask"].to(torch.long)
+                    .cumsum(dim=-1)
+                    .sub(1)
+                    .clamp_min(0)
+                )
+                filtered_batch["position_ids"] = text_positions.unsqueeze(0).expand(
+                    3, -1, -1
+                ).contiguous()
             del batch
             if num_valid == 0:
                 # Data has already been generated, no sample processing, update progress bar.

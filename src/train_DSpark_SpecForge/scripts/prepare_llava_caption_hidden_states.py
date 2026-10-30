@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture Qwen2.5-VL LLaVA caption features for DFlash or MSD."""
+"""Capture Qwen2.5-VL LLaVA caption features for DFlash, DSpark, or MSD."""
 
 from __future__ import annotations
 
@@ -59,7 +59,9 @@ def _output_path(root: Path, index: int, compress: bool) -> Path:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target-model-path", required=True)
-    parser.add_argument("--strategy", choices=("dflash", "msd"), default="dflash")
+    parser.add_argument(
+        "--strategy", choices=("dflash", "dspark", "msd"), default="dflash"
+    )
     parser.add_argument("--draft-model-config", required=True)
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--image-root", required=True)
@@ -301,7 +303,7 @@ def main() -> int:
         draft_config = json.load(handle)
     layer_ids = (
         list(draft_config["dflash_config"]["target_layer_ids"])
-        if args.strategy == "dflash"
+        if args.strategy in {"dflash", "dspark"}
         else [0]
     )
 
@@ -392,7 +394,7 @@ def main() -> int:
                 ):
                     hidden = (
                         captured.hidden_states[row, :length]
-                        if args.strategy == "dflash"
+                        if args.strategy in {"dflash", "dspark"}
                         else captured.last_hidden_states[row, :length]
                     )
                     if hidden.ndim != 2:
@@ -409,6 +411,21 @@ def main() -> int:
                     }
                     if args.strategy == "dflash":
                         payload["hidden_states"] = hidden.cpu().contiguous()
+                    elif args.strategy == "dspark":
+                        target_last_hidden = captured.last_hidden_states[
+                            row, :length
+                        ]
+                        if target_last_hidden.ndim != 2:
+                            raise ValueError(
+                                "captured target last hidden states have shape "
+                                f"{tuple(target_last_hidden.shape)}"
+                            )
+                        payload.update(
+                            hidden_states=hidden.cpu().contiguous(),
+                            target_last_hidden_states=(
+                                target_last_hidden.cpu().unsqueeze(0).contiguous()
+                            ),
+                        )
                     else:
                         from specforge.algorithms.msd.data import (
                             validate_msd_capture_record,

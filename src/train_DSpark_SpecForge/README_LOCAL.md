@@ -8,6 +8,27 @@ artifacts, and checkpoints separate from `src/train_Dflash_SpecForge`.
 The launcher only trains. It does not prepare JSONL, stage images, capture
 teacher states, rewrite cache metadata, or modify the DFlash tree.
 
+## One-command two-B200 run with DSpark depth 2
+
+On the company machine, the local ignored file
+`src/train_Dflash_SpecForge/train_qwen25vl_dflash_3layer.env` supplies the
+ShareGPT, model, LLaVA JSONL, image, and artifact paths. Run:
+
+```bash
+bash src/train_DSpark_SpecForge/train_qwen25vl_dspark_2layer_b200.sh
+```
+
+This prepares the ShareGPT conversion and LLaVA manifest, captures DSpark
+features for both phases into a separate `dspark_depth2_layers_...` artifact
+tree, then trains Phase 1 followed by Phase 2 warm-started from Phase 1. It
+defaults to GPUs `0,1` and target taps `26,28,30,32,34`; the draft depth is two
+DSpark decoder layers. It recaptures features with the DSpark schema because
+the old DFlash cache does not contain DSpark's `target_last_hidden_states`.
+Partial feature captures are reused if the command is rerun. Use `--resume` to
+resume an existing training checkpoint, or `SPECFORGE_ENV_FILE=/path/to/file`
+to select another local environment file. `--print-config` shows paths without
+starting work.
+
 ## Server setup
 
 Use the Python environment already configured for this SpecForge checkout, or
