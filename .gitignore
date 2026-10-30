@@ -65,6 +65,9 @@ docs/superpowers/
 .venv-msd-static/
 .jspace/
 data/
+# Keep the DSpark loss-mask source package visible; the global data/ rule is
+# for generated datasets and caches.
+!src/train_DSpark_SpecForge/specforge/data/
 .serena/
 
 

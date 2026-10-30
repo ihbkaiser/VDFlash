@@ -508,6 +508,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.projector_type = dflash_config.get("projector_type", None)
         self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)
         self.shift_label = dflash_config.get("shift_label", False)
+        self._init_draft_head(config, dflash_config)
         hook_fn = getattr(self, "register_load_state_dict_pre_hook", getattr(self, "_register_load_state_dict_pre_hook", None))
         if hook_fn is not None:
             hook_fn(normalize_draft_head_checkpoint_keys)
