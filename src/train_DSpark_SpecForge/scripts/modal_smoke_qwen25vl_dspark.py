@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-GPU Modal smoke for the Qwen2.5-VL DSpark training path.
+"""One-GPU Modal smoke for DSpark depth 3 across teacher-layer choices.
 
 The production draft dimensions, BF16 dtype, FlexAttention backend, DSpark
 Markov/confidence heads, and objective weights come from the checked-in DSpark
@@ -23,11 +23,16 @@ from typing import Any
 import modal
 
 
-APP_NAME = "vdflash-qwen25vl-dspark-smoke"
+APP_NAME = "vdflash-qwen25vl-dspark-3layer-smoke"
 SPEC_DIR = Path(__file__).resolve().parents[1]
 REMOTE_ROOT = "/root/VDFlash/src/train_DSpark_SpecForge"
 SOURCE_CONFIG = "configs/qwen2.5-vl-3b-dspark.json"
-TARGET_LAYER_IDS = "26,28,30,32,34"
+TARGET_LAYER_SETS = {
+    "spread": [1, 9, 17, 25, 33],
+    "high_only": [26, 28, 30, 32, 34],
+    "middle_high": [17, 19, 25, 33, 34],
+}
+DRAFT_DEPTH = 3
 SMOKE_SEQUENCE_LENGTH = 16
 SMOKE_NUM_ANCHORS = 2
 SMOKE_OBJECTIVE_CHUNK_BLOCKS = 1
@@ -121,7 +126,7 @@ def _write_smoke_cache(path: Path, *, hidden_size: int, vocab_size: int) -> None
     gpu="A10G",
     cpu=4,
     memory=12_288,
-    timeout=1_200,
+    timeout=300,
 )
 def run_modal_smoke() -> dict[str, Any]:
     import torch
@@ -160,78 +165,77 @@ def run_modal_smoke() -> dict[str, Any]:
 
     with tempfile.TemporaryDirectory(prefix="dspark-modal-smoke-") as temp_name:
         workdir = Path(temp_name)
-        phase_configs: dict[str, Path] = {}
-        feature_roots: dict[str, Path] = {}
+        phase_configs: dict[tuple[str, str], Path] = {}
+        feature_roots: dict[tuple[str, str], Path] = {}
 
         # Exercise the same phase-specific resolver and cache preflight used by
-        # the Qwen2.5-VL two-phase launcher, with one synthetic record per phase.
-        for phase in ("phase1", "phase2"):
-            config_path = workdir / phase / "draft_config.json"
-            config_path.parent.mkdir(parents=True, exist_ok=True)
-            subprocess.run(
-                [
-                    sys.executable,
-                    str(Path(REMOTE_ROOT) / "scripts/resolve_dspark_config.py"),
-                    "--input",
-                    str(source_config_path),
-                    "--output",
-                    str(config_path),
-                    "--phase",
-                    phase,
-                    "--target-layer-ids",
-                    TARGET_LAYER_IDS,
-                    "--draft-num-hidden-layers",
-                    str(int(source_config["num_hidden_layers"])),
-                    "--block-size",
-                    str(int(source_config["block_size"])),
-                ],
-                cwd=REMOTE_ROOT,
-                check=True,
-            )
-            resolved = json.loads(config_path.read_text(encoding="utf-8"))
-            if resolved["num_hidden_layers"] != source_config["num_hidden_layers"]:
-                raise AssertionError(
-                    f"{phase} draft depth differs from production config"
+        # the Qwen2.5-VL launcher, with one synthetic record per phase and
+        # teacher-layer set.
+        for layer_set, layer_ids in TARGET_LAYER_SETS.items():
+            layer_ids_arg = ",".join(str(layer_id) for layer_id in layer_ids)
+            for phase in ("phase1", "phase2"):
+                key = (layer_set, phase)
+                phase_root = workdir / layer_set / phase
+                config_path = phase_root / "draft_config.json"
+                config_path.parent.mkdir(parents=True, exist_ok=True)
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(Path(REMOTE_ROOT) / "scripts/resolve_dspark_config.py"),
+                        "--input",
+                        str(source_config_path),
+                        "--output",
+                        str(config_path),
+                        "--phase",
+                        phase,
+                        "--target-layer-ids",
+                        layer_ids_arg,
+                        "--draft-num-hidden-layers",
+                        str(DRAFT_DEPTH),
+                        "--block-size",
+                        str(int(source_config["block_size"])),
+                    ],
+                    cwd=REMOTE_ROOT,
+                    check=True,
                 )
-            if resolved["block_size"] != source_config["block_size"]:
-                raise AssertionError(f"{phase} block size differs from production config")
-            if resolved["dflash_config"]["target_layer_ids"] != [
-                26,
-                28,
-                30,
-                32,
-                34,
-            ]:
-                raise AssertionError(
-                    f"{phase} target layer IDs were resolved incorrectly"
-                )
+                resolved = json.loads(config_path.read_text(encoding="utf-8"))
+                if resolved["num_hidden_layers"] != DRAFT_DEPTH:
+                    raise AssertionError(f"{layer_set}/{phase} draft depth is not 3")
+                if resolved["block_size"] != source_config["block_size"]:
+                    raise AssertionError(
+                        f"{layer_set}/{phase} block size differs from production config"
+                    )
+                if resolved["dflash_config"]["target_layer_ids"] != layer_ids:
+                    raise AssertionError(
+                        f"{layer_set}/{phase} teacher layer IDs resolved incorrectly"
+                    )
 
-            feature_root = workdir / phase / "features"
-            _write_smoke_cache(
-                feature_root,
-                hidden_size=hidden_size,
-                vocab_size=vocab_size,
-            )
-            subprocess.run(
-                [
-                    sys.executable,
-                    str(Path(REMOTE_ROOT) / "scripts/validate_dspark_cache.py"),
-                    "--feature-root",
-                    str(feature_root),
-                    "--draft-model-config",
-                    str(config_path),
-                    "--phase",
-                    phase,
-                    "--expected-samples",
-                    "1",
-                    "--sample-limit",
-                    "0",
-                ],
-                cwd=REMOTE_ROOT,
-                check=True,
-            )
-            phase_configs[phase] = config_path
-            feature_roots[phase] = feature_root
+                feature_root = phase_root / "features"
+                _write_smoke_cache(
+                    feature_root,
+                    hidden_size=hidden_size,
+                    vocab_size=vocab_size,
+                )
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(Path(REMOTE_ROOT) / "scripts/validate_dspark_cache.py"),
+                        "--feature-root",
+                        str(feature_root),
+                        "--draft-model-config",
+                        str(config_path),
+                        "--phase",
+                        phase,
+                        "--expected-samples",
+                        "1",
+                        "--sample-limit",
+                        "0",
+                    ],
+                    cwd=REMOTE_ROOT,
+                    check=True,
+                )
+                phase_configs[key] = config_path
+                feature_roots[key] = feature_root
 
         # Run both phases through the production offline runtime. Phase 2 loads
         # phase 1's actual SpecForge draft checkpoint via the production
@@ -272,12 +276,13 @@ def run_modal_smoke() -> dict[str, Any]:
         try:
             algorithm = builtin_algorithm_registry().resolve("dspark")
             def train_phase(
+                layer_set: str,
                 phase: str,
                 *,
                 warm_start_from: Path | None = None,
             ) -> dict[str, Any]:
                 phase_config = json.loads(
-                    phase_configs[phase].read_text(encoding="utf-8")
+                    phase_configs[(layer_set, phase)].read_text(encoding="utf-8")
                 )
                 draft_config = Qwen3Config.from_dict(phase_config)
                 draft_config._attn_implementation = "flex_attention"
@@ -328,12 +333,12 @@ def run_modal_smoke() -> dict[str, Any]:
                     )
                     return optimizer
 
-                run_id = f"qwen25vl-dspark-modal-smoke-{phase}"
-                output_dir = workdir / "outputs" / phase
+                run_id = f"qwen25vl-dspark-modal-smoke-{layer_set}-{phase}"
+                output_dir = workdir / "outputs" / layer_set / phase
                 trainer = build_offline_runtime(
                     algorithm=algorithm,
                     modality="qwen2_5_vl",
-                    hidden_states_path=str(feature_roots[phase]),
+                    hidden_states_path=str(feature_roots[(layer_set, phase)]),
                     hidden_state_phase=phase,
                     draft_model=training_model,
                     target_head=None,
@@ -386,42 +391,55 @@ def run_modal_smoke() -> dict[str, Any]:
                     ),
                 }
 
-            phase1_result = train_phase("phase1")
-            phase1_checkpoint = phase1_result.pop("checkpoint_dir")
-            gc.collect()
-            torch.cuda.empty_cache()
-            torch.cuda.reset_peak_memory_stats()
-            phase2_result = train_phase(
-                "phase2",
-                warm_start_from=phase1_checkpoint,
-            )
-            peak_memory_gib = max(
-                phase1_result["peak_memory_gib"],
-                phase2_result["peak_memory_gib"],
-            )
+            results_by_layer_set: dict[str, dict[str, Any]] = {}
+            for layer_set in TARGET_LAYER_SETS:
+                torch.cuda.reset_peak_memory_stats()
+                phase1_result = train_phase(layer_set, "phase1")
+                phase1_checkpoint = phase1_result.pop("checkpoint_dir")
+                gc.collect()
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
+                phase2_result = train_phase(
+                    layer_set,
+                    "phase2",
+                    warm_start_from=phase1_checkpoint,
+                )
+                results_by_layer_set[layer_set] = {
+                    "phase1": phase1_result,
+                    "phase2": phase2_result,
+                }
         finally:
             destroy_distributed()
 
-        phase1_config = json.loads(
-            phase_configs["phase1"].read_text(encoding="utf-8")
+        peak_memory_gib = max(
+            phase["peak_memory_gib"]
+            for phases in results_by_layer_set.values()
+            for phase in phases.values()
         )
         summary = {
             **environment,
-            "layers": phase1_config["dflash_config"]["target_layer_ids"],
-            "draft_depth": phase1_config["num_hidden_layers"],
-            "block_size": phase1_config["block_size"],
-            "trained_phases": ["phase1", "phase2"],
+            "teacher_layer_sets": TARGET_LAYER_SETS,
+            "draft_depth": DRAFT_DEPTH,
+            "block_size": int(source_config["block_size"]),
+            "trained_phases_per_layer_set": ["phase1", "phase2"],
             "cache_preflight": "passed",
-            "optimizer_steps_by_phase": {
-                "phase1": phase1_result["steps"],
-                "phase2": phase2_result["steps"],
+            "optimizer_steps_by_layer_set": {
+                layer_set: {
+                    phase: result["steps"]
+                    for phase, result in phases.items()
+                }
+                for layer_set, phases in results_by_layer_set.items()
             },
-            "phase2_warm_start_loaded_keys": phase2_result[
-                "warm_start_loaded_keys"
-            ],
-            "fused_adamw_by_phase": {
-                "phase1": phase1_result["fused_adamw"],
-                "phase2": phase2_result["fused_adamw"],
+            "phase2_warm_start_loaded_keys_by_layer_set": {
+                layer_set: phases["phase2"]["warm_start_loaded_keys"]
+                for layer_set, phases in results_by_layer_set.items()
+            },
+            "fused_adamw_by_layer_set": {
+                layer_set: {
+                    phase: result["fused_adamw"]
+                    for phase, result in phases.items()
+                }
+                for layer_set, phases in results_by_layer_set.items()
             },
             "peak_memory_gib": round(peak_memory_gib, 2),
             "smoke_only_overrides": {
@@ -429,7 +447,8 @@ def run_modal_smoke() -> dict[str, Any]:
                 "sequence_length": SMOKE_SEQUENCE_LENGTH,
                 "num_anchors": SMOKE_NUM_ANCHORS,
                 "objective_chunk_blocks": SMOKE_OBJECTIVE_CHUNK_BLOCKS,
-                "optimizer_steps_per_phase": 1,
+                "optimizer_steps_per_phase_and_layer_set": 1,
+                "layer_sets": 3,
             },
         }
         print("MY_SUMMARY_JSON=" + json.dumps(summary, sort_keys=True), flush=True)

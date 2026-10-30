@@ -32,28 +32,50 @@ set +a
 
 RESUME=0
 PRINT_CONFIG=0
+CLI_LAYER_SET=
+CLI_TEACHER_LAYERS=
 while (($#)); do
   case "$1" in
     --env-file) shift 2 ;;
     --env-file=*) shift ;;
     --resume) RESUME=1; shift ;;
     --print-config) PRINT_CONFIG=1; shift ;;
+    --layer-set|--set)
+      (($# >= 2)) || { echo "$1 requires a value" >&2; exit 2; }
+      CLI_LAYER_SET=$2
+      shift 2
+      ;;
+    --layer-set=*|--set=*) CLI_LAYER_SET=${1#*=}; shift ;;
+    --teacher-layers|--layer)
+      (($# >= 2)) || { echo "$1 requires a value" >&2; exit 2; }
+      CLI_TEACHER_LAYERS=$2
+      shift 2
+      ;;
+    --teacher-layers=*|--layer=*) CLI_TEACHER_LAYERS=${1#*=}; shift ;;
     -h|--help)
       cat <<'EOF'
-Usage: bash src/train_DSpark_SpecForge/train_qwen25vl_dspark_2layer_b200.sh [options]
+Usage: bash src/train_DSpark_SpecForge/train_qwen25vl_dspark_3layer_b200.sh [options]
 
 Runs data preparation, DSpark feature capture for both phases, then two-phase
-training. The default target taps are 26,28,30,32,34; the DSpark draft depth is
-2. Phase 2 warm-starts from the Phase 1 checkpoint.
+training. The DSpark draft depth is 3. Phase 2 warm-starts from Phase 1.
+
+Teacher-layer sets (five target hidden-state taps each):
+  spread       [1,9,17,25,33]
+  high_only    [26,28,30,32,34] (default)
+  middle_high  [17,19,25,33,34]
 
 Options:
   --env-file FILE   Source the local machine environment (default: the ignored
                     train_qwen25vl_dflash_3layer.env beside the DFlash scripts).
   --resume          Resume training checkpoints and continue partial captures.
+  --layer-set NAME  Select spread, high_only, or middle_high.
+  --teacher-layers IDS
+                   Custom ordered five layer IDs, e.g. 1,9,17,25,33.
   --print-config    Print resolved paths without starting data/capture/training.
 
-Useful overrides: SPECFORGE_GPU_IDS, SPECFORGE_TARGET_LAYER_IDS,
-SPECFORGE_NUM_SAMPLES, SPECFORGE_CAPTURE_BATCH_SIZE, SPECFORGE_DSPARK_DEPTH,
+Useful overrides: SPECFORGE_GPU_IDS, SPECFORGE_LAYER_SET,
+SPECFORGE_TARGET_LAYER_IDS, SPECFORGE_NUM_SAMPLES,
+SPECFORGE_CAPTURE_BATCH_SIZE,
 SPECFORGE_GLOBAL_BATCH_SIZE, SPECFORGE_NUM_EPOCHS, and PYTHON_BIN.
 EOF
       exit 0
@@ -88,29 +110,66 @@ IMAGE_ROOT=${IMAGE_ROOT:-}
 BASE_ARTIFACT_ROOT=${ARTIFACT_ROOT:-${DFLASH_ARTIFACT_ROOT:-}}
 BASE_OUTPUT_ROOT=${OUTPUT_ROOT:-}
 [[ -n "$TARGET_MODEL_PATH" ]] || { echo "MODEL_3B or TARGET_MODEL_PATH must be set in $ENV_FILE" >&2; exit 2; }
-[[ -f "$SOURCE_DATA" ]] || { echo "ShareGPT source file not found: $SOURCE_DATA" >&2; exit 1; }
-[[ -f "$SOURCE_JSONL" ]] || { echo "LLaVA source JSONL not found: $SOURCE_JSONL" >&2; exit 1; }
-[[ -d "$IMAGE_ROOT" ]] || { echo "LLaVA image root not found: $IMAGE_ROOT" >&2; exit 1; }
+[[ -n "$SOURCE_DATA" ]] || { echo "SOURCE_DATA must be set in $ENV_FILE" >&2; exit 2; }
+[[ -n "$SOURCE_JSONL" ]] || { echo "SOURCE_JSONL must be set in $ENV_FILE" >&2; exit 2; }
+[[ -n "$IMAGE_ROOT" ]] || { echo "IMAGE_ROOT must be set in $ENV_FILE" >&2; exit 2; }
 [[ -n "$BASE_ARTIFACT_ROOT" ]] || { echo "ARTIFACT_ROOT must be set in $ENV_FILE" >&2; exit 2; }
 [[ -n "$BASE_OUTPUT_ROOT" ]] || BASE_OUTPUT_ROOT="$BASE_ARTIFACT_ROOT/outputs"
 
-TARGET_LAYER_IDS=${SPECFORGE_TARGET_LAYER_IDS:-26,28,30,32,34}
-TARGET_LAYER_IDS=${TARGET_LAYER_IDS//[[:space:]]/}
+if [[ -n "$CLI_LAYER_SET" && -n "$CLI_TEACHER_LAYERS" ]]; then
+  echo "choose either --layer-set or --teacher-layers" >&2
+  exit 2
+fi
+if [[ -n "$CLI_LAYER_SET" ]]; then
+  LAYER_SET=$CLI_LAYER_SET
+  TARGET_LAYER_IDS=
+  LAYER_SELECTION=set
+elif [[ -n "$CLI_TEACHER_LAYERS" ]]; then
+  LAYER_SET=custom
+  TARGET_LAYER_IDS=$CLI_TEACHER_LAYERS
+  LAYER_SELECTION=layer
+else
+  LAYER_SET=${SPECFORGE_LAYER_SET:-high_only}
+  TARGET_LAYER_IDS=${SPECFORGE_TARGET_LAYER_IDS:-}
+  if [[ -n "$TARGET_LAYER_IDS" ]]; then
+    LAYER_SET=custom
+    LAYER_SELECTION=layer
+  else
+    LAYER_SELECTION=set
+  fi
+fi
+if [[ "$LAYER_SELECTION" == set ]]; then
+  case "$LAYER_SET" in
+    spread) TARGET_LAYER_IDS=1,9,17,25,33 ;;
+    high_only) TARGET_LAYER_IDS=26,28,30,32,34 ;;
+    middle_high) TARGET_LAYER_IDS=17,19,25,33,34 ;;
+    *) echo "unknown teacher layer set: $LAYER_SET" >&2; exit 2 ;;
+  esac
+fi
+TARGET_LAYER_IDS=$(printf '%s' "$TARGET_LAYER_IDS" | tr -d '[][:space:]')
 IFS=',' read -r -a LAYER_ARRAY <<< "$TARGET_LAYER_IDS"
 [[ ${#LAYER_ARRAY[@]} -eq 5 ]] || { echo "DSpark requires five target layer IDs, got: $TARGET_LAYER_IDS" >&2; exit 2; }
 declare -A SEEN_LAYERS=()
+NORMALIZED_LAYER_IDS=()
 for layer_id in "${LAYER_ARRAY[@]}"; do
   [[ "$layer_id" =~ ^[0-9]+$ ]] || { echo "invalid target layer ID: $layer_id" >&2; exit 2; }
-  ((10#$layer_id <= 34)) || { echo "Qwen2.5-VL-3B target layer IDs must be in 0..34" >&2; exit 2; }
-  [[ -z ${SEEN_LAYERS[$((10#$layer_id))]+x} ]] || { echo "target layer IDs must be unique" >&2; exit 2; }
-  SEEN_LAYERS[$((10#$layer_id))]=1
+  numeric_layer_id=$((10#$layer_id))
+  ((numeric_layer_id <= 34)) || { echo "Qwen2.5-VL-3B target layer IDs must be in 0..34" >&2; exit 2; }
+  [[ -z ${SEEN_LAYERS[$numeric_layer_id]+x} ]] || { echo "target layer IDs must be unique" >&2; exit 2; }
+  SEEN_LAYERS[$numeric_layer_id]=1
+  NORMALIZED_LAYER_IDS+=("$numeric_layer_id")
 done
-LAYER_SLUG=$(IFS=_; printf '%s' "${LAYER_ARRAY[*]}")
+TARGET_LAYER_IDS=$(IFS=,; printf '%s' "${NORMALIZED_LAYER_IDS[*]}")
+LAYER_SLUG=$(IFS=_; printf '%s' "${NORMALIZED_LAYER_IDS[*]}")
 
 NUM_SAMPLES=${SPECFORGE_NUM_SAMPLES:-68000}
 PHASE1_MAX_LENGTH=${SPECFORGE_PHASE1_MAX_LENGTH:-2048}
 PHASE2_MAX_LENGTH=${SPECFORGE_PHASE2_MAX_LENGTH:-3072}
-DSPARK_DEPTH=${SPECFORGE_DSPARK_DEPTH:-2}
+[[ ${SPECFORGE_DSPARK_DEPTH:-3} == 3 ]] || {
+  echo "this launcher fixes the DSpark draft depth at 3 transformer layers" >&2
+  exit 2
+}
+DSPARK_DEPTH=3
 DSPARK_BLOCK_SIZE=${SPECFORGE_DSPARK_BLOCK_SIZE:-7}
 CAPTURE_BATCH_SIZE=${SPECFORGE_CAPTURE_BATCH_SIZE:-8}
 CAPTURE_WORKERS=${SPECFORGE_CAPTURE_PREPROCESS_WORKERS:-8}
@@ -130,12 +189,16 @@ MANIFEST="$DS_ARTIFACT_ROOT/phase2/manifest.jsonl"
 
 if ((PRINT_CONFIG)); then
   printf 'ENV_FILE=%s\nTARGET_MODEL_PATH=%s\nGPU_IDS=%s\n' "$ENV_FILE" "$TARGET_MODEL_PATH" "$GPU_IDS"
-  printf 'TARGET_LAYER_IDS=%s\nDSPARK_DEPTH=%s\nDSPARK_BLOCK_SIZE=%s\n' "$TARGET_LAYER_IDS" "$DSPARK_DEPTH" "$DSPARK_BLOCK_SIZE"
+  printf 'LAYER_SET=%s\nTARGET_LAYER_IDS=%s\nDSPARK_DEPTH=%s\nDSPARK_BLOCK_SIZE=%s\n' "$LAYER_SET" "$TARGET_LAYER_IDS" "$DSPARK_DEPTH" "$DSPARK_BLOCK_SIZE"
   printf 'SHAREGPT_DATA=%s\nPHASE1_FEATURE_ROOT=%s\nPHASE2_FEATURE_ROOT=%s\n' "$SHAREGPT_DATA" "$PHASE1_FEATURE_ROOT" "$PHASE2_FEATURE_ROOT"
   printf 'PHASE1_CONFIG=%s\nPHASE2_CONFIG=%s\nMANIFEST=%s\n' "$PHASE1_CONFIG" "$PHASE2_CONFIG" "$MANIFEST"
   printf 'OUTPUT_ROOT=%s\nNUM_SAMPLES=%s\n' "$DS_OUTPUT_ROOT" "$NUM_SAMPLES"
   exit 0
 fi
+
+[[ -f "$SOURCE_DATA" ]] || { echo "ShareGPT source file not found: $SOURCE_DATA" >&2; exit 1; }
+[[ -f "$SOURCE_JSONL" ]] || { echo "LLaVA source JSONL not found: $SOURCE_JSONL" >&2; exit 1; }
+[[ -d "$IMAGE_ROOT" ]] || { echo "LLaVA image root not found: $IMAGE_ROOT" >&2; exit 1; }
 
 command -v "$PYTHON_BIN" >/dev/null 2>&1 || { echo "Python executable not found: $PYTHON_BIN" >&2; exit 1; }
 visible_gpus=$("$PYTHON_BIN" -c 'import torch; print(torch.cuda.device_count())')
@@ -247,7 +310,11 @@ export SPECFORGE_PHASE2_MAX_LENGTH="$PHASE2_MAX_LENGTH"
 export SPECFORGE_ARTIFACT_ROOT="$DS_ARTIFACT_ROOT/training"
 export SPECFORGE_OUTPUT_ROOT="$DS_OUTPUT_ROOT"
 
-train_args=(--layer "$TARGET_LAYER_IDS" --gpu-ids "$GPU_IDS" --env-file "$ENV_FILE")
+if [[ "$LAYER_SELECTION" == set ]]; then
+  train_args=(--set "$LAYER_SET" --gpu-ids "$GPU_IDS" --env-file "$ENV_FILE")
+else
+  train_args=(--layer "$TARGET_LAYER_IDS" --gpu-ids "$GPU_IDS" --env-file "$ENV_FILE")
+fi
 if ((RESUME)); then
   train_args+=(--resume)
 fi

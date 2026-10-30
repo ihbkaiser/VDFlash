@@ -8,26 +8,41 @@ artifacts, and checkpoints separate from `src/train_Dflash_SpecForge`.
 The launcher only trains. It does not prepare JSONL, stage images, capture
 teacher states, rewrite cache metadata, or modify the DFlash tree.
 
-## One-command two-B200 run with DSpark depth 2
+## One-command two-B200 run with DSpark depth 3
 
 On the company machine, the local ignored file
 `src/train_Dflash_SpecForge/train_qwen25vl_dflash_3layer.env` supplies the
 ShareGPT, model, LLaVA JSONL, image, and artifact paths. Run:
 
 ```bash
-bash src/train_DSpark_SpecForge/train_qwen25vl_dspark_2layer_b200.sh
+bash src/train_DSpark_SpecForge/train_qwen25vl_dspark_3layer_b200.sh
 ```
 
 This prepares the ShareGPT conversion and LLaVA manifest, captures DSpark
-features for both phases into a separate `dspark_depth2_layers_...` artifact
+features for both phases into a separate `dspark_depth3_layers_...` artifact
 tree, then trains Phase 1 followed by Phase 2 warm-started from Phase 1. It
-defaults to GPUs `0,1` and target taps `26,28,30,32,34`; the draft depth is two
-DSpark decoder layers. It recaptures features with the DSpark schema because
+defaults to GPUs `0,1` and target taps `26,28,30,32,34`; the draft depth is three
+DSpark decoder layers. Choose `spread` (`1,9,17,25,33`), `high_only`
+(`26,28,30,32,34`), or `middle_high` (`17,19,25,33,34`) with `--layer-set`.
+It recaptures features with the DSpark schema because
 the old DFlash cache does not contain DSpark's `target_last_hidden_states`.
 Partial feature captures are reused if the command is rerun. Use `--resume` to
 resume an existing training checkpoint, or `SPECFORGE_ENV_FILE=/path/to/file`
 to select another local environment file. `--print-config` shows paths without
 starting work.
+
+Examples for the three teacher-layer presets:
+
+```bash
+bash src/train_DSpark_SpecForge/train_qwen25vl_dspark_3layer_b200.sh --layer-set spread
+bash src/train_DSpark_SpecForge/train_qwen25vl_dspark_3layer_b200.sh --layer-set high_only
+bash src/train_DSpark_SpecForge/train_qwen25vl_dspark_3layer_b200.sh --layer-set middle_high
+```
+
+For a custom five-layer list, pass `--teacher-layers '[1,9,17,25,33]'` or set
+`SPECFORGE_TARGET_LAYER_IDS`. The three-layer launcher fixes the DSpark draft
+depth at 3; the teacher-layer list controls which five target representations
+feed that draft.
 
 ## Server setup
 
@@ -55,9 +70,9 @@ set is:
 <SPECFORGE_DFLASH_ARTIFACT_ROOT>/dflash_3layer_<IDs>/phase2/hidden_states
 ```
 
-The `high_only`, `middle_high`, `middle_high_2`, and `shallow_high` selections
+The `spread`, `high_only`, `middle_high`, `middle_high_2`, and `shallow_high` selections
 must match the target layers used to make the respective caches. The draft uses
-five DSpark decoder layers and block size 7 by default; the training head uses
+three DSpark decoder layers and block size 7 by default; the training head uses
 the DSpark CE, L1, and confidence losses with weights 0.1, 0.9, and 1.0.
 
 ## Train

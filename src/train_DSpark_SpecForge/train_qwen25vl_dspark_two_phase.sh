@@ -48,7 +48,8 @@ Train DSpark on existing Qwen2.5-VL-3B Phase 1 and Phase 2 feature caches.
 The default run trains Phase 1, then warm-starts Phase 2 from its latest draft.
 No data preparation or hidden-state capture is run by this launcher.
 
-Layer sets (must match the cached DFlash target features):
+Teacher-layer sets (each set selects five target hidden-state taps):
+  spread          1,9,17,25,33
   high_only       26,28,30,32,34
   middle_high     17,19,25,33,34
   middle_high_2   17,28,30,32,34
@@ -125,6 +126,7 @@ if [[ -n "$SET_NAME" && -n "$TARGET_LAYER_IDS" ]]; then
   exit 2
 fi
 case "$SET_NAME" in
+  spread) TARGET_LAYER_IDS=1,9,17,25,33 ;;
   high_only) TARGET_LAYER_IDS=26,28,30,32,34 ;;
   middle_high) TARGET_LAYER_IDS=17,19,25,33,34 ;;
   middle_high_2) TARGET_LAYER_IDS=17,28,30,32,34 ;;
@@ -190,7 +192,7 @@ PHASE1_EPOCHS=${SPECFORGE_PHASE1_NUM_EPOCHS:-$NUM_EPOCHS}
 PHASE2_EPOCHS=${SPECFORGE_PHASE2_NUM_EPOCHS:-$NUM_EPOCHS}
 GLOBAL_BATCH_SIZE=${SPECFORGE_GLOBAL_BATCH_SIZE:-64}
 MICRO_BATCH_SIZE=${SPECFORGE_MICRO_BATCH_SIZE:-1}
-DSPARK_DEPTH=${SPECFORGE_DSPARK_DEPTH:-5}
+DSPARK_DEPTH=${SPECFORGE_DSPARK_DEPTH:-3}
 DSPARK_BLOCK_SIZE=${SPECFORGE_DSPARK_BLOCK_SIZE:-7}
 NUM_ANCHORS=${SPECFORGE_NUM_ANCHORS:-512}
 OBJECTIVE_CHUNK_BLOCKS=${SPECFORGE_OBJECTIVE_CHUNK_BLOCKS:-32}
