@@ -3,6 +3,7 @@ set -euo pipefail
 
 # End-to-end two-B200 DSpark run: prepare ShareGPT, capture DSpark features for
 # both phases, then train Phase 1 and warm-start Phase 2 from its checkpoint.
+# Defaults favor throughput on two B200s and can be overridden in the shell.
 # Machine-specific paths are loaded from the ignored DFlash environment file.
 
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -75,8 +76,10 @@ Options:
 
 Useful overrides: SPECFORGE_GPU_IDS, SPECFORGE_LAYER_SET,
 SPECFORGE_TARGET_LAYER_IDS, SPECFORGE_NUM_SAMPLES,
-SPECFORGE_CAPTURE_BATCH_SIZE,
-SPECFORGE_GLOBAL_BATCH_SIZE, SPECFORGE_NUM_EPOCHS, and PYTHON_BIN.
+SPECFORGE_CAPTURE_BATCH_SIZE, SPECFORGE_SGLANG_MEM_FRACTION_STATIC,
+SPECFORGE_GLOBAL_BATCH_SIZE, SPECFORGE_MICRO_BATCH_SIZE,
+SPECFORGE_DATALOADER_WORKERS, SPECFORGE_OBJECTIVE_CHUNK_BLOCKS,
+SPECFORGE_NUM_EPOCHS, and PYTHON_BIN.
 EOF
       exit 0
       ;;
@@ -169,13 +172,48 @@ PHASE2_MAX_LENGTH=${SPECFORGE_PHASE2_MAX_LENGTH:-3072}
 }
 DSPARK_DEPTH=3
 DSPARK_BLOCK_SIZE=${SPECFORGE_DSPARK_BLOCK_SIZE:-7}
-CAPTURE_BATCH_SIZE=${SPECFORGE_CAPTURE_BATCH_SIZE:-8}
-CAPTURE_WORKERS=${SPECFORGE_CAPTURE_PREPROCESS_WORKERS:-8}
-CAPTURE_QUEUE=${SPECFORGE_CAPTURE_PREPROCESS_QUEUE:-32}
-CAPTURE_IO_THREADS=${SPECFORGE_CAPTURE_IO_THREADS:-8}
-CAPTURE_IO_QUEUE=${SPECFORGE_CAPTURE_IO_QUEUE:-64}
-DATASET_NUM_PROC=${SPECFORGE_DATASET_NUM_PROC:-8}
-SGLANG_MEM_FRACTION=${SPECFORGE_SGLANG_MEM_FRACTION_STATIC:-0.4}
+
+# Throughput defaults for two dedicated B200 GPUs. Keep global batch 64 and the
+# current sequence lengths for a comparable optimizer batch. Micro batch 32
+# gives one optimizer pass per global batch (no accumulation).
+export SPECFORGE_GLOBAL_BATCH_SIZE=${SPECFORGE_GLOBAL_BATCH_SIZE:-64}
+export SPECFORGE_MICRO_BATCH_SIZE=${SPECFORGE_MICRO_BATCH_SIZE:-32}
+export SPECFORGE_NUM_EPOCHS=${SPECFORGE_NUM_EPOCHS:-6}
+export SPECFORGE_DATALOADER_WORKERS=${SPECFORGE_DATALOADER_WORKERS:-16}
+export SPECFORGE_OBJECTIVE_CHUNK_BLOCKS=${SPECFORGE_OBJECTIVE_CHUNK_BLOCKS:-128}
+export SPECFORGE_ATTENTION_BACKEND=${SPECFORGE_ATTENTION_BACKEND:-flex_attention}
+export SPECFORGE_FSDP_SHARDING=${SPECFORGE_FSDP_SHARDING:-NO_SHARD}
+export SPECFORGE_OPTIMIZER_CPU_OFFLOAD=${SPECFORGE_OPTIMIZER_CPU_OFFLOAD:-0}
+
+export SPECFORGE_CAPTURE_BATCH_SIZE=${SPECFORGE_CAPTURE_BATCH_SIZE:-64}
+export SPECFORGE_CAPTURE_PREPROCESS_WORKERS=${SPECFORGE_CAPTURE_PREPROCESS_WORKERS:-12}
+export SPECFORGE_CAPTURE_PREPROCESS_QUEUE=${SPECFORGE_CAPTURE_PREPROCESS_QUEUE:-32}
+export SPECFORGE_CAPTURE_IO_THREADS=${SPECFORGE_CAPTURE_IO_THREADS:-12}
+export SPECFORGE_CAPTURE_IO_QUEUE=${SPECFORGE_CAPTURE_IO_QUEUE:-64}
+export SPECFORGE_DATASET_NUM_PROC=${SPECFORGE_DATASET_NUM_PROC:-12}
+# Larger static pool supports the increased capture batch on dedicated GPUs.
+export SPECFORGE_SGLANG_MEM_FRACTION_STATIC=${SPECFORGE_SGLANG_MEM_FRACTION_STATIC:-0.8}
+
+for batch_name in SPECFORGE_GLOBAL_BATCH_SIZE SPECFORGE_MICRO_BATCH_SIZE; do
+  batch_value=${!batch_name}
+  [[ "$batch_value" =~ ^[1-9][0-9]*$ ]] || {
+    echo "$batch_name must be a positive integer, got: $batch_value" >&2
+    exit 2
+  }
+done
+if ((SPECFORGE_GLOBAL_BATCH_SIZE % (GPU_COUNT * SPECFORGE_MICRO_BATCH_SIZE) != 0)); then
+  echo "global batch must be divisible by GPUs x micro batch" >&2
+  exit 2
+fi
+TRAIN_ACCUMULATION_STEPS=$((SPECFORGE_GLOBAL_BATCH_SIZE / (GPU_COUNT * SPECFORGE_MICRO_BATCH_SIZE)))
+
+CAPTURE_BATCH_SIZE=$SPECFORGE_CAPTURE_BATCH_SIZE
+CAPTURE_WORKERS=$SPECFORGE_CAPTURE_PREPROCESS_WORKERS
+CAPTURE_QUEUE=$SPECFORGE_CAPTURE_PREPROCESS_QUEUE
+CAPTURE_IO_THREADS=$SPECFORGE_CAPTURE_IO_THREADS
+CAPTURE_IO_QUEUE=$SPECFORGE_CAPTURE_IO_QUEUE
+DATASET_NUM_PROC=$SPECFORGE_DATASET_NUM_PROC
+SGLANG_MEM_FRACTION=$SPECFORGE_SGLANG_MEM_FRACTION_STATIC
 DS_ROOT=${SPECFORGE_DSPARK_ROOT:-"$(dirname "$BASE_ARTIFACT_ROOT")/qwen25_dspark_3layer"}
 DS_ARTIFACT_ROOT=${SPECFORGE_DSPARK_ARTIFACT_ROOT:-"$DS_ROOT/dspark_depth${DSPARK_DEPTH}_layers_${LAYER_SLUG}"}
 DS_OUTPUT_ROOT=${SPECFORGE_DSPARK_OUTPUT_ROOT:-"$DS_ROOT/outputs/dspark_depth${DSPARK_DEPTH}_layers_${LAYER_SLUG}"}
@@ -189,6 +227,15 @@ MANIFEST="$DS_ARTIFACT_ROOT/phase2/manifest.jsonl"
 if ((PRINT_CONFIG)); then
   printf 'ENV_FILE=%s\nTARGET_MODEL_PATH=%s\nGPU_IDS=%s\n' "$ENV_FILE" "$TARGET_MODEL_PATH" "$GPU_IDS"
   printf 'LAYER_SET=%s\nTARGET_LAYER_IDS=%s\nDSPARK_DEPTH=%s\nDSPARK_BLOCK_SIZE=%s\n' "$LAYER_SET" "$TARGET_LAYER_IDS" "$DSPARK_DEPTH" "$DSPARK_BLOCK_SIZE"
+  printf 'PHASE1_MAX_LENGTH=%s\nPHASE2_MAX_LENGTH=%s\n' "$PHASE1_MAX_LENGTH" "$PHASE2_MAX_LENGTH"
+  printf 'CAPTURE_BATCH_SIZE_PER_GPU=%s\nSGLANG_MEM_FRACTION_STATIC=%s\n' "$CAPTURE_BATCH_SIZE" "$SGLANG_MEM_FRACTION"
+  printf 'CAPTURE_PREPROCESS_WORKERS=%s\nCAPTURE_IO_THREADS=%s\nDATASET_NUM_PROC=%s\n' \
+    "$CAPTURE_WORKERS" "$CAPTURE_IO_THREADS" "$DATASET_NUM_PROC"
+  printf 'TRAIN_GLOBAL_BATCH_SIZE=%s\nTRAIN_MICRO_BATCH_SIZE_PER_GPU=%s\n' \
+    "$SPECFORGE_GLOBAL_BATCH_SIZE" "$SPECFORGE_MICRO_BATCH_SIZE"
+  printf 'TRAIN_ACCUMULATION_STEPS=%s\n' "$TRAIN_ACCUMULATION_STEPS"
+  printf 'TRAIN_DATALOADER_WORKERS=%s\nOBJECTIVE_CHUNK_BLOCKS=%s\nATTENTION_BACKEND=%s\n' \
+    "$SPECFORGE_DATALOADER_WORKERS" "$SPECFORGE_OBJECTIVE_CHUNK_BLOCKS" "$SPECFORGE_ATTENTION_BACKEND"
   printf 'DS_ROOT=%s\nDS_ARTIFACT_ROOT=%s\nDS_OUTPUT_ROOT=%s\n' "$DS_ROOT" "$DS_ARTIFACT_ROOT" "$DS_OUTPUT_ROOT"
   printf 'SHAREGPT_DATA=%s\nPHASE1_FEATURE_ROOT=%s\nPHASE2_FEATURE_ROOT=%s\n' "$SHAREGPT_DATA" "$PHASE1_FEATURE_ROOT" "$PHASE2_FEATURE_ROOT"
   printf 'PHASE1_CONFIG=%s\nPHASE2_CONFIG=%s\nMANIFEST=%s\n' "$PHASE1_CONFIG" "$PHASE2_CONFIG" "$MANIFEST"
@@ -201,11 +248,32 @@ fi
 [[ -d "$IMAGE_ROOT" ]] || { echo "LLaVA image root not found: $IMAGE_ROOT" >&2; exit 1; }
 
 command -v "$PYTHON_BIN" >/dev/null 2>&1 || { echo "Python executable not found: $PYTHON_BIN" >&2; exit 1; }
-visible_gpus=$("$PYTHON_BIN" -c 'import torch; print(torch.cuda.device_count())')
-[[ "$visible_gpus" == "$GPU_COUNT" ]] || {
-  echo "expected two visible GPUs after CUDA_VISIBLE_DEVICES=$GPU_IDS, found $visible_gpus" >&2
-  exit 1
-}
+"$PYTHON_BIN" - "$GPU_IDS" <<'PY'
+import sys
+
+import torch
+
+expected_ids = sys.argv[1]
+expected_count = len(expected_ids.split(","))
+count = torch.cuda.device_count()
+if count != expected_count:
+    raise SystemExit(
+        f"expected {expected_count} visible GPUs from CUDA_VISIBLE_DEVICES="
+        f"{expected_ids}, found {count}"
+    )
+names = [torch.cuda.get_device_name(index) for index in range(count)]
+not_b200 = [name for name in names if "B200" not in name.upper()]
+if not_b200:
+    raise SystemExit(f"this launcher targets B200 GPUs; detected: {names}")
+for index, name in enumerate(names):
+    torch.cuda.set_device(index)
+    if not torch.cuda.is_bf16_supported():
+        raise SystemExit(f"GPU {index} ({name}) does not support BF16")
+print(
+    f"[dspark] torch={torch.__version__} cuda={torch.version.cuda} "
+    f"visible_gpus={count} names={names} dtype=bfloat16"
+)
+PY
 mkdir -p "$DS_ARTIFACT_ROOT/configs" "$DS_OUTPUT_ROOT"
 
 resolve_config() {
