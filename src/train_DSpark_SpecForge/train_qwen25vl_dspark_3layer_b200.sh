@@ -332,10 +332,17 @@ echo "[dspark:phase1-capture] GPUs=$GPU_COUNT batch/rank=$CAPTURE_BATCH_SIZE max
     --sglang-disable-radix-cache
 )
 PHASE1_COUNT=$(feature_count "$PHASE1_FEATURE_ROOT")
-[[ "$PHASE1_COUNT" == "$NUM_SAMPLES" ]] || {
-  echo "Phase 1 DSpark capture produced $PHASE1_COUNT records; expected exactly $NUM_SAMPLES" >&2
+[[ "$PHASE1_COUNT" =~ ^[1-9][0-9]*$ ]] || {
+  echo "Phase 1 DSpark capture produced no feature records" >&2
   exit 1
 }
+((PHASE1_COUNT <= NUM_SAMPLES)) || {
+  echo "Phase 1 DSpark capture produced $PHASE1_COUNT records, more than the requested $NUM_SAMPLES" >&2
+  exit 1
+}
+if ((PHASE1_COUNT < NUM_SAMPLES)); then
+  echo "[dspark:phase1-capture] using $PHASE1_COUNT captured records (requested $NUM_SAMPLES; DSpark eligibility filtering can remove samples)"
+fi
 
 echo "[dspark] preparing LLaVA manifest"
 mkdir -p "$(dirname "$MANIFEST")" "$PHASE2_FEATURE_ROOT"
@@ -343,7 +350,19 @@ mkdir -p "$(dirname "$MANIFEST")" "$PHASE2_FEATURE_ROOT"
   --input "$SOURCE_JSONL" \
   --output "$MANIFEST" \
   --image-root "$IMAGE_ROOT" \
-  --expected-records "$NUM_SAMPLES"
+  --expected-records 0
+MANIFEST_COUNT=$(wc -l < "$MANIFEST" | tr -d '[:space:]')
+[[ "$MANIFEST_COUNT" =~ ^[1-9][0-9]*$ ]] || {
+  echo "Phase 2 manifest contains no records: $MANIFEST" >&2
+  exit 1
+}
+((MANIFEST_COUNT <= NUM_SAMPLES)) || {
+  echo "Phase 2 manifest contains $MANIFEST_COUNT records, more than the requested $NUM_SAMPLES" >&2
+  exit 1
+}
+if ((MANIFEST_COUNT < NUM_SAMPLES)); then
+  echo "[dspark:phase2-manifest] using $MANIFEST_COUNT manifest records (requested $NUM_SAMPLES)"
+fi
 
 echo "[dspark:phase2-capture] GPUs=$GPU_COUNT batch/rank=$CAPTURE_BATCH_SIZE max_length=$PHASE2_MAX_LENGTH"
 (
@@ -358,7 +377,7 @@ echo "[dspark:phase2-capture] GPUs=$GPU_COUNT batch/rank=$CAPTURE_BATCH_SIZE max
     --image-root "$IMAGE_ROOT" \
     --output-path "$PHASE2_FEATURE_ROOT" \
     --max-length "$PHASE2_MAX_LENGTH" \
-    --expected-records "$NUM_SAMPLES" \
+    --expected-records "$MANIFEST_COUNT" \
     --tp-size 1 \
     --batch-size "$CAPTURE_BATCH_SIZE" \
     --num-preprocess-workers "$CAPTURE_WORKERS" \
@@ -368,10 +387,17 @@ echo "[dspark:phase2-capture] GPUs=$GPU_COUNT batch/rank=$CAPTURE_BATCH_SIZE max
     --sglang-mem-fraction-static "$SGLANG_MEM_FRACTION"
 )
 PHASE2_COUNT=$(feature_count "$PHASE2_FEATURE_ROOT")
-[[ "$PHASE2_COUNT" == "$NUM_SAMPLES" ]] || {
-  echo "Phase 2 DSpark capture produced $PHASE2_COUNT records; expected exactly $NUM_SAMPLES" >&2
+[[ "$PHASE2_COUNT" =~ ^[1-9][0-9]*$ ]] || {
+  echo "Phase 2 DSpark capture produced no feature records" >&2
   exit 1
 }
+((PHASE2_COUNT <= MANIFEST_COUNT)) || {
+  echo "Phase 2 DSpark capture produced $PHASE2_COUNT records, more than the manifest's $MANIFEST_COUNT" >&2
+  exit 1
+}
+if ((PHASE2_COUNT < MANIFEST_COUNT)); then
+  echo "[dspark:phase2-capture] using $PHASE2_COUNT captured records from $MANIFEST_COUNT manifest records"
+fi
 
 export SPECFORGE_DSPARK_DEPTH="$DSPARK_DEPTH"
 export SPECFORGE_DSPARK_BLOCK_SIZE="$DSPARK_BLOCK_SIZE"
