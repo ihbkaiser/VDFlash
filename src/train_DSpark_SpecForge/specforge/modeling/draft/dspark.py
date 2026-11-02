@@ -332,7 +332,15 @@ class DSparkDraftModel(DFlashDraftModel):
     ) -> torch.LongTensor:
         """Generate a block with the same Markov correction used in training."""
 
-        proposal_hidden = draft_hidden[:, -self.block_size + 1 :, :]
+        candidate_count = block_output_ids.shape[1] - 1
+        if draft_hidden.shape[1] < candidate_count:
+            raise ValueError(
+                "DSpark draft output has fewer trained positions than candidates: "
+                f"hidden={draft_hidden.shape[1]}, candidates={candidate_count}"
+            )
+        # Training predicts target_ids[anchor + 1 : anchor + block_size + 1]
+        # from hidden positions [0:block_size], with the anchor as predecessor.
+        proposal_hidden = draft_hidden[:, :candidate_count, :]
         base_logits = target.lm_head(proposal_hidden)
         if self.markov_head is None:
             return _sample(base_logits)
@@ -394,7 +402,9 @@ class DSparkDraftModel(DFlashDraftModel):
                     "target-engine throughput profile"
                 )
             rates = {int(size): float(rate) for size, rate in step_rate_by_batch.items()}
-            missing = [size for size in range(1, self.block_size + 1) if size not in rates]
+            missing = [
+                size for size in range(1, self.block_size + 2) if size not in rates
+            ]
             invalid = {
                 size: rate
                 for size, rate in rates.items()
@@ -422,7 +432,7 @@ class DSparkDraftModel(DFlashDraftModel):
             )
             if candidate_count <= 0:
                 return 0
-            proposal_hidden = draft_hidden[:, -candidate_count:, :]
+            proposal_hidden = draft_hidden[:, :candidate_count, :]
             previous_ids = full_block_ids[:, :candidate_count]
             confidence_logits = self.predict_confidence(
                 proposal_hidden,
@@ -483,9 +493,11 @@ class DSparkDraftModel(DFlashDraftModel):
 
         ``profile`` scheduling is the single-request form of DSpark's
         hardware-aware scheduler. The supplied rates must be measured steps
-        per second for target verification batches containing 1..block_size
-        tokens. ``threshold`` is useful for offline sweeps when no engine
-        profile is available.
+        per second for target verification batches containing 1..block_size+1
+        tokens. The trained block size counts draft positions after the anchor,
+        so the verifier batch can contain up to ``block_size + 1`` tokens.
+        ``threshold`` is useful for offline sweeps when no engine profile is
+        available.
         """
 
         selector = self._make_verification_length_selector(
@@ -502,6 +514,8 @@ class DSparkDraftModel(DFlashDraftModel):
             position_ids=position_ids,
             target_kwargs=target_kwargs,
             verification_length_selector=selector,
+            draft_block_size=self.block_size,
+            verification_block_size=self.block_size + 1,
         )
 
     def apply_logits_head(

@@ -386,7 +386,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--confidence-threshold", type=float, default=0.5)
     parser.add_argument(
         "--throughput-profile",
-        help="JSON object with step_rate_by_batch for verification batch sizes 1..block_size",
+        help=(
+            "JSON object with step_rate_by_batch for verification batches "
+            "1..block_size+1"
+        ),
     )
     parser.add_argument(
         "--skip-target-verification",

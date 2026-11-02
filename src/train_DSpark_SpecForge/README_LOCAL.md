@@ -155,6 +155,8 @@ The default `--scheduler fixed` is the fixed-block offline evaluation path.
 choose a cumulative-survival prefix. `--scheduler profile` with
 `--throughput-profile FILE.json` uses the single-request, hardware-aware prefix
 selector; the JSON must contain
-`{"step_rate_by_batch":{"1":sps1,"2":sps2,...,"7":sps7}}`, measured in
-target verification steps per second. The target still verifies every selected
-prefix, so scheduling changes verification work but not greedy output tokens.
+`{"step_rate_by_batch":{"1":sps1,"2":sps2,...,"8":sps8}}`, measured in
+target verification steps per second. This checkpoint predicts seven draft
+tokens after its anchor, so verification batches range from one anchor token
+through eight tokens. The target verifies every selected prefix, so scheduling
+changes verification work but not greedy output tokens.

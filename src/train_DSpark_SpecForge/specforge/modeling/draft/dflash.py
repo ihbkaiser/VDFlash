@@ -614,13 +614,34 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         verification_length_selector: Optional[
             Callable[[torch.Tensor, torch.Tensor, int], int]
         ] = None,
+        draft_block_size: Optional[int] = None,
+        verification_block_size: Optional[int] = None,
     ):
         self.eval()
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
         target_device = next(target.parameters()).device
 
-        block_size = self.block_size
+        block_size = (
+            self.block_size
+            if verification_block_size is None
+            else int(verification_block_size)
+        )
+        draft_size = (
+            self.block_size
+            if draft_block_size is None
+            else int(draft_block_size)
+        )
+        if block_size < 2 or draft_size < 2:
+            raise ValueError(
+                "draft and verification blocks must each contain at least two "
+                f"positions, got draft={draft_size}, verification={block_size}"
+            )
+        if draft_size not in {block_size, block_size - 1}:
+            raise ValueError(
+                "draft block size must equal the verification block size or be one "
+                f"position shorter, got draft={draft_size}, verification={block_size}"
+            )
         if input_ids.shape[0] != 1:
             raise ValueError("DFlash HF inference currently supports batch size one")
         output_ids = torch.full(
@@ -708,13 +729,14 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         while start < max_length:
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = position_ids[..., start : start + block_size]
-            noise_embedding = target_embed_tokens(block_output_ids)
+            draft_input_ids = block_output_ids[:, :draft_size]
+            noise_embedding = target_embed_tokens(draft_input_ids)
             draft_hidden = self(
                 target_hidden=target_hidden,
                 noise_embedding=noise_embedding,
                 position_ids=position_ids[
                     ...,
-                    past_key_values_draft.get_seq_length() : start + block_size,
+                    past_key_values_draft.get_seq_length() : start + draft_size,
                 ],
                 past_key_values=past_key_values_draft,
                 use_cache=True,

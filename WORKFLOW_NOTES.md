@@ -151,7 +151,8 @@ repository VDFlash.
 - Default `--scheduler fixed` is the offline fixed-block path. Use the
   confidence head with `--scheduler threshold` for cumulative-survival prefix
   selection or `--scheduler profile` with measured target-engine steps per
-  second by verification batch size. The latter is single-request scheduling,
-  not a continuous-batching server scheduler.
+  second by verification batch size (1 through 8 tokens for this checkpoint).
+  The latter is single-request scheduling, not a continuous-batching server
+  scheduler.
 - Keep the archive, extracted training states, target-model cache, and
   inference JSONL under ignored artifact/cache roots; never commit them.
