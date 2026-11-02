@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+import math
+from typing import Callable, Mapping, Optional, Tuple
 
 import torch
 from torch import nn
@@ -362,6 +363,146 @@ class DSparkDraftModel(DFlashDraftModel):
             if self.confidence_head_with_markov:
                 input_dim += self.markov_head.markov_rank
             self.confidence_head = AcceptRatePredictor(input_dim=input_dim)
+
+    def _make_verification_length_selector(
+        self,
+        scheduler: str,
+        *,
+        confidence_threshold: float,
+        step_rate_by_batch: Optional[Mapping[int, float]],
+    ) -> Optional[Callable[[torch.Tensor, torch.Tensor, int], int]]:
+        rates: dict[int, float] | None = None
+        if scheduler == "fixed":
+            return None
+        if self.confidence_head is None:
+            raise ValueError(
+                "confidence scheduling requires a checkpoint with a confidence head"
+            )
+        if scheduler == "threshold":
+            if (
+                not math.isfinite(confidence_threshold)
+                or not 0.0 <= confidence_threshold <= 1.0
+            ):
+                raise ValueError(
+                    "confidence_threshold must be between 0 and 1, got "
+                    f"{confidence_threshold}"
+                )
+        elif scheduler == "profile":
+            if step_rate_by_batch is None:
+                raise ValueError(
+                    "profile scheduling requires step_rate_by_batch from a "
+                    "target-engine throughput profile"
+                )
+            rates = {int(size): float(rate) for size, rate in step_rate_by_batch.items()}
+            missing = [size for size in range(1, self.block_size + 1) if size not in rates]
+            invalid = {
+                size: rate
+                for size, rate in rates.items()
+                if not math.isfinite(rate) or rate <= 0.0
+            }
+            if missing or invalid:
+                raise ValueError(
+                    "invalid throughput profile: "
+                    f"missing batch sizes={missing}, non-positive/non-finite rates={invalid}"
+                )
+        else:
+            raise ValueError(
+                "confidence scheduler must be 'fixed', 'threshold', or 'profile', "
+                f"got {scheduler!r}"
+            )
+
+        def select_prefix(
+            draft_hidden: torch.Tensor,
+            full_block_ids: torch.Tensor,
+            max_draft_tokens: int,
+        ) -> int:
+            candidate_count = min(
+                full_block_ids.shape[1] - 1,
+                max(0, int(max_draft_tokens)),
+            )
+            if candidate_count <= 0:
+                return 0
+            proposal_hidden = draft_hidden[:, -candidate_count:, :]
+            previous_ids = full_block_ids[:, :candidate_count]
+            confidence_logits = self.predict_confidence(
+                proposal_hidden,
+                prev_token_ids=previous_ids,
+            )
+            if confidence_logits is None:
+                raise RuntimeError("DSpark confidence head is unavailable")
+            if not bool(torch.isfinite(confidence_logits).all()):
+                raise FloatingPointError("DSpark confidence head produced non-finite logits")
+            conditional_acceptance = torch.sigmoid(confidence_logits.float())[0].tolist()
+
+            survival = 1.0
+            if scheduler == "threshold":
+                selected = 0
+                for confidence in conditional_acceptance:
+                    survival *= confidence
+                    if survival < confidence_threshold:
+                        break
+                    selected += 1
+                return selected
+
+            # Single-request instance of DSpark's prefix scheduler. It admits
+            # one proposal at a time and stops at the first lower-throughput
+            # prefix, preserving the scheduler's non-anticipating decision.
+            assert rates is not None
+            expected_accepts = 1.0  # The target-generated anchor token.
+            selected = 0
+            best_throughput = expected_accepts * rates[1]
+            for index, confidence in enumerate(conditional_acceptance, start=1):
+                survival *= confidence
+                expected_accepts += survival
+                verification_batch = index + 1  # Anchor plus this draft prefix.
+                throughput = expected_accepts * rates[verification_batch]
+                if throughput <= best_throughput:
+                    break
+                best_throughput = throughput
+                selected = index
+            return selected
+
+        return select_prefix
+
+    @torch.inference_mode()
+    def spec_generate(
+        self,
+        target: nn.Module,
+        input_ids: torch.LongTensor,
+        max_new_tokens: int,
+        stop_token_ids: list[int],
+        temperature: float,
+        *,
+        position_ids: Optional[torch.LongTensor] = None,
+        target_kwargs: Optional[dict] = None,
+        confidence_scheduler: str = "fixed",
+        confidence_threshold: float = 0.0,
+        step_rate_by_batch: Optional[Mapping[int, float]] = None,
+    ) -> torch.LongTensor:
+        """Generate losslessly with fixed or confidence-scheduled verification.
+
+        ``profile`` scheduling is the single-request form of DSpark's
+        hardware-aware scheduler. The supplied rates must be measured steps
+        per second for target verification batches containing 1..block_size
+        tokens. ``threshold`` is useful for offline sweeps when no engine
+        profile is available.
+        """
+
+        selector = self._make_verification_length_selector(
+            confidence_scheduler,
+            confidence_threshold=confidence_threshold,
+            step_rate_by_batch=step_rate_by_batch,
+        )
+        return super().spec_generate(
+            target,
+            input_ids,
+            max_new_tokens,
+            stop_token_ids,
+            temperature,
+            position_ids=position_ids,
+            target_kwargs=target_kwargs,
+            verification_length_selector=selector,
+        )
 
     def apply_logits_head(
         self,

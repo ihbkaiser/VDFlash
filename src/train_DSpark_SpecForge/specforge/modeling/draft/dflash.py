@@ -611,6 +611,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         *,
         position_ids: Optional[torch.LongTensor] = None,
         target_kwargs: Optional[dict] = None,
+        verification_length_selector: Optional[
+            Callable[[torch.Tensor, torch.Tensor, int], int]
+        ] = None,
     ):
         self.eval()
         num_input_tokens = input_ids.shape[1]
@@ -723,6 +726,27 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 draft_hidden,
                 block_output_ids,
             )
+
+            if verification_length_selector is not None:
+                max_draft_tokens = min(
+                    block_size - 1,
+                    max(0, max_length - start - 1),
+                )
+                selected_length = int(
+                    verification_length_selector(
+                        draft_hidden, block_output_ids, max_draft_tokens
+                    )
+                )
+                if not 0 <= selected_length <= block_size - 1:
+                    raise ValueError(
+                        "verification_length_selector must return a prefix length "
+                        f"in [0, {block_size - 1}], got {selected_length}"
+                    )
+                selected_length = min(selected_length, max_draft_tokens)
+                block_output_ids = block_output_ids[:, : selected_length + 1]
+                block_position_ids = block_position_ids[
+                    ..., : selected_length + 1
+                ]
 
             output = forward_target(
                 input_ids=block_output_ids,

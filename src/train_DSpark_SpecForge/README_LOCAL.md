@@ -111,3 +111,50 @@ cache; the launcher stops before training and identifies the missing tensor.
 All resolved configs and data-loader caches are under the DSpark artifact root.
 Checkpoints are under the DSpark output root, in `dspark_targets_<IDs>/phase1`
 and `phase2`. They do not overwrite DFlash outputs.
+
+## Infer from the published MSD DSpark checkpoint
+
+The Hugging Face archive is 51.5 GB. Download and verify it, then scan its
+checkpoint headers and extract only the selected checkpoint's shared state and
+rank states:
+
+```bash
+bash src/train_DSpark_SpecForge/scripts/prepare_dspark_inference.sh
+```
+
+The archive and selected files stay under the ignored
+`artifacts/ihbkaiser_qwen25vl-3b-msd-checkpoints/` tree. The selector prefers
+the latest Phase 2 checkpoint and falls back to the latest Phase 1 checkpoint;
+set `DSPARK_PHASE=phase1|phase2`, `DSPARK_RUN_ID`, or `DSPARK_STEP` to choose
+explicitly. It writes `selected_checkpoint.json`, so the inference command can
+resolve the selected checkpoint automatically. The target model defaults to
+[`Qwen/Qwen2.5-VL-3B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct)
+and downloads through the configured `HF_HOME` cache when it is not local.
+
+Run a single image through the DSpark draft and compare greedy tokens against
+the target-only result:
+
+```bash
+.venv/bin/python src/train_DSpark_SpecForge/scripts/infer_qwen25vl_dspark.py \
+  --image /path/to/image.jpg \
+  --prompt "Describe the image." \
+  --max-new-tokens 128
+```
+
+For a normalized image manifest, pass `--manifest`, `--image-root`,
+`--start-index`, and `--num-samples`. The command requires one CUDA GPU with
+BF16 support and enough memory for both the target and draft. The default
+`--device-map auto` is accepted when it places the target on one device; this
+local verifier reports an error if Transformers shards the target across
+devices. Greedy target verification is enabled by default and exits with an
+error if any generated token differs. `--skip-target-verification` omits the
+reference pass when measuring draft-only runtime.
+
+The default `--scheduler fixed` is the fixed-block offline evaluation path.
+`--scheduler threshold --confidence-threshold 0.5` uses the confidence head to
+choose a cumulative-survival prefix. `--scheduler profile` with
+`--throughput-profile FILE.json` uses the single-request, hardware-aware prefix
+selector; the JSON must contain
+`{"step_rate_by_batch":{"1":sps1,"2":sps2,...,"7":sps7}}`, measured in
+target verification steps per second. The target still verifies every selected
+prefix, so scheduling changes verification work but not greedy output tokens.
