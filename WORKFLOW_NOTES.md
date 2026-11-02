@@ -142,7 +142,9 @@ repository VDFlash.
 - Use `src/train_DSpark_SpecForge/scripts/prepare_dspark_inference.sh` to
   resume the download, verify it, inventory checkpoint steps, and extract only
   the selected `training_state.pt` plus rank states. `DSPARK_PHASE=auto`
-  prefers the latest Phase 2 checkpoint and falls back to Phase 1.
+  prefers the latest Phase 2 checkpoint and falls back to Phase 1. The archive
+  has two layer-set runs; the default run uses target layers `26,28,30,32,34`
+  to match the local Qwen2.5-VL config. Override it with `DSPARK_RUN_ID`.
 - Run
   `src/train_DSpark_SpecForge/scripts/infer_qwen25vl_dspark.py` on a CUDA
   BF16-capable GPU with enough memory for the target and draft on one device.

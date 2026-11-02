@@ -124,10 +124,13 @@ bash src/train_DSpark_SpecForge/scripts/prepare_dspark_inference.sh
 
 The archive and selected files stay under the ignored
 `artifacts/ihbkaiser_qwen25vl-3b-msd-checkpoints/` tree. The selector prefers
-the latest Phase 2 checkpoint and falls back to the latest Phase 1 checkpoint;
-set `DSPARK_PHASE=phase1|phase2`, `DSPARK_RUN_ID`, or `DSPARK_STEP` to choose
-explicitly. It writes `selected_checkpoint.json`, so the inference command can
-resolve the selected checkpoint automatically. The target model defaults to
+the latest Phase 2 checkpoint and falls back to the latest Phase 1 checkpoint.
+The archive contains two target-layer runs; by default the script selects
+`qwen25vl-3b-dspark-llava68k-dspark_targets_26_28_30_32_34`, which matches the
+local Qwen2.5-VL draft config. Set `DSPARK_RUN_ID`, `DSPARK_PHASE=phase1|phase2`,
+or `DSPARK_STEP` to choose another checkpoint. It writes
+`selected_checkpoint.json`, so the inference command can resolve the selected
+checkpoint automatically. The target model defaults to
 [`Qwen/Qwen2.5-VL-3B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct)
 and downloads through the configured `HF_HOME` cache when it is not local.
 

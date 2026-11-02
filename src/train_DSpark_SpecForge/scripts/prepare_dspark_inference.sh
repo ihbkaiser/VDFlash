@@ -71,8 +71,6 @@ prepare_args=(
   --output-root "$EXTRACT_ROOT"
   --phase "${DSPARK_PHASE:-auto}"
   --step "${DSPARK_STEP:-latest}"
+  --run-id "${DSPARK_RUN_ID:-qwen25vl-3b-dspark-llava68k-dspark_targets_26_28_30_32_34}"
 )
-if [[ -n "${DSPARK_RUN_ID:-}" ]]; then
-  prepare_args+=(--run-id "$DSPARK_RUN_ID")
-fi
 "$python_bin" "$SCRIPT_DIR/prepare_dspark_checkpoint.py" "${prepare_args[@]}"
