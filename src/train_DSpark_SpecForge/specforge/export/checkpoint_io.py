@@ -90,7 +90,11 @@ def apply_legacy_rope_scaling(output_dir: str) -> bool:
     return True
 
 
-def resolve_training_state(checkpoint_path: str) -> Dict[str, Any]:
+def resolve_training_state(
+    checkpoint_path: str,
+    *,
+    mmap: bool = False,
+) -> Dict[str, Any]:
     """Load the runtime training state from any checkpoint-shaped path.
 
     Accepts a ``training_state.pt`` file, a ``{run_id}-step{N}`` checkpoint
@@ -102,10 +106,12 @@ def resolve_training_state(checkpoint_path: str) -> Dict[str, Any]:
     if path.startswith("file://"):
         path = path[len("file://") :]
     if os.path.isfile(path):
-        return torch.load(path, map_location="cpu", weights_only=False)
+        return torch.load(path, map_location="cpu", weights_only=False, mmap=mmap)
     state_file = os.path.join(path, STATE_FILE)
     if os.path.isfile(state_file):
-        return torch.load(state_file, map_location="cpu", weights_only=False)
+        return torch.load(
+            state_file, map_location="cpu", weights_only=False, mmap=mmap
+        )
     latest = [
         link
         for link in sorted(glob.glob(os.path.join(path, "*-latest")))
@@ -122,6 +128,7 @@ def resolve_training_state(checkpoint_path: str) -> Dict[str, Any]:
             os.path.join(os.path.realpath(latest[0]), STATE_FILE),
             map_location="cpu",
             weights_only=False,
+            mmap=mmap,
         )
     # no `{run_id}-latest` pointer (e.g. symlink-free filesystem): fall back to
     # the highest step directory, mirroring CheckpointManager.latest_dir().
@@ -133,7 +140,10 @@ def resolve_training_state(checkpoint_path: str) -> Dict[str, Any]:
     if steps:
         best = max(steps)[1]
         return torch.load(
-            os.path.join(best, STATE_FILE), map_location="cpu", weights_only=False
+            os.path.join(best, STATE_FILE),
+            map_location="cpu",
+            weights_only=False,
+            mmap=mmap,
         )
     raise FileNotFoundError(
         f"{checkpoint_path!r} is not a training_state.pt, a checkpoint directory, "

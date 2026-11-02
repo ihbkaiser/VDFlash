@@ -153,10 +153,20 @@ devices. Greedy target verification is enabled by default and exits with an
 error if any generated token differs. `--skip-target-verification` omits the
 reference pass when measuring draft-only runtime.
 
-On NCI Gadi, submit one image sample to the H200 queue with
-`qsub -v REPO_ROOT="$PWD",HF_HOME="$HF_HOME",DSPARK_IMAGE=/path/to/image.png,DSPARK_OUTPUT_DIR="$PWD/results/dspark_inference/smoke" src/train_DSpark_SpecForge/scripts/infer_qwen25vl_dspark_gadi.pbs`.
-The job uses the selected checkpoint by default, writes `job.log` and
-`inference.jsonl` under the output directory, and exits nonzero if greedy token
+On NCI Gadi, use the submit wrapper to run a CPU preflight first. It checks
+checkpoint selection, draft tensor shapes/materialization, target provenance,
+scheduler settings, and image preprocessing, then submits to the H200 queue
+only when those checks pass:
+
+```bash
+HF_HOME="$HF_HOME" \
+DSPARK_IMAGE=/path/to/image.png \
+DSPARK_OUTPUT_DIR="$PWD/results/dspark_inference/smoke" \
+bash src/train_DSpark_SpecForge/scripts/submit_dspark_inference_gadi.sh
+```
+
+The job uses the selected checkpoint by default, writes preflight, job, and
+inference logs under the output directory, and exits nonzero if greedy token
 IDs differ from target-only generation. Set `DSPARK_CHECKPOINT` to override
 the selected checkpoint or `DSPARK_MAX_NEW_TOKENS` to adjust the smoke length.
 

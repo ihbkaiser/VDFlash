@@ -458,7 +458,7 @@ class DSparkDraftModel(DFlashDraftModel):
             # one proposal at a time and stops at the first lower-throughput
             # prefix, preserving the scheduler's non-anticipating decision.
             assert rates is not None
-            expected_accepts = 1.0  # The target-generated anchor token.
+            expected_accepts = 1.0  # The target-generated bonus token.
             selected = 0
             best_throughput = expected_accepts * rates[1]
             for index, confidence in enumerate(conditional_acceptance, start=1):

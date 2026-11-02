@@ -40,6 +40,14 @@ checkpoint_args=()
 if [[ -n "${DSPARK_CHECKPOINT:-}" ]]; then
   checkpoint_args+=(--checkpoint "${DSPARK_CHECKPOINT}")
 fi
+draft_config_args=()
+if [[ -n "${DSPARK_DRAFT_CONFIG:-}" ]]; then
+  draft_config_args+=(--draft-config "${DSPARK_DRAFT_CONFIG}")
+fi
+profile_args=()
+if [[ -n "${DSPARK_THROUGHPUT_PROFILE:-}" ]]; then
+  profile_args+=(--throughput-profile "${DSPARK_THROUGHPUT_PROFILE}")
+fi
 
 "${REPO_ROOT}/.venv/bin/python" -u "${SCRIPT_PATH}" \
   --image "${DSPARK_IMAGE}" \
@@ -48,7 +56,10 @@ fi
   --target-model-path "${TARGET_MODEL_PATH}" \
   --max-new-tokens "${DSPARK_MAX_NEW_TOKENS:-64}" \
   --scheduler "${DSPARK_SCHEDULER:-fixed}" \
+  --confidence-threshold "${DSPARK_CONFIDENCE_THRESHOLD:-0.5}" \
   --output-jsonl "${OUTPUT_DIR}/inference.jsonl" \
+  "${draft_config_args[@]}" \
+  "${profile_args[@]}" \
   "${checkpoint_args[@]}"
 
 "${REPO_ROOT}/.venv/bin/python" - "${OUTPUT_DIR}/inference.jsonl" <<'PY'

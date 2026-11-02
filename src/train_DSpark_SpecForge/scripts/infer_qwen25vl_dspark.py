@@ -92,21 +92,56 @@ def _load_config_and_validate_checkpoint(state: dict[str, Any], config_path: Pat
     markov_weight = state_dict.get("markov_head.markov_w1.weight")
     confidence_weight = state_dict.get("confidence_head.proj.weight")
     expected_rank = int(dspark.get("markov_rank", 0))
+    if expected_rank < 0:
+        raise ValueError(f"DSpark markov_rank must be >= 0, got {expected_rank}")
     expected_vocab = int(config["vocab_size"])
-    if markov_weight is None or tuple(markov_weight.shape) != (
-        expected_vocab,
-        expected_rank,
-    ):
-        raise ValueError(
-            "checkpoint Markov embedding does not match draft config: "
-            f"shape={getattr(markov_weight, 'shape', None)}, "
-            f"expected={(expected_vocab, expected_rank)}"
+    markov_head_type = str(dspark.get("markov_head_type", "vanilla")).lower()
+    markov_shapes = {
+        "markov_head.markov_w1.weight": (expected_vocab, expected_rank),
+        "markov_head.markov_w2.weight": (expected_vocab, expected_rank),
+    }
+    if markov_head_type == "gated":
+        markov_shapes["markov_head.gate_proj.weight"] = (
+            expected_rank,
+            int(config["hidden_size"]) + expected_rank,
         )
-    if bool(dspark.get("enable_confidence_head")) and confidence_weight is None:
+    elif markov_head_type == "rnn":
+        markov_shapes["markov_head.joint_proj.weight"] = (
+            3 * expected_rank,
+            int(config["hidden_size"]) + 2 * expected_rank,
+        )
+    elif markov_head_type != "vanilla":
+        raise ValueError(f"unsupported DSpark Markov head type: {markov_head_type!r}")
+
+    markov_keys = {
+        key for key in state_dict if key.startswith("markov_head.")
+    }
+    if expected_rank == 0 and markov_keys:
+        raise ValueError("checkpoint contains Markov weights but config disables the Markov head")
+    if expected_rank > 0:
+        for key, expected_shape in markov_shapes.items():
+            weight = state_dict.get(key)
+            if weight is None or tuple(weight.shape) != expected_shape:
+                raise ValueError(
+                    f"checkpoint tensor {key} does not match draft config: "
+                    f"shape={getattr(weight, 'shape', None)}, expected={expected_shape}"
+                )
+
+    confidence_alpha = float(dspark.get("confidence_head_alpha", 0.0) or 0.0)
+    confidence_enabled = bool(
+        dspark.get("enable_confidence_head", confidence_alpha > 0.0)
+    )
+    if confidence_enabled and confidence_weight is None:
         raise ValueError("DSpark config enables confidence head but checkpoint lacks it")
+    if not confidence_enabled and confidence_weight is not None:
+        raise ValueError("checkpoint has a confidence head but draft config disables it")
     if confidence_weight is not None:
         confidence_input = int(config["hidden_size"])
         if dspark.get("confidence_head_with_markov"):
+            if expected_rank <= 0:
+                raise ValueError(
+                    "confidence_head_with_markov requires a positive markov_rank"
+                )
             confidence_input += expected_rank
         if tuple(confidence_weight.shape) != (1, confidence_input):
             raise ValueError(
@@ -169,7 +204,11 @@ def _verify_target_snapshot(
                 f"unsupported target provenance method {method!r} for {relative_name}"
             )
             continue
-        local_file = snapshot_path / str(relative_name)
+        relative_path = Path(str(relative_name))
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            mismatches.append(f"unsafe target provenance path {relative_name!r}")
+            continue
+        local_file = snapshot_path / relative_path
         if not local_file.is_file():
             mismatches.append(f"missing target file {relative_name}")
             continue
@@ -396,6 +435,14 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="skip the greedy target-only reference run",
     )
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help=(
+            "validate checkpoint, config, target provenance, and image preprocessing "
+            "on CPU without loading the target model or running generation"
+        ),
+    )
     parser.add_argument("--output-jsonl", default=None)
     return parser
 
@@ -412,17 +459,24 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("--max-new-tokens must be positive")
     if args.image_min_pixels <= 0 or args.image_max_pixels < args.image_min_pixels:
         raise ValueError("image pixel limits must be positive and max >= min")
-    if not torch.cuda.is_available():
+    records = _records(args) if args.preflight_only else None
+    profile = _load_profile(args.throughput_profile)
+    if args.scheduler == "profile" and profile is None:
+        raise ValueError("--throughput-profile is required for --scheduler profile")
+    if args.scheduler != "profile" and profile is not None:
+        raise ValueError("--throughput-profile is only valid for --scheduler profile")
+
+    if not args.preflight_only and not torch.cuda.is_available():
         raise RuntimeError(
             "DSpark Qwen2.5-VL inference requires a CUDA GPU; run this command "
             "inside a GPU allocation"
         )
-    if not torch.cuda.is_bf16_supported():
+    if not args.preflight_only and not torch.cuda.is_bf16_supported():
         raise RuntimeError("the checkpoint uses BF16; select a CUDA GPU with BF16 support")
 
     draft_config_path = resolve_workspace_path(args.draft_config)
     checkpoint_path = _resolve_checkpoint_path(args.checkpoint)
-    state = resolve_training_state(str(checkpoint_path))
+    state = resolve_training_state(str(checkpoint_path), mmap=True)
     checkpoint_step = int(state.get("global_step", -1))
     draft_config = _load_config_and_validate_checkpoint(state, draft_config_path)
 
@@ -506,6 +560,44 @@ def main(argv: list[str] | None = None) -> int:
     draft, draft_config = _materialize_draft(state, draft_config_path)
     del state
     processor = AutoProcessor.from_pretrained(target_snapshot)
+    if records is None:
+        records = _records(args)
+    if args.preflight_only:
+        draft._make_verification_length_selector(
+            args.scheduler,
+            confidence_threshold=args.confidence_threshold,
+            step_rate_by_batch=profile,
+        )
+        for index, record, image_root in records:
+            prepared = prepare_inference_prompt(
+                processor,
+                target_config,
+                record,
+                image_root=image_root,
+                image_min_pixels=args.image_min_pixels,
+                image_max_pixels=args.image_max_pixels,
+            )
+            image_grid = prepared["multimodal_inputs"].get("image_grid_thw")
+            print(
+                "Preflight passed: "
+                f"sample={record.get('id') or record.get('sample_id') or index} "
+                f"checkpoint_step={checkpoint_step} "
+                f"draft_device={next(draft.parameters()).device} "
+                f"input_shape={tuple(prepared['input_ids'].shape)} "
+                f"position_shape={tuple(prepared['position_ids'].shape)} "
+                f"image_grid_thw={image_grid.tolist() if image_grid is not None else None} "
+                f"multimodal_keys={sorted(prepared['multimodal_inputs'])}",
+                file=sys.stderr,
+                flush=True,
+            )
+        print(
+            f"CPU preflight passed for {len(records)} sample(s); "
+            "CUDA generation and greedy comparison remain for the GPU job.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 0
+
     target = _load_target(
         str(target_snapshot),
         None,
@@ -528,12 +620,6 @@ def main(argv: list[str] | None = None) -> int:
         )
     draft.to(device=device, dtype=torch.bfloat16).eval()
     stop_ids = _stop_token_ids(target, processor)
-    records = _records(args)
-    profile = _load_profile(args.throughput_profile)
-    if args.scheduler == "profile" and profile is None:
-        raise ValueError("--throughput-profile is required for --scheduler profile")
-    if args.scheduler != "profile" and profile is not None:
-        raise ValueError("--throughput-profile is only valid for --scheduler profile")
 
     output_handle = None
     try:

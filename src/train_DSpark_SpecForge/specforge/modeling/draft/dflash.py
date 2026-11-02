@@ -619,6 +619,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
     ):
         self.eval()
         num_input_tokens = input_ids.shape[1]
+        if max_new_tokens <= 0:
+            raise ValueError(f"max_new_tokens must be positive, got {max_new_tokens}")
         max_length = num_input_tokens + max_new_tokens
         target_device = next(target.parameters()).device
 
@@ -719,6 +721,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
             output.logits[:, -1:, :], temperature
         )
+        generated_end = num_input_tokens + 1
         target_hidden = extract_context_feature(
             output.hidden_states, self.target_layer_ids
         )
@@ -791,6 +794,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             output_ids[:, start + acceptance_length + 1] = posterior[
                 :, acceptance_length
             ]
+            generated_end = min(max_length, start + acceptance_length + 2)
             start += acceptance_length + 1
             past_key_values_target.crop(start)
             target_hidden = extract_context_feature(
@@ -798,12 +802,12 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             )[:, : acceptance_length + 1, :]
             acceptance_lengths.append(acceptance_length + 1)
             if stop_token_ids is not None and any(
-                stop_token_id in output_ids[:, num_input_tokens:]
+                stop_token_id
+                in output_ids[:, num_input_tokens:generated_end]
                 for stop_token_id in stop_token_ids
             ):
                 break
-        output_ids = output_ids[:, :max_length]
-        output_ids = output_ids[:, output_ids[0] != self.mask_token_id]
+        output_ids = output_ids[:, :generated_end]
         if stop_token_ids is not None:
             stop_token_ids = torch.tensor(stop_token_ids, device=output_ids.device)
             stop_token_indices = torch.isin(
