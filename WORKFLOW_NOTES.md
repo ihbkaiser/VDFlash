@@ -67,3 +67,67 @@ repository VDFlash.
 - Không tuyên bố hoàn tất nếu chưa chạy verification tương ứng.
 - Với thay đổi code, chạy test tập trung trước; với thay đổi report, kiểm tra
   toàn bộ link markdown và sự tồn tại của hình/artifact được tham chiếu.
+
+## 6. Inference tiếp theo từ checkpoint MSD DFlash
+
+- Archive Hugging Face `ihbkaiser/qwen25vl-3b-msd-checkpoints/outputs.tar.zst`
+  được lưu tại `artifacts/ihbkaiser_qwen25vl-3b-msd-checkpoints/outputs.tar.zst`
+  và giải nén dưới
+  `artifacts/ihbkaiser_qwen25vl-3b-msd-checkpoints/extracted/outputs/`.
+- Thực nghiệm inference sắp tới dùng checkpoint `latest` của **Phase 2** cho
+  cả bốn cấu hình DFlash 3-layer. Mỗi `latest` hiện trỏ tới step 6375:
+  - `dflash_3layer_26_28_30_32_34` (`high_only`)
+  - `dflash_3layer_17_19_25_33_34` (`middle_high`)
+  - `dflash_3layer_17_28_30_32_34` (`middle_high_2`)
+  - `dflash_3layer_1_28_30_32_34` (`shallow_high`)
+- Đường dẫn mỗi checkpoint là
+  `artifacts/ihbkaiser_qwen25vl-3b-msd-checkpoints/extracted/outputs/<config>/phase2/qwen25vl-3b-dflash-llava68k-<config>/qwen25vl-3b-dflash-llava68k-<config>-latest`;
+  `latest` là symlink tới thư mục `*-step6375`.
+- Phase 1 (`*-step6129`) là checkpoint ShareGPT trước khi fine-tune Phase 2;
+  giữ lại cho resume hoặc phân tích, không dùng làm checkpoint cuối mặc định
+  cho inference hai giai đoạn.
+- Checkpoint là training state SpecForge (`training_state.pt` cùng state của
+  rank 0 và rank 1), không phải thư mục export HF độc lập. Chọn loader/exporter
+  phù hợp trước khi chạy inference; giữ nguyên archive gốc và thư mục đã giải
+  nén.
+
+## 7. Môi trường inference chung trên GPU Gadi
+
+- Dùng môi trường `.venv` tại thư mục gốc repository; trong PBS script gọi
+  trực tiếp `.venv/bin/python`, không tạo một venv riêng cho từng queue.
+- Pin Torch `2.7.1+cu126` và torchvision `0.22.1+cu126` trong
+  `requirements.txt`. CUDA 12.6 giữ hỗ trợ Volta (V100, SM 7.0) và cũng phục
+  vụ Ampere (A100) cùng Hopper (H200) trong cùng môi trường.
+- Không dùng wheel cu128 hiện tại cho V100: lần chạy ngày 2026-10-27 load được
+  model nhưng lỗi `no kernel image is available` tại Qwen M-RoPE vì Torch wheel
+  không có kernel SM 7.0. Khi thay Torch/CUDA wheel dùng chung, hold các job GPU
+  đang chờ rồi release sau khi kiểm tra import và `pip check`.
+- Queue Gadi dùng trong smoke inference: `gpuvolta` cho V100 (12 CPU/GPU),
+  `dgxa100` cho A100 (16 CPU/GPU), và `gpuhopper` cho H200 (12 CPU/GPU). Xác
+  nhận GPU thực bằng `nvidia-smi` trong log job, không chỉ dựa vào tên queue.
+- Khi chạy cùng sample trên nhiều GPU, ghi report riêng theo GPU; report phải
+  có `success=true`, đủ bốn config và `outputs_match=true` trước khi kết luận.
+- Smoke một sample ngày 2026-10-27: H200 (`report_h200.json`) cho
+  `outputs_match=true` ở cả bốn config, ESR 4.02–4.86x và DSR 1.42–1.73x.
+  V100 cu126 (`report.json`) và A100 (`report_a100.json`) chạy hết decode nhưng
+  trả `outputs_match=false` ở cả bốn config, nên chỉ dùng H200 cho thực nghiệm
+  chính cho tới khi mismatch trên V100/A100 được giải thích. Kết quả này là
+  sanity check trên một sample, không phải đánh giá chất lượng tổng quát.
+
+## 8. VisualCut và attention campaign
+
+- Dùng `calibrate_visualcut_vdc50` để đo số visual token từ `video_grid_thw`
+  bằng cùng `nframes`, `min_pixels`, `max_pixels` như inference. Calibration
+  version và sample fingerprint được lưu để resume không tái dùng phép đo cũ
+  khi video hoặc quy trình thay đổi.
+- Worker `run_dflash_visualcut_attention` ghi ma trận case dự kiến vào
+  `run_config.json`; analyzer dùng ma trận này để kiểm tra đủ case theo số
+  config, target, chunk và sample limit của campaign.
+- Raw attention lưu thành shard PyTorch nén bằng chương trình dòng lệnh `zstd`.
+  Cần có `zstd` trên node chạy; PBS script kiểm tra binary trước khi tải model.
+  Shard và journal nằm dưới `results/`, không đưa artifact vào Git.
+- Khi submit PBS, đặt `TARGET_MODEL`, `CHECKPOINT_ROOT` và `HF_HOME` trong môi
+  trường job; không ghi đường dẫn checkpoint hoặc cache cá nhân vào script.
+- Sau pilot, chạy `validate_dflash_visualcut_pilot` để kiểm tra sáu điều kiện,
+  SHA256, số record, key map và tính lossless; khi phân tích campaign đầy đủ,
+  dùng `analyze_dflash_visualcut_attention --require-complete`.

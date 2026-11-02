@@ -368,6 +368,7 @@ def _prepare_prompt(
     device: torch.device,
     target_visual_tokens: int,
     allow_out_of_tolerance: bool = False,
+    video_reader: str = "decord",
 ):
     from src.infer.qwen25vl_dflash_compare import prepare_video_prompt
 
@@ -388,7 +389,7 @@ def _prepare_prompt(
         video_min_pixels=int(settings["max_pixels"]),
         video_max_pixels=int(settings["max_pixels"]),
         # Avoid torchvision's full-video decode on long 1080p VDC clips.
-        video_reader="decord",
+        video_reader=video_reader,
     )
     positions = find_visual_positions(prompt.inputs["input_ids"], target=target, processor=processor)
     return prompt, positions, input_fingerprint(prompt.inputs), settings
@@ -407,6 +408,9 @@ def _decode_prompt(
     prefill_target_context_keep_mask: torch.Tensor | None = None,
     capture_attention: bool = False,
     capture_first_attention_only: bool = False,
+    attention_record_sink=None,
+    retain_attention_records: bool = True,
+    attention_metadata: Mapping[str, Any] | None = None,
     target_output_ids: Sequence[int] | None = None,
     target_timing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -437,10 +441,13 @@ def _decode_prompt(
         device=device,
         draft_device=draft_device or device,
     )
+    decoder.attention_capture_base = dict(attention_metadata or {})
     capture_context = (
         capture_dflash_attention(
             draft,
             first_forward_only=capture_first_attention_only,
+            record_sink=attention_record_sink,
+            retain_records=retain_attention_records,
         )
         if capture_attention
         else None

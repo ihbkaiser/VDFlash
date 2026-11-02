@@ -32,6 +32,7 @@ from src.analyze.Validate_Sparrow_hypothesises.dataset import (
 from src.analyze.Validate_Sparrow_hypothesises.model_analysis import (
     find_instruction_masks,
 )
+from src.analyze.Validate_Sparrow_hypothesises.metrics import score_pair
 from src.analyze.Validate_Sparrow_hypothesises.dflash_runtime import (
     find_visual_positions,
     input_fingerprint,
@@ -361,6 +362,16 @@ def _common_prefix(left: Sequence[int], right: Sequence[int]) -> int:
     return common
 
 
+def _resolve_reference_answer(sample_record: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    """Return the usable caption reference and the field it came from."""
+
+    for key in ("reference_answer", "answer"):
+        value = sample_record.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip(), key
+    return None, None
+
+
 def _write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
@@ -438,11 +449,13 @@ def _run_one(
     device: torch.device,
     draft_device: torch.device,
     target_cache: dict[str, dict[str, Any]] | None = None,
+    prepared_context: tuple[Any, list[int], str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     from src.infer.qwen25vl_dflash_compare import prepare_video_prompt
 
     sample_proxy = type("SampleProxy", (), sample_record)()
     prompt_record = build_prompt_record(sample_proxy, prompt_variant)
+    reference_answer, reference_source = _resolve_reference_answer(sample_record)
     # ``build_prompt_record`` intentionally emits the compact VDC contract.
     # MVBench additionally needs candidates so that the canonical multiple-
     # choice prompt can be rebuilt by prepare_video_prompt.
@@ -454,15 +467,16 @@ def _run_one(
             "candidates": sample_record.get("candidates"),
             "dataset_format": args.dataset,
             "correct_option": sample_record.get("correct_option"),
-            "reference_answer": sample_record.get(
-                "reference_answer", sample_record.get("answer")
-            ),
+            "reference_answer": reference_answer,
             "option_provenance": sample_record.get("option_provenance", []),
             "distractor_provenance": sample_record.get("distractor_provenance", []),
         }
     )
     prompt_record["calibration_by_target"] = sample_record.get("calibration_by_target", {})
-    if args.dataset in {"vdc", "vdc_mcq"}:
+    if prepared_context is not None:
+        prompt, visual_positions, fingerprint, settings = prepared_context
+        visual_budget_policy = "vdc_per_sample_calibration"
+    elif args.dataset in {"vdc", "vdc_mcq"}:
         prompt, visual_positions, fingerprint, settings = _prepare_prompt(
             processor=processor,
             target=target,
@@ -471,6 +485,7 @@ def _run_one(
             device=device,
             target_visual_tokens=int(args.target_visual_tokens),
             allow_out_of_tolerance=bool(args.allow_out_of_tolerance),
+            video_reader=getattr(args, "video_reader", "decord"),
         )
         visual_budget_policy = "vdc_per_sample_calibration"
     else:
@@ -512,12 +527,18 @@ def _run_one(
         # Value ablation keeps the visual positions in the DFlash context;
         # only their hidden values are replaced by zero.
         keep_mask = torch.ones(sequence_length, dtype=torch.bool)
-    elif visual_condition in {"reduced", "deleted", "cut"}:
+    elif visual_condition in {"reduced", "deleted", "cut"} or visual_condition.startswith("retained_"):
         context_keep_mask = keep_mask
     if visual_condition == "full":
         keep_mask = torch.ones(sequence_length, dtype=torch.bool)
 
-    capture_attention = bool(args.experiment in {"e7", "h2_1"} or args.capture_attention)
+    capture_attention = bool(
+        args.experiment in {"e7", "h2_1"}
+        or getattr(args, "capture_attention", False)
+    )
+    capture_all_attention = bool(getattr(args, "capture_all_attention", False))
+    attention_record_sink = getattr(args, "attention_record_sink", None)
+    attention_metadata = getattr(args, "attention_metadata", None)
     old_attention = getattr(getattr(draft, "config", None), "_attn_implementation", None)
     if capture_attention and getattr(draft, "config", None) is not None:
         draft.config._attn_implementation = "eager"
@@ -536,7 +557,10 @@ def _run_one(
             prefill_transform=prefill_transform,
             prefill_target_context_keep_mask=context_keep_mask,
             capture_attention=capture_attention,
-            capture_first_attention_only=capture_attention,
+            capture_first_attention_only=(capture_attention and not capture_all_attention),
+            attention_record_sink=attention_record_sink,
+            retain_attention_records=not (capture_all_attention and attention_record_sink is not None),
+            attention_metadata=attention_metadata,
             target_output_ids=(cached_target or {}).get("target_output_ids"),
             target_timing=(cached_target or {}).get("target_timing"),
         )
@@ -586,9 +610,7 @@ def _run_one(
         ),
         "correct_option": sample_record.get("correct_option"),
         "candidates": sample_record.get("candidates", []),
-        "reference_answer": sample_record.get(
-            "reference_answer", sample_record.get("answer")
-        ),
+        "reference_answer": reference_answer,
         "option_provenance": sample_record.get("option_provenance", []),
         "distractor_provenance": sample_record.get("distractor_provenance", []),
         "visual_condition": visual_condition,
@@ -612,7 +634,9 @@ def _run_one(
         .get(int(args.target_visual_tokens), {})
         .get("relative_error"),
         "visual_positions": mapped_regions["visual"],
+        "visual_positions_original": list(regions["visual"]),
         "prompt_regions": mapped_regions,
+        "prompt_regions_original": regions,
         "target_output_ids": target_tokens,
         "speculative_output_ids": speculative_tokens,
         "target_output_hash": _sha256_tokens(target_tokens),
@@ -628,6 +652,13 @@ def _run_one(
         )
         if capture_attention
         else None,
+        "attention_capture_mode": (
+            "all_forwards_streamed"
+            if capture_all_attention and attention_record_sink is not None
+            else "first_forward_summary"
+            if capture_attention
+            else "disabled"
+        ),
         "metrics": result.get("metrics", {}),
         "timing": result.get("timing", {}),
         "speedup": result.get("speedup", {}),
@@ -637,6 +668,14 @@ def _run_one(
     decode_token = lambda token_id: decode_token_ids(processor, [int(token_id)])
     row["target_output_text"] = decode_token_ids(processor, target_tokens)
     row["speculative_output_text"] = decode_token_ids(processor, speculative_tokens)
+    if reference_answer is not None:
+        row["quality_metrics"] = {
+            "reference_source": reference_source,
+            "target": score_pair(row["target_output_text"], reference_answer),
+            "speculative": score_pair(row["speculative_output_text"], reference_answer),
+        }
+    else:
+        row["quality_metrics"] = None
     row["acceptance_by_position"] = enrich_position_trace(
         row["acceptance_by_position"],
         target_tokens,

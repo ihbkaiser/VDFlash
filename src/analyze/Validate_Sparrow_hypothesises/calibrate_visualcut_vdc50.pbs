@@ -1,0 +1,44 @@
+#!/bin/bash
+#PBS -P hn98
+#PBS -q normalbw
+#PBS -N vc50-calibrate
+#PBS -l ncpus=8
+#PBS -l mem=48GB
+#PBS -l jobfs=20GB
+#PBS -l walltime=01:00:00
+#PBS -l storage=gdata/hn98
+#PBS -l wd
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-${PWD}}"
+if [[ ! -f "${REPO_ROOT}/requirements.txt" ]]; then
+  echo "REPO_ROOT must point to the VDFlash repository root" >&2
+  exit 2
+fi
+RUN_DIR="${RUN_DIR:?RUN_DIR must name the experiment artifact directory}"
+CALIBRATION_DIR="${CALIBRATION_DIR:-${RUN_DIR}/calibration}"
+TARGET_MODEL="${TARGET_MODEL:?TARGET_MODEL must point to a local Qwen2.5-VL-3B checkpoint}"
+
+cd "${REPO_ROOT}"
+export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src/train_Dflash_SpecForge${PYTHONPATH:+:${PYTHONPATH}}"
+HF_HOME="${HF_HOME:?HF_HOME must point to the shared Hugging Face cache}"
+export HF_HOME
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export FORCE_QWENVL_VIDEO_READER=decord
+export VD_FLASH_VIDEO_FRAME_MAX_PATCHES=4096
+export TOKENIZERS_PARALLELISM=false
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+
+echo "[calibration-job] id=${PBS_JOBID:-unknown} host=$(hostname) workers=${PBS_NCPUS:-8}"
+"${REPO_ROOT}/.venv/bin/python" -u -m src.analyze.Validate_Sparrow_hypothesises.calibrate_visualcut_vdc50 \
+  --manifest dataset/VideoDetailCaption/test.jsonl \
+  --video-root dataset/VideoDetailCaption \
+  --target-model "${TARGET_MODEL}" \
+  --output-dir "${CALIBRATION_DIR}" \
+  --workers "${PBS_NCPUS:-8}" \
+  --minimum-samples 10

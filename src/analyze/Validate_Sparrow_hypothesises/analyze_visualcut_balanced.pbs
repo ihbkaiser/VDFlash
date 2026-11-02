@@ -1,0 +1,34 @@
+#!/bin/bash
+#PBS -P hn98
+#PBS -q normalbw
+#PBS -N vdc50-bal-analysis
+#PBS -r y
+#PBS -l ncpus=1
+#PBS -l mem=16GB
+#PBS -l jobfs=20GB
+#PBS -l walltime=04:00:00
+#PBS -l storage=gdata/hn98
+#PBS -l wd
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-${PWD}}"
+if [[ ! -f "${REPO_ROOT}/requirements.txt" ]]; then
+  echo "REPO_ROOT must point to the VDFlash repository root" >&2
+  exit 2
+fi
+RUN_DIR="${RUN_DIR:-${REPO_ROOT}/results/visualcut_attention/vdc50_visualcut_balanced_20261029}"
+CALIBRATION_DIR="${CALIBRATION_DIR:-${REPO_ROOT}/results/visualcut_attention/vdc50_visualcut_attention_20261026T170825Z/calibration_v5_decord}"
+
+cd "${REPO_ROOT}"
+export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src/train_Dflash_SpecForge${PYTHONPATH:+:${PYTHONPATH}}"
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+
+"${REPO_ROOT}/.venv/bin/python" -u -m src.analyze.Validate_Sparrow_hypothesises.analyze_dflash_visualcut_attention \
+  --run-dir "${RUN_DIR}" \
+  --calibration-dir "${CALIBRATION_DIR}" \
+  --require-complete

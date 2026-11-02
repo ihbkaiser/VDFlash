@@ -264,6 +264,34 @@ def _move_tensor_kwargs(kwargs: dict[str, Any], device: torch.device) -> dict[st
     }
 
 
+def _verification_attention_mask(
+    attention_mask: torch.Tensor | None,
+    *,
+    prompt_length: int,
+    generated_prefix_length: int,
+    query_length: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build the full 2-D key mask for a cached multi-token verification call."""
+
+    if attention_mask is None:
+        prompt_mask = torch.ones((1, prompt_length), dtype=torch.long, device=device)
+    else:
+        if attention_mask.ndim != 2 or attention_mask.shape[0] != 1:
+            raise ValueError("verification attention_mask must have shape [1, prompt_length]")
+        if attention_mask.shape[-1] != prompt_length:
+            raise ValueError(
+                "verification attention_mask length must equal the original prompt length"
+            )
+        prompt_mask = attention_mask.to(device=device)
+    generated_mask = torch.ones(
+        (1, generated_prefix_length + query_length),
+        dtype=prompt_mask.dtype,
+        device=device,
+    )
+    return torch.cat([prompt_mask, generated_mask], dim=-1)
+
+
 def _configured_token_ids(target: Any, names: tuple[str, ...]) -> set[int]:
     config = getattr(target, "config", None)
     token_ids: set[int] = set()
@@ -441,7 +469,13 @@ def summarize_dflash_attention(
 
 
 @contextmanager
-def capture_dflash_attention(draft: Any, *, first_forward_only: bool = False):
+def capture_dflash_attention(
+    draft: Any,
+    *,
+    first_forward_only: bool = False,
+    record_sink: Any | None = None,
+    retain_records: bool = True,
+):
     """Capture eager DFlash self-attention weights without changing outputs.
 
     ``first_forward_only`` is useful for context-region probes: the first
@@ -458,7 +492,7 @@ def capture_dflash_attention(draft: Any, *, first_forward_only: bool = False):
         if attention is None or not hasattr(attention, "register_forward_hook"):
             continue
 
-        def hook(_module, _inputs, output, *, _layer_index=layer_index):
+        def hook(_module, _inputs, output, *, _layer_index=layer_index, _attention=attention):
             forward_index = forward_counts.get(_layer_index, 0)
             forward_counts[_layer_index] = forward_index + 1
             if first_forward_only and forward_index != 0:
@@ -467,14 +501,29 @@ def capture_dflash_attention(draft: Any, *, first_forward_only: bool = False):
                 return
             weights = output[1]
             if torch.is_tensor(weights):
-                records.append(
-                    {
-                        "layer_index": int(_layer_index),
-                        "forward_index": int(forward_index),
-                        "context_length": int(weights.shape[-1] - weights.shape[-2]),
-                        "weights": weights.detach().cpu(),
-                    }
-                )
+                metadata = getattr(_attention, "_dflash_capture_metadata", None)
+                record = {
+                    "layer_index": int(_layer_index),
+                    "forward_index": int(forward_index),
+                    "context_length": int(weights.shape[-1] - weights.shape[-2]),
+                    "query_length": int(weights.shape[-2]),
+                    "key_length": int(weights.shape[-1]),
+                    "weights": weights.detach().cpu(),
+                }
+                if metadata is not None:
+                    key_map = metadata.get("key_map")
+                    if key_map is not None and len(key_map["token_ids"]) != weights.shape[-1]:
+                        raise RuntimeError(
+                            "DFlash attention key map length does not match captured "
+                            f"weights (map={len(key_map['token_ids'])}, "
+                            f"weights={weights.shape[-1]}, layer={_layer_index}, "
+                            f"forward={forward_index})"
+                        )
+                    record.update(metadata)
+                if record_sink is not None:
+                    record_sink(record)
+                if retain_records:
+                    records.append(record)
 
         handles.append(attention.register_forward_hook(hook))
     try:
@@ -482,6 +531,10 @@ def capture_dflash_attention(draft: Any, *, first_forward_only: bool = False):
     finally:
         for handle in handles:
             handle.remove()
+        for layer in getattr(draft, "layers", ()):
+            attention = getattr(layer, "self_attn", None)
+            if attention is not None and hasattr(attention, "_dflash_capture_metadata"):
+                delattr(attention, "_dflash_capture_metadata")
 
 
 @dataclass
@@ -608,12 +661,20 @@ class InstrumentedDFlashDecoder:
         return str(self.token_decoder(token_ids))
 
     def _target_forward(self, kwargs: dict[str, Any]) -> Any:
+        call_kwargs = dict(kwargs)
+        video_grid = call_kwargs.get("video_grid_thw")
+        if torch.is_tensor(video_grid) and video_grid.device.type != "cpu":
+            # DFlash verification passes through this path, separately from
+            # _target_greedy. Preserve CPU placement for the tiny grid tensor
+            # on every target forward so Qwen2.5-VL can form video split sizes
+            # without its failing CUDA int64 reduction.
+            call_kwargs["video_grid_thw"] = video_grid.detach().to(device="cpu")
         try:
-            return self.target(**kwargs)
+            return self.target(**call_kwargs)
         except TypeError as exc:
             if "logits_to_keep" not in str(exc):
                 raise
-            fallback = dict(kwargs)
+            fallback = dict(call_kwargs)
             fallback.pop("logits_to_keep", None)
             return self.target(**fallback)
 
@@ -791,6 +852,20 @@ class InstrumentedDFlashDecoder:
 
         start = prompt_length
         rounds: list[dict[str, Any]] = []
+        capture_base = dict(getattr(self, "attention_capture_base", {}) or {})
+        prompt_keep = (
+            torch.ones(prompt_length, dtype=torch.bool)
+            if prefill_target_context_keep_mask is None
+            else prefill_target_context_keep_mask.detach().to(device="cpu", dtype=torch.bool)
+        )
+        prompt_ids = input_ids[0].detach().cpu().tolist()
+        prompt_key_entries = [
+            (0, int(position), int(prompt_ids[position]), False)
+            for position in torch.nonzero(prompt_keep, as_tuple=False).flatten().tolist()
+        ]
+        cached_key_entries: list[tuple[int, int, int, bool]] = []
+        pending_target_key_entries = prompt_key_entries
+        cut_target_key_entries = list(prompt_key_entries)
         draft_s = 0.0
         verify_s = 0.0
         selection_s = 0.0
@@ -834,6 +909,54 @@ class InstrumentedDFlashDecoder:
                 if not cut_context
                 else int(target_hidden.shape[1])
             )
+            answer_position_start = start - prompt_length
+            query_token_ids = block_output_ids[0].detach().cpu().tolist()
+            query_key_entries = [
+                (3, answer_position_start + index, int(token_id), False)
+                for index, token_id in enumerate(query_token_ids)
+            ]
+            current_target_entries = (
+                cut_target_key_entries if cut_context else pending_target_key_entries
+            )
+            past_key_entries = [
+                (2 if kind == 3 else kind, position, token_id, True)
+                for kind, position, token_id, _cached in cached_key_entries
+            ] if not cut_context else []
+            attention_key_entries = (
+                past_key_entries + list(current_target_entries) + query_key_entries
+            )
+            if capture_base:
+                attention_metadata = {
+                    **capture_base,
+                    "round_index": len(rounds),
+                    "answer_position_start": int(answer_position_start),
+                    "query_answer_positions": torch.arange(
+                        answer_position_start,
+                        answer_position_start + len(query_token_ids),
+                        dtype=torch.int32,
+                    ),
+                    "query_token_ids": torch.tensor(query_token_ids, dtype=torch.int32),
+                    "key_map": {
+                        "source_ids": torch.tensor(
+                            [entry[0] for entry in attention_key_entries], dtype=torch.uint8
+                        ),
+                        "positions": torch.tensor(
+                            [entry[1] for entry in attention_key_entries], dtype=torch.int32
+                        ),
+                        "token_ids": torch.tensor(
+                            [entry[2] for entry in attention_key_entries], dtype=torch.int32
+                        ),
+                        "is_cached": torch.tensor(
+                            [entry[3] for entry in attention_key_entries], dtype=torch.uint8
+                        ),
+                    },
+                    "past_key_count": len(past_key_entries),
+                    "target_hidden_key_count": len(current_target_entries),
+                    "draft_query_key_count": len(query_key_entries),
+                }
+                for attention in draft_attention_modules:
+                    if attention is not None:
+                        attention._dflash_capture_metadata = attention_metadata
             selected_for_draft = active_context_indices
             if self.attention_selector is not None:
                 for attention in draft_attention_modules:
@@ -853,8 +976,14 @@ class InstrumentedDFlashDecoder:
                     for attention in draft_attention_modules:
                         if attention is not None:
                             attention.context_keep_indices = None
+                for attention in draft_attention_modules:
+                    if attention is not None and hasattr(
+                        attention, "_dflash_capture_metadata"
+                    ):
+                        delattr(attention, "_dflash_capture_metadata")
             if not cut_context:
                 _crop_cache(draft_cache, start)
+                cached_key_entries = attention_key_entries[:start]
             proposals = self.draft._sample_draft_tokens(
                 self.target,
                 draft_hidden.to(device=target_lm_head_device),
@@ -868,6 +997,13 @@ class InstrumentedDFlashDecoder:
             verify_kwargs = {
                 "input_ids": block_output_ids,
                 "position_ids": block_position_ids,
+                "attention_mask": _verification_attention_mask(
+                    target_kwargs.get("attention_mask"),
+                    prompt_length=prompt_length,
+                    generated_prefix_length=start - prompt_length,
+                    query_length=block_output_ids.shape[1],
+                    device=self.device,
+                ),
                 "past_key_values": target_cache,
                 "cache_position": torch.arange(
                     start, start + block_output_ids.shape[1], device=self.device
@@ -903,6 +1039,15 @@ class InstrumentedDFlashDecoder:
             )
             output_ids[:, start : start + emitted] = block_output_ids[:, :emitted]
             output_ids[:, start + emitted] = posterior[:, accepted]
+            emitted_key_entries = [
+                (
+                    1,
+                    answer_position_start + index,
+                    int(block_output_ids[0, index].item()),
+                    False,
+                )
+                for index in range(emitted)
+            ]
             draft_proposal_token_ids = proposals[0].detach().cpu().tolist()
             block_token_ids = block_output_ids[0, :emitted].detach().cpu().tolist()
             next_anchor_token_id = int(posterior[0, accepted].item())
@@ -911,8 +1056,10 @@ class InstrumentedDFlashDecoder:
             new_target_hidden = new_target_hidden[:, :emitted, :]
             if cut_context:
                 target_hidden = torch.cat([target_hidden, new_target_hidden], dim=1)
+                cut_target_key_entries.extend(emitted_key_entries)
             else:
                 target_hidden = new_target_hidden
+                pending_target_key_entries = emitted_key_entries
             selection_metadata = {
                 "method": self.attention_selector or "dense",
                 "context_tokens_available": int(draft_context_length),
@@ -974,6 +1121,14 @@ class InstrumentedDFlashDecoder:
                     "draft_proposal_text": self._decode_token_ids(
                         draft_proposal_token_ids
                     ),
+                    "verification_target_token_ids": posterior[0]
+                    .detach()
+                    .cpu()
+                    .tolist(),
+                    "proposal_match_flags": proposal_matches[0]
+                    .detach()
+                    .cpu()
+                    .tolist(),
                     "block_token_ids": block_token_ids,
                     "block_text": self._decode_token_ids(block_token_ids),
                     "next_anchor_token_id": next_anchor_token_id,
@@ -1579,6 +1734,15 @@ def _target_greedy(
     stop_ids = _as_stop_set(stop_token_ids)
     target_cache = _new_cache()
     prefill_kwargs = dict(prompt.target_kwargs)
+    # Qwen2.5-VL's video feature path reduces ``video_grid_thw`` to Python
+    # split sizes after the vision encoder. Keeping this tiny integer metadata
+    # tensor on CUDA can fail in the CUDA reduction on some Hopper driver /
+    # PyTorch combinations. The vision pixels and model stay on the selected
+    # accelerator; only the grid metadata is kept on CPU, where Transformers
+    # also converts it to Python lengths.
+    video_grid = prefill_kwargs.get("video_grid_thw")
+    if torch.is_tensor(video_grid) and video_grid.device.type != "cpu":
+        prefill_kwargs["video_grid_thw"] = video_grid.detach().to(device="cpu")
     prefill_kwargs.update(
         {
             "input_ids": input_ids,

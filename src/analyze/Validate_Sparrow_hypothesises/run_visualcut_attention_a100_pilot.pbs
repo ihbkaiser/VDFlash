@@ -1,0 +1,72 @@
+#!/bin/bash
+#PBS -P hn98
+#PBS -q dgxa100
+#PBS -N vdc50-vcut-a100-pilot
+#PBS -r y
+#PBS -l ncpus=16
+#PBS -l ngpus=1
+#PBS -l mem=64GB
+#PBS -l jobfs=20GB
+#PBS -l walltime=02:00:00
+#PBS -l storage=gdata/hn98
+#PBS -l wd
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-${PWD}}"
+if [[ ! -f "${REPO_ROOT}/requirements.txt" ]]; then
+  echo "REPO_ROOT must point to the VDFlash repository root" >&2
+  exit 2
+fi
+RUN_DIR="${RUN_DIR:?RUN_DIR must name the experiment artifact directory}"
+RUN_ID="${RUN_ID:?RUN_ID must identify this experiment}"
+CALIBRATION_DIR="${CALIBRATION_DIR:?CALIBRATION_DIR must contain a completed calibration}"
+TARGET_MODEL="${TARGET_MODEL:?TARGET_MODEL must point to a local Qwen2.5-VL-3B checkpoint}"
+CHECKPOINT_ROOT="${CHECKPOINT_ROOT:?CHECKPOINT_ROOT must point to extracted DFlash checkpoints}"
+CONFIG_ROOT="${CONFIG_ROOT:-${REPO_ROOT}/configs/dflash_configs}"
+
+cd "${REPO_ROOT}"
+mkdir -p "${RUN_DIR}/logs"
+if [[ -n "${PBS_ARRAY_INDEX:-}" ]]; then
+  exec >"${RUN_DIR}/logs/worker_${PBS_ARRAY_INDEX}.o" 2>"${RUN_DIR}/logs/worker_${PBS_ARRAY_INDEX}.e"
+fi
+export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src/train_Dflash_SpecForge${PYTHONPATH:+:${PYTHONPATH}}"
+HF_HOME="${HF_HOME:?HF_HOME must point to the shared Hugging Face cache}"
+export HF_HOME
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export FORCE_QWENVL_VIDEO_READER=decord
+export VD_FLASH_VIDEO_FRAME_MAX_PATCHES=4096
+export TOKENIZERS_PARALLELISM=false
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=1
+
+SAMPLE_LIMIT="${SAMPLE_LIMIT:-1}"
+SAMPLE_LIMIT_ARGS=()
+if [[ -n "${SAMPLE_LIMIT}" ]]; then
+  SAMPLE_LIMIT_ARGS=(--limit "${SAMPLE_LIMIT}")
+fi
+
+echo "[visualcut-job] id=${PBS_JOBID:-unknown} array=${PBS_ARRAY_INDEX:-0} host=$(hostname)"
+nvidia-smi --query-gpu=name,memory.total --format=csv
+command -v zstd
+
+"${REPO_ROOT}/.venv/bin/python" -u -m src.analyze.Validate_Sparrow_hypothesises.run_dflash_visualcut_attention \
+  --worker-index "${PBS_ARRAY_INDEX:-0}" \
+  --run-id "${RUN_ID}" \
+  --repo-root "${REPO_ROOT}" \
+  --output-dir "${RUN_DIR}" \
+  --manifest dataset/VideoDetailCaption/test.jsonl \
+  --video-root dataset/VideoDetailCaption \
+  --calibration "${CALIBRATION_DIR}/calibration.jsonl" \
+  --cohort-selection "${CALIBRATION_DIR}/cohort_selection.json" \
+  --target-model "${TARGET_MODEL}" \
+  --checkpoint-root "${CHECKPOINT_ROOT}" \
+  --config-root "${CONFIG_ROOT}" \
+  --max-new-tokens 256 \
+  --attention-max-mib 128 \
+  --zstd-level 1 \
+  --compression-threads 2 \
+  "${SAMPLE_LIMIT_ARGS[@]}"

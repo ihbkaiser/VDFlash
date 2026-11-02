@@ -548,11 +548,25 @@ def build_qwen2vl_video_processor(model_id: str, min_pixels: int, max_pixels: in
 def build_video_messages(
     video_path: str | Path,
     question: str,
-    fps: float,
+    fps: float | None = None,
     max_pixels: int | None = None,
     max_frames: int | None = None,
+    min_pixels: int | None = None,
+    nframes: int | None = None,
 ) -> list[dict[str, Any]]:
-    video = {"type": "video", "video": str(video_path), "fps": float(fps)}
+    if (fps is None) == (nframes is None):
+        raise ValueError("provide exactly one of fps or nframes")
+    if nframes is not None and max_frames is not None:
+        raise ValueError("max_frames cannot be combined with an explicit nframes setting")
+    video = {"type": "video", "video": str(video_path)}
+    if nframes is not None:
+        if nframes <= 0:
+            raise ValueError(f"nframes must be positive, got {nframes}")
+        video["nframes"] = int(nframes)
+    else:
+        video["fps"] = float(fps)
+    if min_pixels is not None:
+        video["min_pixels"] = int(min_pixels)
     if max_pixels is not None:
         video["max_pixels"] = int(max_pixels)
     if max_frames is not None:
@@ -572,10 +586,12 @@ def process_video(
     processor: Any,
     video_path: str | Path,
     question: str,
-    fps: float,
+    fps: float | None = None,
     max_pixels: int | None = None,
     attempts: int = 2,
     max_frames: int | None = None,
+    min_pixels: int | None = None,
+    nframes: int | None = None,
 ) -> Any:
     """Process a video with a small number of retries.
 
@@ -587,7 +603,16 @@ def process_video(
     last_exc: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
-            return _process_video_once(processor, video_path, question, fps, max_pixels, max_frames)
+            return _process_video_once(
+                processor,
+                video_path,
+                question,
+                fps,
+                max_pixels,
+                max_frames,
+                min_pixels,
+                nframes,
+            )
         except Exception as exc:  # noqa: BLE001 - transient video read failures
             last_exc = exc
             if attempt < attempts:
@@ -600,9 +625,11 @@ def _process_video_once(
     processor: Any,
     video_path: str | Path,
     question: str,
-    fps: float,
+    fps: float | None = None,
     max_pixels: int | None = None,
     max_frames: int | None = None,
+    min_pixels: int | None = None,
+    nframes: int | None = None,
 ) -> Any:
     try:
         from qwen_vl_utils import process_vision_info
@@ -614,6 +641,8 @@ def _process_video_once(
         fps,
         max_pixels=max_pixels,
         max_frames=max_frames,
+        min_pixels=min_pixels,
+        nframes=nframes,
     )
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     try:

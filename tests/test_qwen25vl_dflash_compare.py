@@ -642,7 +642,15 @@ class _Target:
         return generated
 
     def __call__(self, input_ids, past_key_values=None, output_hidden_states=False, **kwargs):
-        self.calls.append({"has_video": "pixel_values_videos" in kwargs})
+        attention_mask = kwargs.get("attention_mask")
+        self.calls.append(
+            {
+                "has_video": "pixel_values_videos" in kwargs,
+                "attention_mask": attention_mask.detach().clone()
+                if torch.is_tensor(attention_mask)
+                else None,
+            }
+        )
         cache = past_key_values or _Cache()
         hidden = self.embed_tokens(input_ids)
         output_cache = _Cache(cache.get_seq_length() + input_ids.shape[1])
@@ -702,7 +710,11 @@ def test_instrumented_decoder_accepts_stub_block_and_forwards_video_once():
     result = decoder.decode(
         input_ids=input_ids,
         position_ids=positions,
-        target_kwargs={"pixel_values_videos": torch.ones(1), "video_grid_thw": torch.ones(1, 3)},
+        target_kwargs={
+            "pixel_values_videos": torch.ones(1),
+            "video_grid_thw": torch.ones(1, 3),
+            "attention_mask": torch.ones_like(input_ids),
+        },
         max_new_tokens=5,
         stop_token_ids=[],
     )
@@ -719,6 +731,121 @@ def test_instrumented_decoder_accepts_stub_block_and_forwards_video_once():
     assert result.target_forward_calls >= 2
     assert target.calls[0]["has_video"] is True
     assert all(call["has_video"] is False for call in target.calls[1:])
+    assert target.calls[1]["attention_mask"].shape == (1, input_ids.shape[1] + draft.block_size)
+    assert target.calls[2]["attention_mask"].shape == (
+        1,
+        input_ids.shape[1] + result.acceptance_rounds[0]["effective_emitted_tokens"] + draft.block_size,
+    )
+    assert torch.all(target.calls[1]["attention_mask"] == 1)
+
+
+def test_qwen25vl_speculative_decode_matches_greedy_on_cpu_with_bf16_eager(request):
+    from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
+        Qwen2_5_VLConfig,
+        Qwen2_5_VLTextConfig,
+        Qwen2_5_VLVisionConfig,
+    )
+    from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+        Qwen2_5_VLForConditionalGeneration,
+    )
+
+    previous_num_threads = torch.get_num_threads()
+    previous_rng_state = torch.random.get_rng_state()
+    request.addfinalizer(lambda: torch.set_num_threads(previous_num_threads))
+    request.addfinalizer(lambda: torch.random.set_rng_state(previous_rng_state))
+    torch.set_num_threads(1)
+    torch.manual_seed(31)
+
+    class FixedDraft:
+        target_layer_ids = [0]
+        block_size = 4
+        mask_token_id = 127
+        layers = []
+
+        def __call__(self, target_hidden, noise_embedding, **kwargs):
+            del target_hidden, kwargs
+            return torch.zeros_like(noise_embedding)
+
+        def _sample_draft_tokens(self, target, draft_hidden, block_output_ids):
+            del target, block_output_ids
+            return torch.tensor([[17, 18, 19]], device=draft_hidden.device).expand(
+                draft_hidden.shape[0], -1
+            )
+
+    for attention in ("eager",):
+        text_config = Qwen2_5_VLTextConfig(
+            vocab_size=128,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=1024,
+            rope_scaling={"rope_type": "default", "mrope_section": [1, 1, 2]},
+        )
+        vision_config = Qwen2_5_VLVisionConfig(
+            depth=1,
+            hidden_size=16,
+            intermediate_size=32,
+            num_heads=2,
+            patch_size=2,
+            spatial_merge_size=2,
+            temporal_patch_size=1,
+            out_hidden_size=32,
+            fullatt_block_indexes=[],
+        )
+        config = Qwen2_5_VLConfig(
+            text_config=text_config.to_dict(),
+            vision_config=vision_config.to_dict(),
+            image_token_id=125,
+            video_token_id=126,
+            vision_start_token_id=123,
+            vision_end_token_id=124,
+            attn_implementation=attention,
+        )
+        target = Qwen2_5_VLForConditionalGeneration(config).to(dtype=torch.bfloat16).eval()
+
+        prompt_length = 420
+        input_ids = torch.randint(1, 120, (1, prompt_length))
+        input_ids[:, 8:408] = 126
+        attention_mask = torch.ones_like(input_ids)
+        position_ids = torch.arange(prompt_length).view(1, 1, -1).expand(3, 1, -1).clone()
+        for index in range(400):
+            row, column = divmod(index, 20)
+            position_ids[0, 0, 8 + index] = 8
+            position_ids[1, 0, 8 + index] = row
+            position_ids[2, 0, 8 + index] = column
+        position_ids[:, 0, 408:] = torch.arange(20, 32).view(1, -1).expand(3, -1)
+
+        prompt = PreparedVideoPrompt(
+            record={},
+            video_path=Path("."),
+            inputs={"input_ids": input_ids, "attention_mask": attention_mask},
+            position_ids=position_ids,
+            target_kwargs={"attention_mask": attention_mask},
+            frame_counts=(),
+            video_grid_thw=(),
+        )
+        greedy, _ = _target_greedy(
+            target,
+            prompt,
+            max_new_tokens=40,
+            stop_token_ids=[],
+            device=torch.device("cpu"),
+        )
+        speculative = InstrumentedDFlashDecoder(
+            target, FixedDraft(), device=torch.device("cpu")
+        ).decode(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            target_kwargs={"attention_mask": attention_mask},
+            max_new_tokens=40,
+            stop_token_ids=[],
+        )
+
+        assert speculative.output_ids[0, prompt_length :].tolist() == greedy[
+            0, prompt_length :
+        ].tolist()
 
 
 def test_instrumented_decoder_accepts_explicit_draft_device():
@@ -734,6 +861,22 @@ def test_instrumented_decoder_accepts_explicit_draft_device():
 
     assert decoder.device == torch.device("cpu")
     assert decoder.draft_device == torch.device("meta")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_dflash_target_forward_moves_video_grid_metadata_to_cpu():
+    class RecordingTarget:
+        def __call__(self, **kwargs):
+            return kwargs["video_grid_thw"].device.type
+
+    decoder = InstrumentedDFlashDecoder(
+        RecordingTarget(), SimpleNamespace(), device=torch.device("cuda")
+    )
+    observed_device = decoder._target_forward(
+        {"video_grid_thw": torch.tensor([[2, 28, 28]], device="cuda")}
+    )
+
+    assert observed_device == "cpu"
 
 
 def test_instrumented_decoder_applies_prefill_hidden_transform_only_to_dflash_context():

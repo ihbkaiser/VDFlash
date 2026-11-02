@@ -84,3 +84,6 @@ markdown/tasks/
 markdown/*
 !markdown/hypothesis_text_consistency_visual_context/
 !markdown/hypothesis_text_consistency_visual_context/**
+
+NCI/
+.agy-cli/
