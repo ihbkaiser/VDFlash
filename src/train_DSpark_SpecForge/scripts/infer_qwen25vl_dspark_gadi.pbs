@@ -1,0 +1,64 @@
+#!/bin/bash
+#PBS -P hn98
+#PBS -q gpuhopper
+#PBS -N dspark-qwen25vl
+#PBS -r y
+#PBS -l ncpus=12
+#PBS -l ngpus=1
+#PBS -l mem=64GB
+#PBS -l jobfs=20GB
+#PBS -l walltime=00:45:00
+#PBS -l storage=gdata/hn98+scratch/hn98
+#PBS -l wd
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-${PBS_O_WORKDIR:-$PWD}}"
+HF_HOME="${HF_HOME:?Set HF_HOME to the shared Hugging Face cache}"
+DSPARK_IMAGE="${DSPARK_IMAGE:?Set DSPARK_IMAGE to a local image file}"
+OUTPUT_DIR="${DSPARK_OUTPUT_DIR:-${REPO_ROOT}/results/dspark_inference/${PBS_JOBID:-manual}}"
+TARGET_MODEL_PATH="${TARGET_MODEL_PATH:-Qwen/Qwen2.5-VL-3B-Instruct}"
+SCRIPT_PATH="${REPO_ROOT}/src/train_DSpark_SpecForge/scripts/infer_qwen25vl_dspark.py"
+
+cd "${REPO_ROOT}"
+mkdir -p "${OUTPUT_DIR}"
+exec >"${OUTPUT_DIR}/job.log" 2>&1
+
+export HF_HOME
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export TOKENIZERS_PARALLELISM=false
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=1
+
+echo "[dspark-inference] job=${PBS_JOBID:-manual} host=$(hostname)"
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+checkpoint_args=()
+if [[ -n "${DSPARK_CHECKPOINT:-}" ]]; then
+  checkpoint_args+=(--checkpoint "${DSPARK_CHECKPOINT}")
+fi
+
+"${REPO_ROOT}/.venv/bin/python" -u "${SCRIPT_PATH}" \
+  --image "${DSPARK_IMAGE}" \
+  --sample-id "${DSPARK_SAMPLE_ID:-dspark-gadi-smoke}" \
+  --prompt "${DSPARK_PROMPT:-Describe this image.}" \
+  --target-model-path "${TARGET_MODEL_PATH}" \
+  --max-new-tokens "${DSPARK_MAX_NEW_TOKENS:-64}" \
+  --scheduler "${DSPARK_SCHEDULER:-fixed}" \
+  --output-jsonl "${OUTPUT_DIR}/inference.jsonl" \
+  "${checkpoint_args[@]}"
+
+"${REPO_ROOT}/.venv/bin/python" - "${OUTPUT_DIR}/inference.jsonl" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+if len(rows) != 1 or rows[0].get("greedy_match") is not True:
+    raise SystemExit(f"DSpark GPU verification failed; inspect {path}")
+print(f"[dspark-inference] verified sample={rows[0]['sample_id']} output={path}")
+PY

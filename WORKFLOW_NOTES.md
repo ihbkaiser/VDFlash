@@ -158,3 +158,8 @@ repository VDFlash.
   scheduler.
 - Keep the archive, extracted training states, target-model cache, and
   inference JSONL under ignored artifact/cache roots; never commit them.
+- On Gadi, use `src/train_DSpark_SpecForge/scripts/infer_qwen25vl_dspark_gadi.pbs`
+  for a one-GPU H200 inference run. Pass `REPO_ROOT`, `HF_HOME`,
+  `DSPARK_IMAGE`, and `DSPARK_OUTPUT_DIR` with `qsub -v`; the job records its
+  GPU and output JSONL and fails if greedy tokens disagree with the target-only
+  reference.
