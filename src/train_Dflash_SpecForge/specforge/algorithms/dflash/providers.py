@@ -124,7 +124,7 @@ def resume_contract(config, draft_model, training_model):
         "schema_version": 1,
     }
 
-    return {
+    contract = {
         "dflash_draft_num_hidden_layers": int(
             getattr(draft_model.config, "num_hidden_layers", len(target_layer_ids))
         ),
@@ -138,6 +138,24 @@ def resume_contract(config, draft_model, training_model):
         "dflash_loss_type": str(training_model.loss_type),
         "dflash_dpace_alpha": float(training_model.dpace_alpha),
     }
+    if getattr(config.training, "dflash_self_distill", False):
+        contract.update(
+            {
+                "dflash_self_distill": True,
+                "dflash_teacher_checkpoint_path": str(
+                    config.training.dflash_teacher_checkpoint_path
+                ),
+                "dflash_visual_retention": float(
+                    training_model.visual_retention
+                ),
+                "dflash_visual_selector": str(training_model.visual_selector),
+                "dflash_distill_recipe": str(training_model.recipe),
+                "dflash_kd_weight": float(training_model.kd_weight),
+                "dflash_kd_temperature": float(training_model.kd_temperature),
+                "dflash_visual_token_ids": tuple(training_model.visual_token_ids),
+            }
+        )
+    return contract
 
 
 def resolve_dflash_kernels(config):

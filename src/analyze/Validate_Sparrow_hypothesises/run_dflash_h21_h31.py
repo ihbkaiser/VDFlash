@@ -539,6 +539,14 @@ def _run_one(
     capture_all_attention = bool(getattr(args, "capture_all_attention", False))
     attention_record_sink = getattr(args, "attention_record_sink", None)
     attention_metadata = getattr(args, "attention_metadata", None)
+    if attention_metadata is not None:
+        attention_metadata = {
+            **attention_metadata,
+            "prompt_regions_original": {
+                name: [int(position) for position in positions]
+                for name, positions in regions.items()
+            },
+        }
     old_attention = getattr(getattr(draft, "config", None), "_attn_implementation", None)
     if capture_attention and getattr(draft, "config", None) is not None:
         draft.config._attn_implementation = "eager"

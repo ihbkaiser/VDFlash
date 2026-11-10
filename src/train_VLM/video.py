@@ -165,6 +165,20 @@ def prepare_qwen_messages(
     # as a scalar, so do not forward video kwargs when there are no videos.
     if video_inputs is None or len(video_inputs) == 0:
         video_kwargs = {}
+    else:
+        # qwen-vl-utils returns one FPS value per video, while current
+        # Qwen2.5-VL processor kwargs declare ``fps`` as a scalar. This
+        # function materializes one sample at a time, so a single video can be
+        # safely unwrapped without changing its sampling rate.
+        video_kwargs = dict(video_kwargs or {})
+        fps = video_kwargs.get("fps")
+        if isinstance(fps, (list, tuple)):
+            if len(fps) != 1:
+                raise ValueError(
+                    "the current Qwen2.5-VL processor requires scalar fps; "
+                    f"received {len(fps)} video FPS values for one sample"
+                )
+            video_kwargs["fps"] = fps[0]
     call_kwargs = _merge_processor_kwargs(dict(video_kwargs or {}), processor_kwargs)
     inputs = processor(
         text=[rendered],

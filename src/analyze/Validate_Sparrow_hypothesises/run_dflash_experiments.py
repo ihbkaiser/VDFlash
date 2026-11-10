@@ -413,6 +413,12 @@ def _decode_prompt(
     attention_metadata: Mapping[str, Any] | None = None,
     target_output_ids: Sequence[int] | None = None,
     target_timing: dict[str, Any] | None = None,
+    distribution_cut_keep_mask: torch.Tensor | None = None,
+    distribution_sink=None,
+    distribution_fixed_schedule: Mapping[int, Mapping[str, int]] | None = None,
+    distribution_schedule_sink=None,
+    context_feature_transform=None,
+    context_feature_sink=None,
 ) -> dict[str, Any]:
     from src.infer.qwen25vl_dflash_compare import (
         InstrumentedDFlashDecoder,
@@ -465,6 +471,13 @@ def _decode_prompt(
             stop_token_ids=_eos_token_ids(processor, target),
             prefill_target_hidden_transform=prefill_transform,
             prefill_target_context_keep_mask=prefill_target_context_keep_mask,
+            distribution_cut_keep_mask=distribution_cut_keep_mask,
+            distribution_target_ids=resolved_target_ids if distribution_sink is not None else None,
+            distribution_sink=distribution_sink,
+            distribution_fixed_schedule=distribution_fixed_schedule,
+            distribution_schedule_sink=distribution_schedule_sink,
+            context_feature_transform=context_feature_transform,
+            context_feature_sink=context_feature_sink,
         )
     prompt_length = int(prompt.inputs["input_ids"].shape[1])
     target_ids = resolved_target_ids

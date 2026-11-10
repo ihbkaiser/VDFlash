@@ -102,6 +102,215 @@ bash train_qwen25vl_dflash_sharegpt_68k.sh \
 Set `OUTPUT_ROOT=/another/path` to relocate checkpoints while keeping large
 offline hidden-state files under `ARTIFACT_ROOT`.
 
+## Phase 3: visual-10% DFlash self-distillation
+
+The Phase 3 implementation trains a 10%-visual student from a Phase 2 DFlash
+checkpoint. Each update uses the same target features, anchors, target tokens,
+and block layout for both branches: the frozen DFlash teacher sees the full
+visual context, while the student masks all but exactly
+`ceil(0.1 * visual_token_count)` visual keys. Text keys remain available to
+both branches. The target-token CE, full-vocabulary teacher-to-student KL, and
+teacher-correctness gate are selectable as `target_ce`, `teacher_kl`, `dual`,
+`gated`, or `gated_mean_scaled` recipes. The default recipe is CE + KL with
+temperature 1 and KL weight 0.5.
+
+### Set up the training server environment
+
+Use a fresh Linux x86_64 checkout with Python 3.12. The workspace launcher
+resolves its interpreter as `<repository>/.venv/bin/python`, so create and
+activate `.venv` at the repository root before installing dependencies. The
+[dedicated requirements file](requirements-visual10-selfdistill-py312-cu130.txt)
+pins the core framework versions used by this SpecForge snapshot and adds the
+Qwen2.5-VL video processing dependencies. It does not modify the repository's
+general VLM `requirements.txt`.
+
+```bash
+cd /path/to/VDFlash
+nvidia-smi
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install \
+  -r src/train_Dflash_SpecForge/requirements-visual10-selfdistill-py312-cu130.txt
+python -m pip check
+```
+
+The PyTorch wheels in this file target CUDA 13.0. Confirm the server has a
+compatible NVIDIA driver and GPU before installing: CUDA 13.0 requires Linux
+driver 580.65.06 or newer, and CUDA 13 no longer supports Maxwell, Pascal, or
+Volta GPUs (including V100). The SGLang 0.5.14 CPython 3.12 wheel also requires
+glibc 2.34 or newer. See the [CUDA 13.0 release notes](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-toolkit-release-notes/)
+and [SGLang 0.5.14 package files](https://pypi.org/project/sglang/0.5.14/).
+The NVIDIA driver is managed by the server administrator and is not installed
+by pip.
+
+Verify that the active environment sees the expected Python, PyTorch CUDA
+runtime, and GPU:
+
+```bash
+python --version
+python -c 'import torch; print("torch:", torch.__version__, "CUDA runtime:", torch.version.cuda); assert torch.cuda.is_available(); print("GPU:", torch.cuda.get_device_name(0)); assert torch.version.cuda.startswith("13.0")'
+```
+
+### Prepare offline target features
+
+Start from the prepared video dataset under `data/dflash_posttraining`. If the
+server only has the raw private Hugging Face dataset, first run the `prepare`,
+`targets`, and `validate` commands in
+[`data/dflash_posttraining/README.md`](../../data/dflash_posttraining/README.md).
+Target responses must come from the same target/processor provenance used by
+the feature cache. The cache tool stores target-layer features, input token IDs,
+response loss masks, and three-axis M-RoPE positions. It does not store teacher
+logits; Phase 3 computes those on the fly.
+
+Run a small pilot to estimate the feature-cache size before caching the whole
+cohort:
+
+```bash
+cd /path/to/VDFlash
+PYTHONPATH="src/train_Dflash_SpecForge${PYTHONPATH:+:$PYTHONPATH}" \
+  torchrun --nproc_per_node=2 -m src.train_VLM.cache_visual10_selfdistill_features \
+  --data-dir artifacts/dflash_posttraining_visual10 \
+  --target-config configs/dflash_posttraining_visual10_responses.example.json \
+  --draft-config src/train_Dflash_SpecForge/configs/qwen2.5-vl-3b-dflash.json \
+  --output-dir artifacts/dflash_visual10_features_pilot \
+  --splits train --max-samples 8
+```
+
+Then build full features (all ranks need access to the same output filesystem):
+
+```bash
+PYTHONPATH="src/train_Dflash_SpecForge${PYTHONPATH:+:$PYTHONPATH}" \
+  torchrun --nproc_per_node=4 -m src.train_VLM.cache_visual10_selfdistill_features \
+  --data-dir artifacts/dflash_posttraining_visual10 \
+  --target-config configs/dflash_posttraining_visual10_responses.example.json \
+  --draft-config src/train_Dflash_SpecForge/configs/qwen2.5-vl-3b-dflash.json \
+  --output-dir artifacts/dflash_visual10_features
+```
+
+The output follows the SpecForge offline feature format:
+`features/{train,validation,test}/rows_*/sample_*.ckpt`. Each split includes
+layer/phase metadata and a cache contract that prevents accidentally mixing
+features from different target revisions, response manifests, or layer lists.
+The tool resumes completed samples when the contract matches; pass `--overwrite`
+only when you intend to replace the selected split directories.
+
+These caches can be large: Qwen2.5-VL-3B with five 2,048-wide target layers
+uses about 10,240 bf16 values per sequence token, before token IDs and positions.
+Use the pilot summary to size storage for the actual sequence lengths.
+
+### Train the visual-10 post-training recipes
+
+Use [`examples/configs/qwen25vl-3b-dflash-visual10-selfdistill.yaml`](examples/configs/qwen25vl-3b-dflash-visual10-selfdistill.yaml)
+as the shared starting config. One launcher supports both objectives; choose the
+objective with `training.dflash_distill_recipe`:
+
+| Recipe | Training signal | Purpose |
+| --- | --- | --- |
+| `target_ce` | Target-model next-token cross-entropy | Train the 10%-visual student from the target-model signal only. |
+| `dual` | Target-model cross-entropy plus KL from the frozen full-visual Phase 2 DFlash teacher | Combine target-model supervision with the full-visual DFlash signal. |
+
+For a fresh run, set `model.draft_model_config` to the exact Phase 2 DFlash
+architecture config. Set `model.draft_checkpoint_path` and
+`training.dflash_teacher_checkpoint_path` to the same Phase 2 full-visual
+checkpoint. Set `model.target_model_path` to the target model. Point
+`data.hidden_states_path` and `data.eval_hidden_states_path` at the generated
+train and validation feature roots. The example uses one long sequence per GPU,
+full FSDP sharding, 128 anchors, and two anchor blocks per full-vocabulary
+logits slice; lower anchor/chunk sizes if the server runs out of memory.
+
+The YAML contains placeholder paths. Update those paths on the training server
+before launching. The feature cache must already exist; training consumes the
+cached target hidden states and does not build them.
+
+#### Target-model signal only (`target_ce`)
+
+```bash
+cd src/train_Dflash_SpecForge
+CFG=examples/configs/qwen25vl-3b-dflash-visual10-selfdistill.yaml
+
+./run_specforge.sh train --plan \
+  --config "$CFG" \
+  training.dflash_distill_recipe=target_ce \
+  run_id=visual10-target-ce \
+  output_dir=/checkpoints/dflash-visual10/target-ce
+
+./run_specforge.sh train \
+  --config "$CFG" \
+  training.dflash_distill_recipe=target_ce \
+  run_id=visual10-target-ce \
+  output_dir=/checkpoints/dflash-visual10/target-ce
+```
+
+#### Target model plus full-visual DFlash teacher (`dual`)
+
+```bash
+cd src/train_Dflash_SpecForge
+CFG=examples/configs/qwen25vl-3b-dflash-visual10-selfdistill.yaml
+
+./run_specforge.sh train --plan \
+  --config "$CFG" \
+  training.dflash_distill_recipe=dual \
+  run_id=visual10-dual \
+  output_dir=/checkpoints/dflash-visual10/dual
+
+./run_specforge.sh train \
+  --config "$CFG" \
+  training.dflash_distill_recipe=dual \
+  run_id=visual10-dual \
+  output_dir=/checkpoints/dflash-visual10/dual
+```
+
+`--plan` prints the resolved launch plan; run the second command to start
+training. These commands run one recipe per invocation. Use separate
+`run_id` and `output_dir` values so the checkpoints and logs do not overlap.
+The same pattern applies to the other implemented ablations: `teacher_kl`,
+`gated`, and `gated_mean_scaled`. To use the prefix visual selector, add
+`training.dflash_visual_selector=prefix`. Keep seeds, data, optimizer steps,
+and visual retention fixed when comparing recipes.
+
+Implementation note: `target_ce` skips the teacher forward pass and its KL
+loss, but the current model provider still loads the Phase 2 teacher checkpoint
+and keeps a frozen teacher draft in memory. The teacher checkpoint remains a
+required config field, so account for that extra model's memory use when sizing
+the target-only run.
+
+For resume, retain `training.dflash_teacher_checkpoint_path` pointing at the
+original Phase 2 checkpoint, remove `model.draft_checkpoint_path` from a copy
+of the YAML, and set `training.resume_from` to the Phase 3 checkpoint. The
+checkpoint stores only student DFlash weights; the frozen teacher is rebuilt
+from Phase 2.
+
+### Greedy parity, acceptance, and runtime evaluation
+
+For the Phase 3 video manifests, use the video-aware evaluator. It reports
+greedy output parity, round-end-corrected `tau_proposal` and `tau_effective`,
+first-rejection and accepted-prefix survival, actual visual retention,
+processor/target/speculative latency, selector/draft/verifier time, and peak
+allocated GPU memory plus peak target/draft K/V tensor bytes. It writes both
+per-video rows and the aggregate summary:
+
+```bash
+cd /path/to/VDFlash
+python -m src.train_VLM.evaluate_visual10_selfdistill \
+  --target-config configs/dflash_posttraining_visual10_responses.example.json \
+  --draft-config /models/qwen2.5-vl-3b-dflash.json \
+  --checkpoint /checkpoints/dflash-visual10/dual \
+  --manifest artifacts/dflash_posttraining_visual10/responses/validation.jsonl \
+  --output artifacts/dflash_visual10_eval/dual-validation.json \
+  --max-new-tokens 128 --visual-retention 0.1 \
+  --visual-selector temporal_spatial
+```
+
+Run the same evaluator on the Phase 2 checkpoint for the full-visual baseline
+(`--full-visual`) and the untrained 10% student baseline (Phase 2 checkpoint
+with `--visual-retention 0.1`). Use validation to select a recipe, then run the
+test manifest once for confirmation. Keep model, selector, video sampling,
+generation limit, dtype, and hardware fixed across comparisons. The script
+reports one measured pass after configurable warmup; repeat runs and bootstrap
+paired videos before making a runtime claim. The older
+`scripts/infer_qwen25vl_dflash.py` remains a single-image smoke check.
+
 SpecForge upstream currently requires its own environment (`torch==2.11.0`,
 `transformers==5.8.1`, `sglang==0.5.14`). Do not install those pins into the
 root VLM environment, which has separate versions in the repository-level

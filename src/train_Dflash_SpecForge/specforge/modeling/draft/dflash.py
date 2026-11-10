@@ -1,4 +1,5 @@
-from typing import Callable, Optional
+import time
+from typing import Any, Callable, Optional
 
 import torch
 from torch import nn
@@ -41,6 +42,30 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     logits = logits / temperature
     probs = torch.softmax(logits, dim=-1)
     return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
+
+
+def _cache_tensor_bytes(cache: Any) -> int:
+    """Best-effort resident K/V tensor size for common Transformers cache APIs."""
+
+    seen: set[int] = set()
+    total = 0
+
+    def visit(value: Any) -> None:
+        nonlocal total
+        if torch.is_tensor(value):
+            if id(value) not in seen:
+                seen.add(id(value))
+                total += int(value.numel() * value.element_size())
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item)
+
+    for name in ("key_cache", "value_cache"):
+        visit(getattr(cache, name, None))
+    for layer in getattr(cache, "layers", ()) or ():
+        for name in ("keys", "values", "key_cache", "value_cache"):
+            visit(getattr(layer, name, None))
+    return total
 
 
 def resolve_dflash_attention_layout(
@@ -508,6 +533,10 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.projector_type = dflash_config.get("projector_type", None)
         self.pure_draft_prefix_len = dflash_config.get("pure_draft_prefix_len", 0)
         self.shift_label = dflash_config.get("shift_label", False)
+        # Draft families can add checkpointed logits/confidence heads without
+        # duplicating the shared DFlash backbone constructor. The base DFlash
+        # implementation is a no-op; DSpark overrides this hook.
+        self._init_draft_head(config, dflash_config)
         hook_fn = getattr(self, "register_load_state_dict_pre_hook", getattr(self, "_register_load_state_dict_pre_hook", None))
         if hook_fn is not None:
             hook_fn(normalize_draft_head_checkpoint_keys)
@@ -561,12 +590,25 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         with an auxiliary logits head can override this boundary without
         duplicating the target-cache and acceptance logic in ``spec_generate``.
         """
+        draft_logits = self._compute_draft_logits(
+            target,
+            draft_hidden,
+            block_output_ids,
+        )
+        return sample(draft_logits)
+
+    def _compute_draft_logits(
+        self,
+        target: nn.Module,
+        draft_hidden: torch.Tensor,
+        block_output_ids: torch.LongTensor,
+    ) -> torch.Tensor:
+        """Return the raw vocabulary logits for one draft block."""
         del block_output_ids
         lm_head = getattr(target, "lm_head", None)
         if lm_head is None:
             lm_head = target.get_output_embeddings()
-        draft_logits = lm_head(draft_hidden[:, -self.block_size + 1 :, :])
-        return sample(draft_logits)
+        return lm_head(draft_hidden[:, -self.block_size + 1 :, :])
 
     def forward(
         self,
@@ -610,11 +652,43 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         *,
         position_ids: Optional[torch.LongTensor] = None,
         target_kwargs: Optional[dict] = None,
+        visual_retention: Optional[float] = None,
+        visual_selector: str = "temporal_spatial",
+        profile_timing: bool = False,
     ):
         self.eval()
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
         target_device = next(target.parameters()).device
+        total_started = time.perf_counter()
+
+        def synchronize_target_device() -> None:
+            if profile_timing and target_device.type == "cuda":
+                torch.cuda.synchronize(target_device)
+
+        def start_device_timer():
+            if profile_timing and target_device.type == "cuda":
+                event = torch.cuda.Event(enable_timing=True)
+                event.record(torch.cuda.current_stream(target_device))
+                return event
+            return time.perf_counter()
+
+        def stop_device_timer(started):
+            if profile_timing and target_device.type == "cuda":
+                ended = torch.cuda.Event(enable_timing=True)
+                ended.record(torch.cuda.current_stream(target_device))
+                return started, ended
+            return time.perf_counter() - started
+
+        def timer_seconds(value):
+            if isinstance(value, tuple):
+                return value[0].elapsed_time(value[1]) / 1000.0
+            return float(value)
+
+        target_prefill_time = None
+        visual_selection_time = 0.0
+        draft_timers = []
+        verifier_timers = []
 
         block_size = self.block_size
         if input_ids.shape[0] != 1:
@@ -660,6 +734,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
 
         past_key_values_target = DynamicCache()
         past_key_values_draft = DynamicCache()
+        target_kv_bytes_peak = 0
+        draft_kv_bytes_peak = 0
 
         target_input_embeddings = getattr(target, "get_input_embeddings", None)
         if callable(target_input_embeddings):
@@ -688,7 +764,11 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 "output_hidden_states": True,
             }
         )
+        prefill_started = start_device_timer()
         output = forward_target(**prefill_kwargs)
+        target_kv_bytes_peak = max(
+            target_kv_bytes_peak, _cache_tensor_bytes(past_key_values_target)
+        )
 
         output_ids[:, :num_input_tokens] = input_ids
         output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
@@ -697,38 +777,145 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         target_hidden = extract_context_feature(
             output.hidden_states, self.target_layer_ids
         )
+        target_prefill_timer = stop_device_timer(prefill_started)
+        draft_prompt_positions = None
+        retained_context_count = num_input_tokens
+        visual_context_counts = None
+        if visual_retention is not None:
+            selection_started = time.perf_counter()
+            from specforge.algorithms.common.dflash_self_distill import (
+                build_visual_context_keep_mask,
+            )
+
+            visual_token_ids = set()
+            for config in (
+                getattr(target, "config", None),
+                getattr(getattr(target, "config", None), "text_config", None),
+            ):
+                if config is None:
+                    continue
+                for name in (
+                    "image_token_id",
+                    "image_token_index",
+                    "video_token_id",
+                    "video_token_index",
+                ):
+                    value = getattr(config, name, None)
+                    if value is not None:
+                        visual_token_ids.add(int(value))
+            prompt_positions = position_ids[..., :num_input_tokens]
+            context_keep_mask = build_visual_context_keep_mask(
+                input_ids,
+                prompt_positions,
+                visual_token_ids=sorted(visual_token_ids),
+                retention=visual_retention,
+                selector=visual_selector,
+            )
+            draft_prompt_positions = torch.nonzero(
+                context_keep_mask[0], as_tuple=False
+            ).flatten()
+            retained_context_count = int(draft_prompt_positions.numel())
+            target_visual_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+            for token_id in visual_token_ids:
+                target_visual_mask |= input_ids == token_id
+            visual_total = int(target_visual_mask.sum().item())
+            visual_retained = int(
+                (target_visual_mask & context_keep_mask).sum().item()
+            )
+            visual_context_counts = {
+                "visual_tokens_total": visual_total,
+                "visual_tokens_retained": visual_retained,
+                "visual_retention_actual": (
+                    visual_retained / visual_total if visual_total else 1.0
+                ),
+            }
+            target_hidden = target_hidden.index_select(
+                1, draft_prompt_positions.to(target_hidden.device)
+            )
+            draft_prompt_positions = draft_prompt_positions.to(position_ids.device)
+            visual_selection_time = time.perf_counter() - selection_started
 
         # Decode stage
         acceptance_lengths = []
+        accepted_draft_lengths = []
+        full_accepted_draft_lengths = []
+        proposal_capacities = []
+        target_hidden_position_start = None
         start = input_ids.shape[1]
         while start < max_length:
+            if max_length - start <= 1:
+                break
+            round_start = start
+            proposal_capacity = min(block_size - 1, max_length - round_start - 1)
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = position_ids[..., start : start + block_size]
             noise_embedding = target_embed_tokens(block_output_ids)
-            draft_hidden = self(
-                target_hidden=target_hidden,
-                noise_embedding=noise_embedding,
-                position_ids=position_ids[
+            if draft_prompt_positions is not None and target_hidden_position_start is None:
+                draft_context_positions = position_ids[..., :num_input_tokens].index_select(
+                    -1, draft_prompt_positions
+                )
+                draft_context_hidden = target_hidden
+            elif draft_prompt_positions is not None:
+                context_start = int(target_hidden_position_start)
+                context_end = context_start + target_hidden.shape[1]
+                if context_end != start:
+                    raise RuntimeError(
+                        "verified target features do not end at the next draft anchor: "
+                        f"{context_end} != {start}"
+                    )
+                draft_context_positions = position_ids[..., context_start:context_end]
+                draft_context_hidden = target_hidden
+            else:
+                draft_context_positions = None
+                draft_context_hidden = target_hidden
+            if draft_context_positions is not None:
+                draft_position_ids = torch.cat(
+                    (
+                        draft_context_positions,
+                        position_ids[..., start : start + block_size],
+                    ),
+                    dim=-1,
+                )
+            else:
+                draft_position_ids = position_ids[
                     ...,
                     past_key_values_draft.get_seq_length() : start + block_size,
-                ],
+                ]
+            draft_started = start_device_timer()
+            draft_hidden = self(
+                target_hidden=draft_context_hidden,
+                noise_embedding=noise_embedding,
+                position_ids=draft_position_ids,
                 past_key_values=past_key_values_draft,
                 use_cache=True,
                 is_causal=False,
             )
-            past_key_values_draft.crop(start)
+            draft_kv_bytes_peak = max(
+                draft_kv_bytes_peak, _cache_tensor_bytes(past_key_values_draft)
+            )
+            draft_cache_length = (
+                retained_context_count + start - num_input_tokens
+                if draft_prompt_positions is not None
+                else start
+            )
+            past_key_values_draft.crop(draft_cache_length)
             block_output_ids[:, 1:] = self._sample_draft_tokens(
                 target,
                 draft_hidden,
                 block_output_ids,
             )
+            draft_timers.append(stop_device_timer(draft_started))
 
+            verifier_started = start_device_timer()
             output = forward_target(
                 input_ids=block_output_ids,
                 position_ids=block_position_ids,
                 past_key_values=past_key_values_target,
                 use_cache=True,
                 output_hidden_states=True,
+            )
+            target_kv_bytes_peak = max(
+                target_kv_bytes_peak, _cache_tensor_bytes(past_key_values_target)
             )
 
             posterior = sample(output.logits, temperature)
@@ -738,6 +925,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 .sum(dim=1)[0]
                 .item()
             )
+            verifier_timers.append(stop_device_timer(verifier_started))
             output_ids[:, start : start + acceptance_length + 1] = block_output_ids[
                 :, : acceptance_length + 1
             ]
@@ -749,7 +937,13 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             target_hidden = extract_context_feature(
                 output.hidden_states, self.target_layer_ids
             )[:, : acceptance_length + 1, :]
-            acceptance_lengths.append(acceptance_length + 1)
+            accepted_in_output = min(acceptance_length, proposal_capacity)
+            bonus_fits = round_start + accepted_in_output + 1 < max_length
+            acceptance_lengths.append(accepted_in_output + int(bonus_fits))
+            accepted_draft_lengths.append(accepted_in_output)
+            full_accepted_draft_lengths.append(acceptance_length)
+            proposal_capacities.append(proposal_capacity)
+            target_hidden_position_start = start - (acceptance_length + 1)
             if stop_token_ids is not None and any(
                 stop_token_id in output_ids[:, num_input_tokens:]
                 for stop_token_id in stop_token_ids
@@ -766,5 +960,48 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 output_ids = output_ids[
                     :, : num_input_tokens + stop_token_indices[0] + 1
                 ]
+
+        mean_accepted = (
+            sum(accepted_draft_lengths) / len(accepted_draft_lengths)
+            if accepted_draft_lengths
+            else 0.0
+        )
+        mean_effective = (
+            sum(acceptance_lengths) / len(acceptance_lengths)
+            if acceptance_lengths
+            else 0.0
+        )
+        if profile_timing:
+            synchronize_target_device()
+            target_prefill_time = timer_seconds(target_prefill_timer)
+        draft_forward_time = (
+            sum(timer_seconds(timer) for timer in draft_timers)
+            if profile_timing
+            else None
+        )
+        target_verifier_time = (
+            sum(timer_seconds(timer) for timer in verifier_timers)
+            if profile_timing
+            else None
+        )
+        self.last_speculative_metrics = {
+            "rounds": len(accepted_draft_lengths),
+            "accepted_draft_tokens_per_round": accepted_draft_lengths,
+            "full_accepted_draft_tokens_per_round": full_accepted_draft_lengths,
+            "proposal_capacity_per_round": proposal_capacities,
+            "effective_tokens_per_round": acceptance_lengths,
+            "tau_proposal": mean_accepted,
+            "tau_effective": mean_effective,
+            "target_prefill_time_s": target_prefill_time,
+            "visual_selection_time_s": visual_selection_time,
+            "draft_forward_time_s": draft_forward_time,
+            "target_verifier_time_s": target_verifier_time,
+            "speculative_total_time_s": (
+                time.perf_counter() - total_started if profile_timing else None
+            ),
+            "target_kv_bytes_peak": target_kv_bytes_peak,
+            "draft_kv_bytes_peak": draft_kv_bytes_peak,
+            **(visual_context_counts or {}),
+        }
 
         return output_ids

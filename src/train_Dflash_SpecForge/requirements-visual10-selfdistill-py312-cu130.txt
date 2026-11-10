@@ -1,0 +1,43 @@
+# Phase 3 visual-10 DFlash self-distillation environment.
+# Intended for Linux x86_64, CPython 3.12, and an NVIDIA GPU supported by CUDA 13.
+# SGLang 0.5.14's CPython 3.12 Linux wheel requires glibc 2.34 or newer.
+# CUDA 13.0 requires a compatible NVIDIA driver; the toolkit/driver are not
+# installed by pip.
+#
+# Install in a fresh virtual environment from the repository root with:
+#   python -m pip install -r src/train_Dflash_SpecForge/requirements-visual10-selfdistill-py312-cu130.txt
+
+--index-url https://download.pytorch.org/whl/cu130
+--extra-index-url https://pypi.org/simple
+
+# Keep aligned with the local SpecForge snapshot's pyproject.toml.
+torch==2.11.0
+torchvision==0.26.0
+torchaudio==2.11.0
+transformers==5.8.1
+sglang==0.5.14
+
+# SpecForge runtime dependencies.
+accelerate
+datasets
+huggingface-hub
+numpy>=1.26,<3
+openai-harmony
+packaging
+psutil
+pydantic
+PyYAML
+requests
+safetensors
+setuptools>=70
+tensorboard
+tqdm
+typing-extensions
+wandb
+yunchang
+
+# Qwen2.5-VL video preprocessing, target feature capture, and evaluation.
+av>=14,<17
+decord==0.6.0
+Pillow
+qwen-vl-utils==0.0.10

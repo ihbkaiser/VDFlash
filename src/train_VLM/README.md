@@ -258,3 +258,46 @@ prefix checkpoint is at `output_dir/best/`. For the currently validated Phase
 1 environment, use Python 3.10 with the pinned dependencies in
 `src/train_VLM/requirements.txt`. The repository-root requirements file keeps
 the separate Python 3.11 / CUDA 12.8 environment for other repo workflows.
+
+## Phase 3: DFlash visual-10% post-training data
+
+`prepare_posttraining` builds video-disjoint train/validation/test manifests
+from either the private `Tphuc15/dflash-posttraining-raw` HF dataset or a
+local snapshot. It validates uploaded checksums, filters cataloged VDC-overlap
+video IDs, extracts only selected archive members, and samples 3,000 train
+records plus 250 validation and 250 test records by default. The cohort uses
+75% of records from source groups labeled 1–3 minutes; train allows at most
+two prompts per video while validation/test allow one.
+
+The requested visual-context mix is 25% at 3K, 37.5% at 13K, and 37.5% at
+25K. Defaults request 12, 50, and 98 sampled frames at 512 spatially merged
+tokens per Qwen temporal position. Qwen groups frames in temporal patches of
+two, so these settings target about 3,072, 12,800, and 25,088 visual tokens.
+Per-record frame and pixel limits are written to each manifest; actual
+`video_grid_thw` counts are measured during target response generation. Source
+duration groups do not stand in for visual-token counts. Source GPT answers
+are not used as labels; the full-visual target regenerates exact greedy token
+IDs.
+
+On the training server:
+
+```bash
+python -m src.train_VLM.prepare_posttraining prepare \
+  --source Tphuc15/dflash-posttraining-raw \
+  --output-dir artifacts/dflash_posttraining_visual10
+
+python -m src.train_VLM.prepare_posttraining targets \
+  --data-dir artifacts/dflash_posttraining_visual10 \
+  --config configs/dflash_posttraining_visual10_responses.example.json \
+  --batch-size 1 --resume
+
+python -m src.train_VLM.prepare_posttraining validate \
+  --data-dir artifacts/dflash_posttraining_visual10 \
+  --require-target-responses
+```
+
+Target generation saves token labels, target/processor provenance, and
+realized video grids. It does not cache target hidden states or DFlash logits.
+The Phase 3 trainer should compute full-visual DFlash proposal distributions
+online; this data preparation pipeline does not create a feature or logit
+cache.

@@ -16,21 +16,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 import sys
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 import torch
-
-try:
-    from src.analyze.Whether_they_are_appliable_for_dDrafter.compare_dflash_reference import (
-        score_pair,
-    )
-except ModuleNotFoundError as exc:
-    # The historical caption-scoring helper is not part of every checkout.
-    # DFlash decoding does not depend on it, so keep inference importable and
-    # provide the local overlap metric used by the validation reports.
-    if exc.name != "src.analyze.Whether_they_are_appliable_for_dDrafter":
-        raise
-    from src.analyze.Validate_Sparrow_hypothesises.metrics import score_pair
+from src.infer.text_metrics import score_pair
 from src.infer.qwen25vl_dflash_parallel import (
     build_qwen25vl_model_parallel_map,
     parse_max_memory,
@@ -142,6 +131,64 @@ def _concat_captured_target_hidden(
     if missing:
         raise RuntimeError(f"target forward did not capture hidden states for layers {missing}")
     return torch.cat([captured[int(layer_id)] for layer_id in layer_ids], dim=-1)
+
+
+def _prepare_distribution_replay_inputs(
+    draft_query_ids: torch.Tensor,
+    full_proposal_ids: torch.Tensor,
+    target_ids: Sequence[int],
+    *,
+    answer_offset: int,
+    mask_token_id: int,
+) -> tuple[torch.Tensor, int, int]:
+    """Build verifier inputs on the fixed target trajectory and count full matches.
+
+    The DFlash query retains its anchor-plus-mask layout. Only the verifier
+    receives the known target-greedy suffix, so speculative block boundaries
+    can follow full-condition acceptance without changing the replay prefix.
+    """
+
+    if draft_query_ids.ndim != 2 or draft_query_ids.shape[0] != 1:
+        raise ValueError("draft_query_ids must have shape [1, block_length]")
+    if full_proposal_ids.ndim != 2 or full_proposal_ids.shape[0] != 1:
+        raise ValueError("full_proposal_ids must have shape [1, proposal_count]")
+    if not target_ids:
+        raise ValueError("target_ids must contain at least one greedy token")
+    if answer_offset < 0 or answer_offset >= len(target_ids):
+        raise ValueError("answer_offset must identify a target greedy token")
+    if int(draft_query_ids[0, 0].item()) != int(target_ids[answer_offset]):
+        raise ValueError("draft query anchor does not match the fixed target trajectory")
+    if draft_query_ids.shape[1] > 1 and not bool(
+        (draft_query_ids[0, 1:] == int(mask_token_id)).all()
+    ):
+        raise ValueError("DFlash proposal queries after the anchor must remain masked")
+
+    verification_ids = draft_query_ids.clone()
+    valid_inputs = min(int(draft_query_ids.shape[1]), len(target_ids) - answer_offset)
+    target_input = torch.as_tensor(
+        target_ids[answer_offset : answer_offset + valid_inputs],
+        dtype=verification_ids.dtype,
+        device=verification_ids.device,
+    )
+    verification_ids[0, :valid_inputs] = target_input
+
+    valid_proposals = min(
+        int(full_proposal_ids.shape[1]),
+        max(0, len(target_ids) - answer_offset - 1),
+        max(0, int(draft_query_ids.shape[1]) - 1),
+    )
+    if valid_proposals == 0:
+        return verification_ids, 0, 0
+    expected_proposals = torch.as_tensor(
+        target_ids[answer_offset + 1 : answer_offset + 1 + valid_proposals],
+        dtype=full_proposal_ids.dtype,
+        device=full_proposal_ids.device,
+    )
+    matches = (full_proposal_ids[0, :valid_proposals] == expected_proposals).to(
+        dtype=torch.int32
+    )
+    accepted = int(matches.cumprod(dim=0).sum().item())
+    return verification_ids, accepted, valid_proposals
 
 
 @contextmanager
@@ -432,8 +479,19 @@ def _cache_length(cache: Any) -> int:
 
 def _crop_cache(cache: Any, length: int) -> None:
     crop = getattr(cache, "crop", None)
-    if callable(crop):
-        crop(int(length))
+    if not callable(crop):
+        return
+    current_length = _cache_length(cache)
+    if current_length > 0:
+        tokens_to_remove = current_length - int(length)
+        if tokens_to_remove > 0:
+            # Negative crop values remove tokens in current Transformers and
+            # mean "current length minus abs(value)" in older releases.
+            crop(-tokens_to_remove)
+        return
+    # Compatibility for cache implementations that expose crop() without a
+    # queryable sequence length and use the older target-length contract.
+    crop(int(length))
 
 
 def _as_stop_set(stop_token_ids: list[int] | None) -> set[int]:
@@ -662,13 +720,9 @@ class InstrumentedDFlashDecoder:
 
     def _target_forward(self, kwargs: dict[str, Any]) -> Any:
         call_kwargs = dict(kwargs)
-        video_grid = call_kwargs.get("video_grid_thw")
-        if torch.is_tensor(video_grid) and video_grid.device.type != "cpu":
-            # DFlash verification passes through this path, separately from
-            # _target_greedy. Preserve CPU placement for the tiny grid tensor
-            # on every target forward so Qwen2.5-VL can form video split sizes
-            # without its failing CUDA int64 reduction.
-            call_kwargs["video_grid_thw"] = video_grid.detach().to(device="cpu")
+        # Keep video_grid_thw on the vision device. Recent Transformers uses it
+        # to generate vision rotary positions; CPU placement mismatches CUDA
+        # video features during DFlash verification as well as target prefill.
         try:
             return self.target(**call_kwargs)
         except TypeError as exc:
@@ -723,14 +777,78 @@ class InstrumentedDFlashDecoder:
         stop_token_ids: list[int] | None,
         prefill_target_hidden_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
         prefill_target_context_keep_mask: torch.Tensor | None = None,
+        distribution_cut_keep_mask: torch.Tensor | None = None,
+        distribution_target_ids: Sequence[int] | None = None,
+        distribution_sink: Callable[[torch.Tensor, torch.Tensor, list[int], dict[str, Any]], None]
+        | None = None,
+        distribution_fixed_schedule: Mapping[int, Mapping[str, int]] | None = None,
+        distribution_max_rounds: int | None = None,
+        distribution_deadline: float | None = None,
+        distribution_schedule_sink: Callable[[dict[str, int]], None] | None = None,
+        context_feature_transform: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+        | None = None,
+        context_feature_sink: Callable[[torch.Tensor, torch.Tensor], None] | None = None,
     ) -> SpeculativeDecodeResult:
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
             raise ValueError("DFlash inference currently supports batch size one")
         if max_new_tokens < 0:
             raise ValueError("max_new_tokens must be non-negative")
+        if distribution_max_rounds is not None and distribution_max_rounds <= 0:
+            raise ValueError("distribution_max_rounds must be positive")
 
         input_ids = input_ids.to(device=self.device, dtype=torch.long)
         prompt_length = int(input_ids.shape[1])
+        distribution_capture = any(
+            value is not None
+            for value in (
+                distribution_cut_keep_mask,
+                distribution_target_ids,
+                distribution_sink,
+            )
+        )
+        if distribution_capture:
+            if any(
+                value is None
+                for value in (
+                    distribution_cut_keep_mask,
+                    distribution_target_ids,
+                    distribution_sink,
+                )
+            ):
+                raise ValueError(
+                    "distribution capture requires a cut keep mask, target IDs, "
+                    "and a sink"
+                )
+            if prefill_target_hidden_transform is not None:
+                raise ValueError(
+                    "paired distribution capture requires unmodified target hidden states"
+                )
+            if prefill_target_context_keep_mask is not None:
+                raise ValueError(
+                    "paired distribution capture starts from the full condition; "
+                    "pass the cut mask through distribution_cut_keep_mask"
+                )
+            if not hasattr(self.draft, "_compute_draft_logits"):
+                raise TypeError("draft model does not expose raw DFlash block logits")
+            distribution_cut_keep_mask = torch.as_tensor(
+                distribution_cut_keep_mask,
+                dtype=torch.bool,
+                device=self.device,
+            )
+            if distribution_cut_keep_mask.ndim != 1 or distribution_cut_keep_mask.numel() != prompt_length:
+                raise ValueError(
+                    "distribution_cut_keep_mask must have shape "
+                    f"[{prompt_length}]"
+                )
+            if not bool(distribution_cut_keep_mask.any()):
+                raise ValueError("distribution_cut_keep_mask must keep prompt positions")
+            distribution_target_ids = [int(value) for value in distribution_target_ids]
+            if not distribution_target_ids:
+                raise ValueError("distribution_target_ids must contain target greedy tokens")
+            if len(distribution_target_ids) > max_new_tokens:
+                raise ValueError(
+                    "distribution_target_ids cannot exceed max_new_tokens"
+                )
         if prefill_target_context_keep_mask is not None:
             if (
                 prefill_target_context_keep_mask.ndim != 1
@@ -760,6 +878,38 @@ class InstrumentedDFlashDecoder:
         draft_cache = None if cut_context else _new_cache()
         stop_ids = _as_stop_set(stop_token_ids)
         target_kwargs = _move_tensor_kwargs(dict(target_kwargs or {}), self.device)
+
+        def process_context_features(
+            hidden: torch.Tensor,
+            forward_kwargs: Mapping[str, Any],
+            transform_length: int | None = None,
+        ) -> torch.Tensor:
+            positions = forward_kwargs.get("cache_position")
+            if not torch.is_tensor(positions):
+                raise RuntimeError("target context capture requires cache_position")
+            positions = positions.reshape(-1).to(device=self.device, dtype=torch.long)
+            if positions.numel() != hidden.shape[1]:
+                raise RuntimeError(
+                    "target context positions do not align with captured features: "
+                    f"positions={positions.numel()}, hidden={hidden.shape[1]}"
+                )
+            if context_feature_sink is not None:
+                context_feature_sink(hidden, positions)
+            if context_feature_transform is None:
+                return hidden
+            count = hidden.shape[1] if transform_length is None else int(transform_length)
+            if count < 0 or count > hidden.shape[1]:
+                raise ValueError("context transform length is outside the captured query")
+            transformed = hidden.clone()
+            transformed[:, :count, :] = context_feature_transform(
+                hidden[:, :count, :], positions[:count]
+            )
+            if transformed.shape != hidden.shape:
+                raise ValueError(
+                    "context_feature_transform must preserve the complete hidden shape"
+                )
+            return transformed
+
         output_ids = torch.full(
             (1, max_length + block_size),
             mask_token_id,
@@ -785,6 +935,7 @@ class InstrumentedDFlashDecoder:
         )
         prefill_started = _now(self.device)
         target_output, target_hidden = self._target_forward_with_context(prefill_kwargs)
+        target_hidden = process_context_features(target_hidden, prefill_kwargs)
         prefill_s = _now(self.device) - prefill_started
         target_calls = 1
         if getattr(target_output, "past_key_values", None) is not None:
@@ -833,7 +984,24 @@ class InstrumentedDFlashDecoder:
             if cut_context
             else None
         )
-        pending_anchor = target_output.logits[:, -1:, :].argmax(dim=-1).to(self.device)
+        paired_cut_prompt_hidden = None
+        paired_cut_prompt_positions = None
+        paired_cut_generated_hidden: list[torch.Tensor] = []
+        if distribution_capture:
+            assert distribution_cut_keep_mask is not None
+            paired_cut_prompt_hidden = target_hidden[
+                :, distribution_cut_keep_mask.to(target_hidden.device), :
+            ]
+            paired_cut_prompt_positions = all_positions[
+                ..., :prompt_length
+            ][..., distribution_cut_keep_mask].to(device=self.draft_device)
+        pending_anchor = (
+            torch.tensor(
+                [[distribution_target_ids[0]]], dtype=torch.long, device=self.device
+            )
+            if distribution_capture
+            else target_output.logits[:, -1:, :].argmax(dim=-1).to(self.device)
+        )
         output_ids[:, prompt_length : prompt_length + 1] = pending_anchor
         decode_started = _now(self.device)
 
@@ -878,7 +1046,19 @@ class InstrumentedDFlashDecoder:
             for attention in draft_attention_modules:
                 if attention is not None:
                     attention.context_keep_indices = None
-        while start < max_length:
+        decode_end = (
+            prompt_length + len(distribution_target_ids)
+            if distribution_capture
+            else max_length
+        )
+        while start < decode_end:
+            if distribution_deadline is not None and time.monotonic() >= distribution_deadline:
+                raise TimeoutError("DFlash distribution replay reached its execution deadline")
+            if (
+                distribution_max_rounds is not None
+                and len(rounds) >= distribution_max_rounds
+            ):
+                break
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = all_positions[..., start : start + block_size]
             draft_started = _now(self.device)
@@ -984,18 +1164,135 @@ class InstrumentedDFlashDecoder:
             if not cut_context:
                 _crop_cache(draft_cache, start)
                 cached_key_entries = attention_key_entries[:start]
-            proposals = self.draft._sample_draft_tokens(
-                self.target,
-                draft_hidden.to(device=target_lm_head_device),
-                block_output_ids.to(device=target_lm_head_device),
-            ).to(device=self.device)
+            if distribution_capture:
+                full_logits = self.draft._compute_draft_logits(
+                    self.target,
+                    draft_hidden.to(device=target_lm_head_device),
+                    block_output_ids.to(device=target_lm_head_device),
+                )
+                del draft_hidden
+                assert paired_cut_prompt_hidden is not None
+                assert paired_cut_prompt_positions is not None
+                cut_context_parts = [paired_cut_prompt_hidden, *paired_cut_generated_hidden]
+                cut_target_hidden = (
+                    torch.cat(cut_context_parts, dim=1)
+                    if len(cut_context_parts) > 1
+                    else paired_cut_prompt_hidden
+                )
+                cut_positions = torch.cat(
+                    [
+                        paired_cut_prompt_positions,
+                        all_positions[
+                            ..., prompt_length : start + block_size
+                        ].to(device=self.draft_device),
+                    ],
+                    dim=-1,
+                )
+                cut_draft_hidden = self.draft(
+                    target_hidden=cut_target_hidden,
+                    noise_embedding=noise_embedding,
+                    position_ids=cut_positions,
+                    past_key_values=None,
+                    use_cache=False,
+                    is_causal=False,
+                )
+                cut_logits = self.draft._compute_draft_logits(
+                    self.target,
+                    cut_draft_hidden.to(device=target_lm_head_device),
+                    block_output_ids.to(device=target_lm_head_device),
+                )
+                proposals = full_logits.argmax(dim=-1).to(device=self.device)
+                proposal_position_start = start - prompt_length + 1
+                valid_proposals = min(
+                    int(full_logits.shape[1]),
+                    max(0, len(distribution_target_ids) - proposal_position_start),
+                )
+                if valid_proposals:
+                    distribution_sink(
+                        full_logits[0, :valid_proposals],
+                        cut_logits[0, :valid_proposals],
+                        distribution_target_ids[
+                            proposal_position_start : proposal_position_start + valid_proposals
+                        ],
+                        {
+                            "round_index": len(rounds),
+                            "proposal_position_start": proposal_position_start,
+                            "anchor_position": start - prompt_length,
+                            "anchor_token_id": int(block_output_ids[0, 0].item()),
+                            "proposal_count": valid_proposals,
+                            "block_size": block_size,
+                            "mask_token_id": mask_token_id,
+                        },
+                    )
+                verification_input_ids, accepted, replay_valid_proposals = (
+                    _prepare_distribution_replay_inputs(
+                        block_output_ids,
+                        proposals,
+                        distribution_target_ids,
+                        answer_offset=start - prompt_length,
+                        mask_token_id=mask_token_id,
+                    )
+                )
+                if replay_valid_proposals != valid_proposals:
+                    raise RuntimeError(
+                        "fixed-trajectory proposal count disagrees with captured logits"
+                    )
+                if distribution_fixed_schedule is not None:
+                    answer_offset = start - prompt_length
+                    schedule_entry = distribution_fixed_schedule.get(answer_offset)
+                    if schedule_entry is None:
+                        raise RuntimeError(
+                            "fixed block schedule has no entry for answer offset "
+                            f"{answer_offset}"
+                        )
+                    expected_anchor = int(schedule_entry["anchor_token_id"])
+                    actual_anchor = int(block_output_ids[0, 0].item())
+                    if actual_anchor != expected_anchor:
+                        raise RuntimeError(
+                            "fixed block schedule anchor mismatch at answer offset "
+                            f"{answer_offset}: expected={expected_anchor}, actual={actual_anchor}"
+                        )
+                    expected_proposals = int(schedule_entry["proposal_count"])
+                    if valid_proposals != expected_proposals:
+                        raise RuntimeError(
+                            "fixed block schedule proposal count mismatch at answer offset "
+                            f"{answer_offset}: expected={expected_proposals}, actual={valid_proposals}"
+                        )
+                    emitted_tokens = int(schedule_entry["emitted_tokens"])
+                    if emitted_tokens < 1 or emitted_tokens > valid_proposals + 1:
+                        raise RuntimeError(
+                            "fixed block schedule emitted length is invalid at answer offset "
+                            f"{answer_offset}: emitted={emitted_tokens}, proposals={valid_proposals}"
+                        )
+                    accepted = emitted_tokens - 1
+                proposal_matches = torch.zeros_like(proposals, dtype=torch.bool)
+                if valid_proposals:
+                    expected_proposals = torch.as_tensor(
+                        distribution_target_ids[
+                            proposal_position_start : proposal_position_start
+                            + valid_proposals
+                        ],
+                        dtype=proposals.dtype,
+                        device=proposals.device,
+                    )
+                    proposal_matches[0, :valid_proposals] = (
+                        proposals[0, :valid_proposals] == expected_proposals
+                    )
+                del full_logits, cut_logits, cut_draft_hidden, cut_target_hidden
+            else:
+                proposals = self.draft._sample_draft_tokens(
+                    self.target,
+                    draft_hidden.to(device=target_lm_head_device),
+                    block_output_ids.to(device=target_lm_head_device),
+                ).to(device=self.device)
+                verification_input_ids = block_output_ids.clone()
+                verification_input_ids[:, 1:] = proposals
             draft_s += _now(self.device) - draft_started
-            block_output_ids[:, 1:] = proposals
 
             verify_past_length = _cache_length(target_cache)
             verification_queries: dict[int, torch.Tensor] = {}
             verify_kwargs = {
-                "input_ids": block_output_ids,
+                "input_ids": verification_input_ids,
                 "position_ids": block_position_ids,
                 "attention_mask": _verification_attention_mask(
                     target_kwargs.get("attention_mask"),
@@ -1012,6 +1309,7 @@ class InstrumentedDFlashDecoder:
                 "return_dict": True,
             }
             verify_started = _now(self.device)
+            transform_length = accepted + 1 if distribution_capture else None
             if self.attention_selector is None:
                 target_output, new_target_hidden = self._target_forward_with_context(
                     verify_kwargs
@@ -1025,32 +1323,113 @@ class InstrumentedDFlashDecoder:
                     target_output, new_target_hidden = self._target_forward_with_context(
                         verify_kwargs
                     )
+            new_target_hidden = process_context_features(
+                new_target_hidden,
+                verify_kwargs,
+                transform_length=transform_length,
+            )
             verify_s += _now(self.device) - verify_started
             target_calls += 1
             if getattr(target_output, "past_key_values", None) is not None:
                 target_cache = target_output.past_key_values
             posterior = target_output.logits.argmax(dim=-1).to(self.device)
-            proposal_matches = block_output_ids[:, 1:] == posterior[:, :-1]
-            accepted = int(proposal_matches.cumprod(dim=1).sum(dim=1)[0].item())
+            if not distribution_capture:
+                proposal_matches = verification_input_ids[:, 1:] == posterior[:, :-1]
+                accepted = int(proposal_matches.cumprod(dim=1).sum(dim=1)[0].item())
+            verifier_check_count = 0
+            verifier_unused_tail_mismatch_count = 0
+            verifier_first_unused_tail_mismatch_position = -1
+            if distribution_capture and distribution_target_ids:
+                answer_offset = start - prompt_length
+                target_tokens_after_anchor = max(
+                    0, len(distribution_target_ids) - answer_offset - 1
+                )
+                verifier_available = min(
+                    int(posterior.shape[1]), target_tokens_after_anchor
+                )
+                # Only emitted tokens define the forced trajectory: accepted
+                # proposals plus the target bonus. Predictions after the first
+                # rejected proposal are speculative and do not advance output.
+                verifier_check_count = min(accepted + 1, verifier_available)
+                if verifier_available:
+                    expected_target = torch.as_tensor(
+                        distribution_target_ids[
+                            answer_offset + 1 : answer_offset + 1 + verifier_available
+                        ],
+                        dtype=posterior.dtype,
+                        device=posterior.device,
+                    )
+                    verifier_mismatch = posterior[0, :verifier_available] != expected_target
+                    checked_mismatch = verifier_mismatch[:verifier_check_count]
+                    if bool(checked_mismatch.any()):
+                        mismatch = int(
+                            torch.nonzero(checked_mismatch, as_tuple=False)[0, 0].item()
+                        )
+                        predicted = int(posterior[0, mismatch].item())
+                        expected = int(expected_target[mismatch].item())
+                        raise RuntimeError(
+                            "emitted target trajectory disagrees with target verifier at "
+                            f"answer position {answer_offset + 1 + mismatch}: "
+                            f"anchor={answer_offset}, emitted_tokens={accepted + 1}, "
+                            f"checked_tokens={verifier_check_count}, "
+                            f"predicted={predicted}, expected={expected}"
+                        )
+                    unused_mismatches = verifier_mismatch[verifier_check_count:]
+                    verifier_unused_tail_mismatch_count = int(unused_mismatches.sum().item())
+                    if verifier_unused_tail_mismatch_count:
+                        first_unused = int(
+                            torch.nonzero(unused_mismatches, as_tuple=False)[0, 0].item()
+                        )
+                        verifier_first_unused_tail_mismatch_position = (
+                            answer_offset + 1 + verifier_check_count + first_unused
+                        )
             emitted = accepted + 1
+            if distribution_capture and distribution_schedule_sink is not None:
+                distribution_schedule_sink(
+                    {
+                        "answer_offset": int(start - prompt_length),
+                        "anchor_token_id": int(block_output_ids[0, 0].item()),
+                        "proposal_count": int(valid_proposals),
+                        "emitted_tokens": int(emitted),
+                        "verifier_checked_tokens": int(verifier_check_count),
+                        "verifier_unused_tail_mismatch_count": int(
+                            verifier_unused_tail_mismatch_count
+                        ),
+                        "verifier_first_unused_tail_mismatch_position": int(
+                            verifier_first_unused_tail_mismatch_position
+                        ),
+                    }
+                )
             proposal_position_start = start - prompt_length + 1
             proposal_positions = list(
                 range(proposal_position_start, proposal_position_start + proposals.shape[1])
             )
-            output_ids[:, start : start + emitted] = block_output_ids[:, :emitted]
-            output_ids[:, start + emitted] = posterior[:, accepted]
+            output_ids[:, start : start + emitted] = verification_input_ids[:, :emitted]
+            if distribution_capture:
+                next_target_position = start - prompt_length + emitted
+                if next_target_position < len(distribution_target_ids):
+                    output_ids[:, start + emitted] = distribution_target_ids[
+                        next_target_position
+                    ]
+            else:
+                output_ids[:, start + emitted] = posterior[:, accepted]
             emitted_key_entries = [
                 (
                     1,
                     answer_position_start + index,
-                    int(block_output_ids[0, index].item()),
+                    int(verification_input_ids[0, index].item()),
                     False,
                 )
                 for index in range(emitted)
             ]
             draft_proposal_token_ids = proposals[0].detach().cpu().tolist()
-            block_token_ids = block_output_ids[0, :emitted].detach().cpu().tolist()
-            next_anchor_token_id = int(posterior[0, accepted].item())
+            block_token_ids = verification_input_ids[0, :emitted].detach().cpu().tolist()
+            next_anchor_token_id = (
+                int(distribution_target_ids[start - prompt_length + emitted])
+                if distribution_capture
+                and start - prompt_length + emitted < len(distribution_target_ids)
+                else int(posterior[0, accepted].item())
+            )
             start += emitted
             _crop_cache(target_cache, start)
             new_target_hidden = new_target_hidden[:, :emitted, :]
@@ -1060,6 +1439,8 @@ class InstrumentedDFlashDecoder:
             else:
                 target_hidden = new_target_hidden
                 pending_target_key_entries = emitted_key_entries
+            if distribution_capture:
+                paired_cut_generated_hidden.append(new_target_hidden)
             selection_metadata = {
                 "method": self.attention_selector or "dense",
                 "context_tokens_available": int(draft_context_length),
@@ -1551,6 +1932,7 @@ def _compute_position_ids(target: Any, inputs: dict[str, Any]) -> torch.Tensor:
             "video_grid_thw",
             "second_per_grid_ts",
             "attention_mask",
+            "mm_token_type_ids",
         )
         if key in inputs
     }
@@ -1573,7 +1955,9 @@ def _compute_position_ids(target: Any, inputs: dict[str, Any]) -> torch.Tensor:
             if positions.ndim == 2:
                 positions = positions.unsqueeze(0).expand(3, -1, -1)
             if positions.ndim == 3 and positions.shape[0] == 3:
-                return positions.to(dtype=torch.long)
+                input_ids = inputs.get("input_ids")
+                device = input_ids.device if torch.is_tensor(input_ids) else positions.device
+                return positions.to(device=device, dtype=torch.long)
         except (AttributeError, TypeError, ValueError, RuntimeError) as exc:
             failures.append(f"{type(candidate).__name__}.get_rope_index: {exc}")
     detail = "; ".join(failures) or "no compatible get_rope_index API"
@@ -1734,15 +2118,9 @@ def _target_greedy(
     stop_ids = _as_stop_set(stop_token_ids)
     target_cache = _new_cache()
     prefill_kwargs = dict(prompt.target_kwargs)
-    # Qwen2.5-VL's video feature path reduces ``video_grid_thw`` to Python
-    # split sizes after the vision encoder. Keeping this tiny integer metadata
-    # tensor on CUDA can fail in the CUDA reduction on some Hopper driver /
-    # PyTorch combinations. The vision pixels and model stay on the selected
-    # accelerator; only the grid metadata is kept on CPU, where Transformers
-    # also converts it to Python lengths.
-    video_grid = prefill_kwargs.get("video_grid_thw")
-    if torch.is_tensor(video_grid) and video_grid.device.type != "cpu":
-        prefill_kwargs["video_grid_thw"] = video_grid.detach().to(device="cpu")
+    # Keep video_grid_thw on the vision device: current Transformers derives
+    # the vision rotary position IDs from this tensor before running the video
+    # encoder. Moving it to CPU produces CPU position IDs for CUDA features.
     prefill_kwargs.update(
         {
             "input_ids": input_ids,

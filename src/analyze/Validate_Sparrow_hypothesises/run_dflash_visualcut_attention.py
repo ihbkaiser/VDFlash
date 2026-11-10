@@ -21,6 +21,7 @@ from src.infer.qwen25vl_dflash_compare import _load_draft, _load_target, _resolv
 from src.workspace import resolve_workspace_path
 
 from .attention_artifacts import AttentionShardWriter
+from .attention_summary_storage import compact_attention_record
 from .run_dflash_h21_h31 import (
     _load_records,
     _prepare_prompt,
@@ -366,6 +367,7 @@ def _run_task(args: argparse.Namespace) -> dict[str, Any]:
         "expected_case_ids": expected_case_ids,
         "expected_row_count": len(expected_case_ids),
         "requested_max_new_tokens": int(args.requested_max_new_tokens),
+        "attention_storage_mode": args.attention_storage_mode,
     }
     _write_run_config(args.output_dir / "run_config.json", run_config)
 
@@ -417,6 +419,11 @@ def _run_task(args: argparse.Namespace) -> dict[str, Any]:
         max_buffer_bytes=args.attention_max_mib * 1024 * 1024,
         compression_level=args.zstd_level,
         compression_threads=args.compression_threads,
+        record_transform=(
+            compact_attention_record
+            if args.attention_storage_mode == "summary_exact"
+            else None
+        ),
     )
     args.experiment = "h3_1"
     args.dataset = "vdc"
@@ -577,6 +584,7 @@ def _run_task(args: argparse.Namespace) -> dict[str, Any]:
                     and captured["acceptance_rounds"] == timed["acceptance_rounds"]
                 )
                 row = dict(captured)
+                row["attention_storage_mode"] = args.attention_storage_mode
                 prompt_input_ids = row.pop("prompt_input_ids", None)
                 row.pop("prompt_input_text", None)
                 row.pop("attention_summary", None)
@@ -683,6 +691,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--video-reader", choices=("torchvision", "decord"), default="decord")
     parser.add_argument("--max-new-tokens", dest="requested_max_new_tokens", type=int, default=256)
     parser.add_argument("--attention-max-mib", type=int, default=128)
+    parser.add_argument(
+        "--attention-storage-mode",
+        choices=("raw", "summary_exact"),
+        default="raw",
+        help="Store raw tensors or exact per-forward attention aggregates.",
+    )
     parser.add_argument("--zstd-level", type=int, default=1)
     parser.add_argument("--compression-threads", type=int, default=2)
     parser.add_argument("--limit", type=int)

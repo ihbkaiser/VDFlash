@@ -1,0 +1,11 @@
+# Keep the CUDA-matched PyTorch build supplied by the Colab GPU runtime.
+# Installing a different wheel here can replace its CUDA runtime libraries.
+transformers==4.57.1
+accelerate>=1.4,<2
+huggingface-hub>=0.34,<1
+safetensors>=0.5
+qwen-vl-utils==0.0.10
+av>=14
+decord==0.6.0
+numpy>=1.26,<3
+setuptools>=70

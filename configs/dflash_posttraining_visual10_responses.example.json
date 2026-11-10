@@ -1,0 +1,16 @@
+{
+  "target_model": "Qwen/Qwen2.5-VL-3B-Instruct",
+  "target_revision": null,
+  "stage": "multimodal",
+  "context_mode": "full",
+  "max_seq_length": 32768,
+  "response_max_new_tokens": 512,
+  "mixed_precision": "bf16",
+  "device": "cuda:0",
+  "video_num_frames": 12,
+  "video_min_pixels": 200704,
+  "video_max_pixels": 200704,
+  "video_reader": "torchvision",
+  "target_attn_implementation": "sdpa",
+  "processor_kwargs": {}
+}

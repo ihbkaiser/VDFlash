@@ -11,6 +11,7 @@ from typing import Any
 import torch
 
 from .attention_artifacts import load_attention_shard
+from .attention_summary_storage import SUMMARY_RECORD_SCHEMA
 
 
 CONDITIONS = ("full", "zero", "cut", "retained_75", "retained_50", "retained_25")
@@ -53,6 +54,7 @@ def validate(run_dir: Path, task_id: str) -> dict[str, Any]:
 
     condition_reports = []
     total_records = 0
+    total_compact_records = 0
     for condition in CONDITIONS:
         row = by_condition.get(condition)
         if row is None:
@@ -86,6 +88,19 @@ def validate(run_dir: Path, task_id: str) -> dict[str, Any]:
             if len(records) != int(shard.get("record_count", -1)):
                 failures.append(f"{condition}: shard record count mismatch for {shard_path}")
             for record in records:
+                if record.get("schema") == SUMMARY_RECORD_SCHEMA:
+                    summary = record.get("summary") or {}
+                    aggregate = record.get("aggregate") or {}
+                    if (
+                        str(record.get("case_id")) != str(row["row_id"])
+                        or str(record.get("row_id")) != str(row["row_id"])
+                        or str(summary.get("row_id")) != str(row["row_id"])
+                        or int(aggregate.get("head_query_count", 0)) <= 0
+                        or int(summary.get("key_count", 0)) <= 0
+                    ):
+                        failures.append(f"{condition}: malformed compact attention summary")
+                    total_compact_records += 1
+                    continue
                 weights = record.get("weights")
                 key_map = record.get("key_map") or {}
                 if not torch.is_tensor(weights) or weights.ndim != 4 or weights.shape[0] != 1:
@@ -126,6 +141,7 @@ def validate(run_dir: Path, task_id: str) -> dict[str, Any]:
         "sample_ids": sample_ids,
         "condition_count": len(condition_reports),
         "attention_record_count": total_records,
+        "attention_compact_record_count": total_compact_records,
         "passed": not failures,
         "artifact_integrity_passed": not failures,
         "lossless_passed": not lossless_failures,

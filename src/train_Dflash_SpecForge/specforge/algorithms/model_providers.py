@@ -430,11 +430,77 @@ def _build_dflash_family_model(
 def build_dflash_model(
     cfg: Config,
     draft_model: Any,
-    _draft_config: Any,
-    _target_config: Any,
+    draft_config: Any,
+    target_config: Any,
     tokenizer: Any,
 ) -> AlgorithmModelParts:
     from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
+
+    if cfg.training.dflash_self_distill:
+        import copy
+
+        from specforge.algorithms.common.dflash_self_distill import (
+            OnlineDFlashSelfDistillModel,
+        )
+        from specforge.modeling.auto import AutoDraftModel
+        from specforge.training.model_loading import warm_start_draft_model
+        from specforge.algorithms.dflash.providers import resolve_dflash_kernels
+
+        # Construct on CPU so copying the Phase-2 teacher does not temporarily
+        # double the draft-model GPU allocation before FSDP shards the model.
+        teacher_config = copy.deepcopy(draft_config)
+        teacher_config._attn_implementation = cfg.training.attention_backend
+        teacher_draft_model = AutoDraftModel.from_config(
+            teacher_config,
+            torch_dtype=_torch_dtype(cfg),
+            dflash_kernels=resolve_dflash_kernels(cfg),
+        )
+        warm_start_draft_model(
+            teacher_draft_model,
+            cfg.training.dflash_teacher_checkpoint_path,
+            draft_config=draft_config,
+            strategy="dflash",
+            warm_start_mode="strict",
+            cache_dir=cfg.model.cache_dir,
+            trust_remote_code=cfg.model.trust_remote_code,
+        )
+
+        config_candidates = [target_config, getattr(target_config, "text_config", None)]
+        visual_token_ids = set()
+        for candidate in config_candidates:
+            if candidate is None:
+                continue
+            for name in (
+                "image_token_id",
+                "image_token_index",
+                "video_token_id",
+                "video_token_index",
+            ):
+                value = getattr(candidate, name, None)
+                if value is not None:
+                    visual_token_ids.add(int(value))
+        if not visual_token_ids:
+            raise ValueError(
+                "target config does not expose Qwen2.5-VL image/video token IDs"
+            )
+
+        return _build_dflash_family_model(
+            cfg,
+            draft_model,
+            tokenizer,
+            lambda common: OnlineDFlashSelfDistillModel(
+                **common,
+                teacher_draft_model=teacher_draft_model,
+                visual_token_ids=sorted(visual_token_ids),
+                visual_retention=cfg.training.dflash_visual_retention,
+                visual_selector=cfg.training.dflash_visual_selector,
+                recipe=cfg.training.dflash_distill_recipe,
+                kd_weight=cfg.training.dflash_kd_weight,
+                kd_temperature=cfg.training.dflash_kd_temperature,
+                loss_type=cfg.training.loss_type,
+                dpace_alpha=cfg.training.dpace_alpha,
+            ),
+        )
 
     return _build_dflash_family_model(
         cfg,

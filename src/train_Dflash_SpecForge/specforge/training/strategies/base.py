@@ -541,6 +541,9 @@ class DFlashTrainStrategy(DraftTrainStrategy):
         metrics = {"accuracy": accuracy.detach()}
         if "accuracy_denom" in model_metrics:
             metrics["accuracy_denom"] = model_metrics["accuracy_denom"]
+        for name in ("visual_tokens_total", "visual_tokens_retained"):
+            if name in model_metrics:
+                metrics[name] = model_metrics[name]
         return StepOutput(
             loss=loss,
             metrics=metrics,
@@ -549,12 +552,12 @@ class DFlashTrainStrategy(DraftTrainStrategy):
         )
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
-        # Everything trainable lives under draft_model.; the target
-        # embedding/head are a separate module, not persisted as draft weights.
+        # Persist only the student draft. The frozen full-visual teacher is a
+        # sibling module whose name also contains "draft_model".
         return {
             k.replace("draft_model.", ""): v
             for k, v in state_dict.items()
-            if "draft_model." in k
+            if k.startswith("draft_model.")
         }
 
 

@@ -1,0 +1,6 @@
+{
+  "target_model": "Qwen/Qwen2.5-VL-3B-Instruct",
+  "mixed_precision": "bf16",
+  "max_seq_length": 32768,
+  "response_max_new_tokens": 1024
+}

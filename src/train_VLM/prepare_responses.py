@@ -236,6 +236,13 @@ def prepare_responses_batched(
                         use_cache=True,
                     )
                 padded_prompt_width = int(inputs["input_ids"].shape[1])
+                video_grid = inputs.get("video_grid_thw")
+                if torch.is_tensor(video_grid):
+                    video_grid_rows = video_grid.detach().cpu().tolist()
+                elif isinstance(video_grid, (list, tuple)):
+                    video_grid_rows = list(video_grid)
+                else:
+                    video_grid_rows = []
                 for index, record in enumerate(batch):
                     if index not in valid:
                         continue
@@ -267,6 +274,15 @@ def prepare_responses_batched(
                         },
                     }
                     output["provenance"] = adapter.target_provenance()
+                    # The DFlash post-training manifests contain exactly one
+                    # video per sample. Preserve the realized Qwen grid so the
+                    # requested visual-token budget can be audited downstream.
+                    if len(video_grid_rows) == len(batch):
+                        grid = video_grid_rows[index]
+                        output["video_preprocessing"] = {
+                            "video_grid_thw": [[int(value) for value in grid]],
+                            "video_reader": getattr(adapter, "video_reader", "torchvision"),
+                        }
                     writer.write(json.dumps(output, ensure_ascii=False) + "\n")
                     written += 1
                 writer.flush()

@@ -543,6 +543,7 @@ def build_offline_runtime(
     hidden_states_path: str,
     msd_visual_hidden_states_path: Optional[str] = None,
     hidden_state_phase: Optional[str] = None,
+    expected_target_model_revision: Optional[str] = None,
     draft_model,
     target_head,
     optimizer_factory,
@@ -586,12 +587,16 @@ def build_offline_runtime(
         from specforge.hidden_state import validate_hidden_state_metadata
 
         draft = getattr(draft_model, "draft_model", draft_model)
-        validate_hidden_state_metadata(
-            hidden_states_path,
-            target_layer_ids=list(draft.target_layer_ids),
-            hidden_size=int(draft.config.hidden_size),
-            expected_phase=hidden_state_phase,
-        )
+        for feature_root in (hidden_states_path, eval_hidden_states_path):
+            if not feature_root:
+                continue
+            validate_hidden_state_metadata(
+                feature_root,
+                target_layer_ids=list(draft.target_layer_ids),
+                hidden_size=int(draft.config.hidden_size),
+                expected_phase=hidden_state_phase,
+                expected_target_model_revision=expected_target_model_revision,
+            )
     collate_fn, per_sample_transform = _offline_io(
         algorithm,
         modality,

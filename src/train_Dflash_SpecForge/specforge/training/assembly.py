@@ -51,6 +51,7 @@ class ModelBundle:
     target_head: Any = None
     target_hidden_size: int = 0
     target_vocab_size: int = 0
+    target_model_revision: Optional[str] = None
     draft_vocab_size: int = 0
     capture_layers: Optional[List[int]] = None
     strategy_kwargs: Mapping[str, Any] = field(default_factory=dict)
@@ -225,6 +226,7 @@ def build_model_bundle(cfg: Config, *, algorithm: AlgorithmRegistration) -> Mode
         target_head=parts.target_head,
         target_hidden_size=target_hidden_size,
         target_vocab_size=target_vocab_size,
+        target_model_revision=getattr(target_config, "_commit_hash", None),
         draft_vocab_size=draft_vocab_size,
         capture_layers=parts.capture_layers,
         # This mapping also carries the provider-bound checkpoint policy. It is
@@ -634,6 +636,9 @@ def build_training_run(
                 cfg.data.msd_visual_hidden_states_path or None
             ),
             hidden_state_phase=cfg.data.hidden_state_phase,
+            expected_target_model_revision=(
+                bundle.target_model_revision if t.dflash_self_distill else None
+            ),
             eval_hidden_states_path=cfg.data.eval_hidden_states_path or None,
             draft_model=bundle.model,
             target_head=bundle.target_head,

@@ -247,6 +247,7 @@ def validate_hidden_state_metadata(
     target_layer_ids: str | Sequence[int],
     hidden_size: int | None = None,
     expected_phase: str | None = None,
+    expected_target_model_revision: str | None = None,
 ) -> dict[str, Any]:
     """Fail closed when a feature cache does not match the requested run."""
 
@@ -282,6 +283,15 @@ def validate_hidden_state_metadata(
         raise ValueError(
             "hidden-state metadata phase mismatch: "
             f"saved={metadata.get('phase')!r}, requested={expected_phase!r}"
+        )
+    if (
+        expected_target_model_revision is not None
+        and metadata.get("target_model_revision") != expected_target_model_revision
+    ):
+        raise ValueError(
+            "hidden-state metadata target_model_revision mismatch: "
+            f"saved={metadata.get('target_model_revision')!r}, "
+            f"requested={expected_target_model_revision!r}"
         )
     if metadata.get("schema_version") != HIDDEN_STATE_SCHEMA_VERSION:
         raise ValueError(

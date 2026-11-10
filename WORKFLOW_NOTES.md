@@ -132,6 +132,7 @@ repository VDFlash.
   SHA256, số record, key map và tính lossless; khi phân tích campaign đầy đủ,
   dùng `analyze_dflash_visualcut_attention --require-complete`.
 
+<<<<<<< HEAD
 ## 9. Published Qwen2.5-VL DSpark inference
 
 - Archive `ihbkaiser/qwen25vl-3b-msd-checkpoints/dspark_3layer.zst` is
@@ -163,3 +164,43 @@ repository VDFlash.
   check target provenance and preprocess the image before calling `qsub` for
   one H200. The PBS worker records its GPU and output JSONL and fails if greedy
   tokens disagree with the target-only reference.
+=======
+## 9. VisualCut distribution replay
+
+- Distribution replay so sánh hai điều kiện `full` và `cut` trên cùng target
+  greedy trajectory, anchor, mask layout và ranh giới block. Draft dùng kiến trúc
+  3-layer với target layers `[1, 9, 17, 25, 33]`; config mẫu trỏ tới checkpoint
+  `h32-depth3` cùng layer selection. Visual context chỉ bị loại khỏi DFlash.
+- Dùng `run_dflash_distribution_replay` để chạy; pilot dùng config mẫu
+  `configs/dflash_distribution_colab.pilot.example.json` (một mẫu, 25K), campaign
+  đầy đủ dùng `configs/dflash_distribution_colab.full.example.json` (50 mẫu, bốn
+  ngân sách). Sửa các đường dẫn theo mount trên Colab trước khi chạy.
+- Trên Colab CLI, gọi `scripts/run_dflash_distribution_colab.sh CONFIG.json`.
+  Launcher upload source bundle/config; dữ liệu và checkpoint đọc từ Google Drive.
+  Giữ output trên Drive để resume và không lưu logits vocabulary đầy đủ.
+- Runner nhận checkpoint qua `checkpoint` tường minh hoặc cặp
+  `checkpoint_root`/`checkpoint_name`; `draft_config` phải khớp layer selection.
+- Pair artifact gzip lưu target greedy IDs, visual positions, input/checkpoint
+  fingerprints, metric theo draft position và top-100. Raw target hidden và raw
+  full-vocabulary logits chỉ tồn tại trong RAM.
+- Sau đủ 200 pair, `analyze_dflash_distribution_replay` tính trung bình vị trí
+  trong video rồi bootstrap ghép cặp 2.000 lần ở cấp sample, dùng chung resample
+  sample IDs qua bốn ngân sách. Artifact nằm dưới `results/` hoặc output directory
+  được cấu hình và không đưa vào Git.
+
+## 10. Text-State Feature Capture & Matched-Path Protocol
+
+- Khi thực hiện kiểm định nhân quả hoặc can thiệp feature (như nghiên cứu
+  Text-State Intervention), phải thu thập feature của cả hai nhánh $G$
+  (chuẩn) và $A$ (can thiệp) qua **cùng một lượt forward teacher-forced
+  duy nhất** trên chuỗi `[prompt_ids, answer_ids]` với `use_cache=False`.
+- Tuyệt đối không so sánh feature trích xuất từ cached prefill phân mảnh của
+  vòng lặp decode với full teacher-forced forward pass để tránh sai lệch số học
+  ở các vị trí text trước visual (`previsual`).
+- Hook can thiệp trên `target.model.get_video_features` phải hỗ trợ cả
+  Transformers 4.x (trả về tuple tensor) và Transformers 5.x (trả về
+  `BaseModelOutputWithPooling` với thuộc tính `pooler_output`).
+- Khi mở rộng `input_ids` và `attention_mask` cho chuỗi token đầu ra,
+  phải đồng thời mở rộng `mm_token_type_ids` (điền 0 cho các token text)
+  để tránh lỗi lệch kích thước tensor trong phép tính RoPE 3D.
+>>>>>>> self distillation Dflash

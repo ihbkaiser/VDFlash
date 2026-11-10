@@ -571,6 +571,16 @@ class TrainingConfig(StrictConfigModel):
         "dpace-continuation-value-only",
     ] = "dflash"
     dpace_alpha: float = 0.5
+    #: Post-Phase-2 DFlash self-distillation with a reduced visual context.
+    dflash_self_distill: bool = False
+    dflash_teacher_checkpoint_path: Optional[str] = None
+    dflash_visual_retention: float = Field(default=0.1, gt=0.0, le=1.0)
+    dflash_visual_selector: Literal["prefix", "temporal_spatial"] = "temporal_spatial"
+    dflash_distill_recipe: Literal[
+        "dual", "target_ce", "teacher_kl", "gated", "gated_mean_scaled"
+    ] = "dual"
+    dflash_kd_weight: float = Field(default=0.5, ge=0.0)
+    dflash_kd_temperature: float = Field(default=1.0, gt=0.0)
     lambda_base_start: float = 1.0
     lambda_base_decay_ratio: float = 0.5
     dspark_ce_loss_alpha: float = 0.1
@@ -618,6 +628,11 @@ class TrainingConfig(StrictConfigModel):
             raise ValueError(
                 "training.down_sample_ratio_min must be in "
                 "(0, training.down_sample_ratio]"
+            )
+        if self.dflash_self_distill and not self.dflash_teacher_checkpoint_path:
+            raise ValueError(
+                "training.dflash_teacher_checkpoint_path is required when "
+                "training.dflash_self_distill=true"
             )
         sp_size = self.sp_ulysses_size * self.sp_ring_size
         if self.attention_backend == "usp":
@@ -753,6 +768,60 @@ class Config(StrictConfigModel):
             raise ValueError(
                 "data.msd_visual_hidden_states_path requires training.strategy='msd'"
             )
+
+        if self.training.dflash_self_distill:
+            if self.training.strategy != "dflash":
+                raise ValueError("DFlash self-distillation requires strategy='dflash'")
+            if self.model.input_modality != "qwen2_5_vl":
+                raise ValueError(
+                    "DFlash self-distillation currently requires "
+                    "model.input_modality='qwen2_5_vl'"
+                )
+            if self.mode != "offline":
+                raise ValueError(
+                    "DFlash self-distillation requires precomputed offline "
+                    "Qwen2.5-VL features"
+                )
+            if self.data.hidden_state_phase != "phase2":
+                raise ValueError(
+                    "DFlash self-distillation features must declare "
+                    "data.hidden_state_phase='phase2'"
+                )
+            if self.training.loss_type != "dflash":
+                raise ValueError(
+                    "DFlash self-distillation requires training.loss_type='dflash'"
+                )
+            if not 1 <= self.training.objective_chunk_blocks <= 8:
+                raise ValueError(
+                    "DFlash self-distillation requires "
+                    "training.objective_chunk_blocks in [1, 8] to bound "
+                    "full-vocabulary teacher/student logits"
+                )
+            if (
+                self.training.resume_from is None
+                and not self.model.draft_checkpoint_path
+            ):
+                raise ValueError(
+                    "a fresh self-distillation run must warm-start the student "
+                    "from model.draft_checkpoint_path"
+                )
+            if (
+                self.training.resume_from is None
+                and self.model.draft_checkpoint_path
+                != self.training.dflash_teacher_checkpoint_path
+            ):
+                raise ValueError(
+                    "fresh student and full-visual teacher must use the same "
+                    "Phase 2 checkpoint path"
+                )
+            if (
+                self.training.resume_from is None
+                and self.model.draft_warm_start_mode == "none"
+            ):
+                raise ValueError(
+                    "fresh DFlash self-distillation must warm-start the student; "
+                    "model.draft_warm_start_mode cannot be 'none'"
+                )
 
         if mode == "online" and deployment != "disaggregated":
             raise ValueError(

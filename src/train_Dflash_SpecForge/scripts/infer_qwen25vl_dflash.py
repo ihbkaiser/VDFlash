@@ -64,6 +64,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--image-min-pixels", type=int, default=200704)
     parser.add_argument("--image-max-pixels", type=int, default=200704)
+    parser.add_argument(
+        "--visual-retention",
+        type=float,
+        default=None,
+        help="Retain this fraction of visual context for DFlash (for example 0.1).",
+    )
+    parser.add_argument(
+        "--visual-selector",
+        choices=("prefix", "temporal_spatial"),
+        default="temporal_spatial",
+    )
     return parser.parse_args()
 
 
@@ -139,6 +150,8 @@ def main() -> int:
             temperature=0.0,
             position_ids=position_ids,
             target_kwargs=media,
+            visual_retention=args.visual_retention,
+            visual_selector=args.visual_selector,
         )
 
     target_new = target_output[:, input_ids.shape[1] :]
@@ -151,7 +164,16 @@ def main() -> int:
     text = processor.tokenizer.decode(target_new[0], skip_special_tokens=True)
     sample = records[args.sample_index]
     sample_id = sample.get("id") or sample.get("sample_id") or sample.get("video_name")
-    print(json.dumps({"sample_id": sample_id, "text": text}, ensure_ascii=False))
+    print(
+        json.dumps(
+            {
+                "sample_id": sample_id,
+                "text": text,
+                "speculative_metrics": getattr(draft, "last_speculative_metrics", {}),
+            },
+            ensure_ascii=False,
+        )
+    )
     return 0
 
 

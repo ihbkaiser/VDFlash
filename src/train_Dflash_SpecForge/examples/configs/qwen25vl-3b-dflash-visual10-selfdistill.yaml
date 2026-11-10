@@ -1,0 +1,67 @@
+model:
+  target_model_path: /models/Qwen2.5-VL-3B-Instruct
+  # Use the exact DFlash architecture config that was used for Phase 2.
+  draft_model_config: /models/phase2-dflash/config.json
+  # Fresh run: this and training.dflash_teacher_checkpoint_path must identify
+  # the same Phase 2 full-visual DFlash checkpoint.
+  draft_checkpoint_path: /checkpoints/phase2-dflash/run-latest
+  draft_warm_start_mode: strict
+  target_backend: sglang
+  input_modality: qwen2_5_vl
+  embedding_key: model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+  mask_token_id: 151669
+  torch_dtype: bfloat16
+
+data:
+  hidden_states_path: /data/dflash-posttraining/features/train
+  eval_hidden_states_path: /data/dflash-posttraining/features/validation
+  hidden_state_phase: phase2
+  max_length: 32768
+  chat_template: qwen
+  train_only_last_turn: true
+  dataloader_num_workers: 8
+  cache_dir: /data/huggingface-cache
+
+training:
+  strategy: dflash
+  dflash_self_distill: true
+  dflash_teacher_checkpoint_path: /checkpoints/phase2-dflash/run-latest
+  dflash_visual_retention: 0.1
+  dflash_visual_selector: temporal_spatial
+  # Recipes: dual, target_ce, teacher_kl, gated, gated_mean_scaled.
+  dflash_distill_recipe: dual
+  dflash_kd_weight: 0.5
+  dflash_kd_temperature: 1.0
+  loss_type: dflash
+  num_epochs: 1
+  batch_size: 1
+  accumulation_steps: 8
+  fsdp_sharding: FULL_SHARD
+  learning_rate: 1.0e-5
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  attention_backend: flex_attention
+  num_anchors: 128
+  # Full-vocabulary teacher/student logits are projected in small anchor
+  # slices; use 1-4 for long-video runs to bound peak memory.
+  objective_chunk_blocks: 2
+  loss_decay_gamma: 7.0
+  eval_interval: 50
+  save_interval: 50
+  max_checkpoints: 3
+  log_interval: 10
+  dist_timeout: 60
+  seed: 42
+
+tracking:
+  report_to: none
+
+run_id: qwen25vl-3b-dflash-visual10-dual
+output_dir: /checkpoints/dflash-visual10/dual
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 4

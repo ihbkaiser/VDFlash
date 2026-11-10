@@ -5,10 +5,11 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import pickle
 from pathlib import Path
 import shutil
 import subprocess
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import torch
 
@@ -23,6 +24,7 @@ class AttentionShardWriter:
         max_buffer_bytes: int = 128 * 1024 * 1024,
         compression_level: int = 1,
         compression_threads: int = 2,
+        record_transform: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
         if max_buffer_bytes <= 0 or compression_threads <= 0:
             raise ValueError("buffer size and compression thread count must be positive")
@@ -37,6 +39,7 @@ class AttentionShardWriter:
         self.max_buffer_bytes = int(max_buffer_bytes)
         self.compression_level = int(compression_level)
         self.compression_threads = int(compression_threads)
+        self.record_transform = record_transform
         self.records: list[dict[str, Any]] = []
         self.pending_bytes = 0
         self.shard_index = self._last_shard_index()
@@ -72,8 +75,16 @@ class AttentionShardWriter:
             raise ValueError("attention record is missing its aligned token key map")
         saved = dict(record)
         saved["case_id"] = self.active_case_id
+        if self.record_transform is not None:
+            saved = self.record_transform(saved)
+            if not isinstance(saved, dict):
+                raise TypeError("attention record transform must return a dict")
         self.records.append(saved)
-        self.pending_bytes += int(weights.numel() * weights.element_size())
+        self.pending_bytes += (
+            len(pickle.dumps(saved, protocol=pickle.HIGHEST_PROTOCOL))
+            if self.record_transform is not None
+            else int(weights.numel() * weights.element_size())
+        )
         self.case_record_count += 1
         if self.pending_bytes >= self.max_buffer_bytes:
             self.flush()

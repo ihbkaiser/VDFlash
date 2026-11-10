@@ -52,6 +52,7 @@ def create_dflash_sdpa_mask(
     block_size,
     device,
     sliding_window: Optional[int] = None,
+    context_keep_mask: Optional[torch.Tensor] = None,
 ):
     """Construct a full or sliding dense boolean DFlash mask."""
 
@@ -74,6 +75,18 @@ def create_dflash_sdpa_mask(
     )
 
     mask_context = (kv_indices < S) & (kv_indices < anchor_expanded)
+    if context_keep_mask is not None:
+        if tuple(context_keep_mask.shape) != (B, S):
+            raise ValueError(
+                "context_keep_mask must have shape [batch, sequence], "
+                f"got {tuple(context_keep_mask.shape)} for {(B, S)}"
+            )
+        full_context_keep = F.pad(
+            context_keep_mask.bool(),
+            (0, KV_LEN - S),
+            value=True,
+        )
+        mask_context = mask_context & full_context_keep[:, None, None, :]
     if sliding_window is not None:
         # The current draft token occupies one slot in the window.
         context_lower_bound = anchor_expanded + q_block_offsets - (sliding_window - 1)
@@ -100,6 +113,7 @@ def create_dflash_block_mask(
     device: torch.device,
     flex_block_size=None,
     sliding_window: Optional[int] = None,
+    context_keep_mask: Optional[torch.Tensor] = None,
 ):
     """Construct a full or sliding Flex Attention mask for DFlash training."""
 
@@ -116,6 +130,9 @@ def create_dflash_block_mask(
         # Strictly less than: matches inference where target_hidden[anchor_pos]
         # is not available as context.
         mask_context = is_context & (kv_idx < anchor_pos)
+        if context_keep_mask is not None:
+            safe_kv_idx = kv_idx.clamp(min=0, max=S - 1)
+            mask_context = mask_context & context_keep_mask[b, safe_kv_idx].bool()
         if sliding_window is not None:
             # The current draft token occupies one slot in the window.
             context_lower_bound = anchor_pos + q_block_offset - (sliding_window - 1)
@@ -192,6 +209,10 @@ class OnlineDFlashModel(nn.Module):
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
         self._cached_bsz: Optional[int] = None
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        return self
 
     def _sample_anchor_positions(
         self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
@@ -321,13 +342,30 @@ class OnlineDFlashModel(nn.Module):
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
+        anchor_positions: Optional[torch.Tensor] = None,
+        block_keep_mask: Optional[torch.Tensor] = None,
+        context_keep_mask: Optional[torch.Tensor] = None,
+        draft_model: Optional[DFlashDraftModel] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
-        anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len, loss_mask, device
-        )
+        if anchor_positions is None or block_keep_mask is None:
+            if anchor_positions is not None or block_keep_mask is not None:
+                raise ValueError(
+                    "anchor_positions and block_keep_mask must be provided together"
+                )
+            anchor_positions, block_keep_mask = self._sample_anchor_positions(
+                seq_len, loss_mask, device
+            )
+        if context_keep_mask is not None and tuple(context_keep_mask.shape) != (
+            bsz,
+            seq_len,
+        ):
+            raise ValueError(
+                "context_keep_mask must have shape [batch, sequence], "
+                f"got {tuple(context_keep_mask.shape)} for {(bsz, seq_len)}"
+            )
 
         noise_embedding = self._create_noise_embed(
             input_ids, anchor_positions, block_keep_mask
@@ -372,6 +410,7 @@ class OnlineDFlashModel(nn.Module):
             "S": seq_len,
             "block_size": self.block_size,
             "device": device,
+            "context_keep_mask": context_keep_mask,
         }
         if (
             self.attention_backend == "flex_attention"
@@ -380,7 +419,8 @@ class OnlineDFlashModel(nn.Module):
             # FLASH requires a minimum of this block size.
             mask_args["flex_block_size"] = (256, 128)
         full_attn_mask = mask_builder(**mask_args)
-        sliding_window = self.draft_model.sliding_window
+        active_draft_model = draft_model or self.draft_model
+        sliding_window = active_draft_model.sliding_window
         dflash_attn_mask = full_attn_mask
         if sliding_window is not None:
             dflash_attn_mask = {
@@ -391,7 +431,7 @@ class OnlineDFlashModel(nn.Module):
                 ),
             }
 
-        output_hidden = self.draft_model(
+        output_hidden = active_draft_model(
             position_ids=full_position_ids,
             noise_embedding=noise_embedding,
             target_hidden=hidden_states,

@@ -15,6 +15,7 @@ import torch
 
 from .metrics import score_pair
 from .attention_artifacts import load_attention_shard
+from .attention_summary_storage import SUMMARY_RECORD_SCHEMA
 
 
 CONDITIONS = ("full", "zero", "cut", "retained_75", "retained_50", "retained_25")
@@ -329,6 +330,7 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
     case_accumulators: dict[str, dict[str, Any]] = {}
     unique_shards: dict[str, dict[str, Any]] = {}
     malformed_records: list[dict[str, Any]] = []
+    attention_record_formats = {"raw": 0, "summary_exact": 0}
 
     for row in valid_rows:
         for shard in (row.get("attention_capture") or {}).get("shards", []):
@@ -350,13 +352,35 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
             if row is None:
                 malformed_records.append({"shard": shard_path_string, "error": f"unknown case {case_id}"})
                 continue
-            try:
-                summary, aggregate = _summarize_attention_record(row, record)
-            except Exception as exc:
-                malformed_records.append(
-                    {"shard": shard_path_string, "case_id": case_id, "error": f"{type(exc).__name__}: {exc}"}
-                )
-                continue
+            if record.get("schema") == SUMMARY_RECORD_SCHEMA:
+                summary = record.get("summary")
+                aggregate = record.get("aggregate")
+                if (
+                    not isinstance(summary, dict)
+                    or not isinstance(aggregate, dict)
+                    or str(record.get("row_id")) != case_id
+                    or str(summary.get("row_id")) != case_id
+                    or summary.get("checkpoint_name") != row.get("checkpoint_name")
+                    or str(summary.get("sample_id")) != str(row.get("sample_id"))
+                    or int(summary.get("target_visual_tokens", -1))
+                    != int(row.get("target_visual_tokens", -2))
+                    or summary.get("visual_condition") != row.get("visual_condition")
+                    or int(aggregate.get("head_query_count", 0)) <= 0
+                ):
+                    malformed_records.append(
+                        {"shard": shard_path_string, "case_id": case_id, "error": "invalid exact attention summary record"}
+                    )
+                    continue
+                attention_record_formats["summary_exact"] += 1
+            else:
+                try:
+                    summary, aggregate = _summarize_attention_record(row, record)
+                except Exception as exc:
+                    malformed_records.append(
+                        {"shard": shard_path_string, "case_id": case_id, "error": f"{type(exc).__name__}: {exc}"}
+                    )
+                    continue
+                attention_record_formats["raw"] += 1
             attention_handle.write(json.dumps(summary, ensure_ascii=False, separators=(",", ":")) + "\n")
             accumulator = case_accumulators.setdefault(
                 case_id,
@@ -570,6 +594,7 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
         "attention_shards_referenced": len(unique_shards),
         "attention_shards_verified": verified_shards,
         "attention_summary_records": sum(1 for _ in attention_file.open(encoding="utf-8")) if attention_file.is_file() else 0,
+        "attention_record_formats": attention_record_formats,
         "case_attention_summaries": len(case_summaries),
         "bootstrap_replicates": 2000,
         "bootstrap_seed": 42,
