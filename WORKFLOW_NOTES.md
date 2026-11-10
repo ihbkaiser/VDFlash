@@ -132,39 +132,6 @@ repository VDFlash.
   SHA256, số record, key map và tính lossless; khi phân tích campaign đầy đủ,
   dùng `analyze_dflash_visualcut_attention --require-complete`.
 
-<<<<<<< HEAD
-## 9. Published Qwen2.5-VL DSpark inference
-
-- Archive `ihbkaiser/qwen25vl-3b-msd-checkpoints/dspark_3layer.zst` is
-  51,534,964,941 bytes. Store it under the ignored
-  `artifacts/ihbkaiser_qwen25vl-3b-msd-checkpoints/` directory and verify its
-  LFS SHA-256 (`52ea9887ec90c69fb2dc2f9381f0cb4e3ccd5e48b046043700680dc257ad0ec5`)
-  before extraction.
-- Use `src/train_DSpark_SpecForge/scripts/prepare_dspark_inference.sh` to
-  resume the download, verify it, inventory checkpoint steps, and extract only
-  the selected `training_state.pt` plus rank states. `DSPARK_PHASE=auto`
-  prefers the latest Phase 2 checkpoint and falls back to Phase 1. The archive
-  has two layer-set runs; the default run uses target layers `26,28,30,32,34`
-  to match the local Qwen2.5-VL config. Override it with `DSPARK_RUN_ID`.
-- Run
-  `src/train_DSpark_SpecForge/scripts/infer_qwen25vl_dspark.py` on a CUDA
-  BF16-capable GPU with enough memory for the target and draft on one device.
-  It reconstructs the phase-specific draft config from the checkpoint contract
-  and checks config and target-model provenance before greedy generation.
-- Default `--scheduler fixed` is the offline fixed-block path. Use the
-  confidence head with `--scheduler threshold` for cumulative-survival prefix
-  selection or `--scheduler profile` with measured target-engine steps per
-  second by verification batch size (1 through 8 tokens for this checkpoint).
-  The latter is single-request scheduling, not a continuous-batching server
-  scheduler.
-- Keep the archive, extracted training states, target-model cache, and
-  inference JSONL under ignored artifact/cache roots; never commit them.
-- On Gadi, use `src/train_DSpark_SpecForge/scripts/submit_dspark_inference_gadi.sh`.
-  It runs `--preflight-only` on the login node to materialize the selected draft,
-  check target provenance and preprocess the image before calling `qsub` for
-  one H200. The PBS worker records its GPU and output JSONL and fails if greedy
-  tokens disagree with the target-only reference.
-=======
 ## 9. VisualCut distribution replay
 
 - Distribution replay so sánh hai điều kiện `full` và `cut` trên cùng target
@@ -203,4 +170,3 @@ repository VDFlash.
 - Khi mở rộng `input_ids` và `attention_mask` cho chuỗi token đầu ra,
   phải đồng thời mở rộng `mm_token_type_ids` (điền 0 cho các token text)
   để tránh lỗi lệch kích thước tensor trong phép tính RoPE 3D.
->>>>>>> self distillation Dflash
