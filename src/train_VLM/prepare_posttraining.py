@@ -983,9 +983,27 @@ def generate_target_responses(args: argparse.Namespace) -> dict[str, Any]:
             if not metadata_path.is_file():
                 raise ValueError(f"cannot safely resume without response provenance: {metadata_path}")
             saved = json.loads(metadata_path.read_text(encoding="utf-8"))
-            if saved.get("config") != config_contract:
+            saved_config = saved.get("config")
+            can_extend_response = False
+            if isinstance(saved_config, dict):
+                saved_response_limit = saved_config.get("response_max_new_tokens")
+                saved_other_settings = {
+                    key: value for key, value in saved_config.items()
+                    if key != "response_max_new_tokens"
+                }
+                current_other_settings = {
+                    key: value for key, value in config_contract.items()
+                    if key != "response_max_new_tokens"
+                }
+                can_extend_response = (
+                    isinstance(saved_response_limit, int)
+                    and config.response_max_new_tokens >= saved_response_limit
+                    and saved_other_settings == current_other_settings
+                )
+            if saved_config != config_contract and not can_extend_response:
                 raise ValueError(
-                    f"target response config differs from saved output for {split}; use a new data directory"
+                    f"target response config differs from saved output for {split}; "
+                    "resume allows only an equal or larger response token limit with all other settings unchanged"
                 )
     adapter = Qwen25VLTargetAdapter.from_pretrained(config, device=config.device)
     target_provenance = adapter.target_provenance()
@@ -1024,15 +1042,66 @@ def generate_target_responses(args: argparse.Namespace) -> dict[str, Any]:
         output_ids = {str(row["id"]) for row in generated if isinstance(row.get("target_response"), dict)}
         missing = sorted(input_ids - output_ids)
         extra = sorted(output_ids - input_ids)
-        response_counts[split] = {"input": len(input_ids), "generated": len(output_ids), "missing": len(missing)}
+        requested_input_count = len(input_ids)
         if extra:
             raise ValueError(f"{split} response output contains {len(extra)} IDs absent from its manifest")
         if missing:
-            sample = ", ".join(missing[:8])
-            raise RuntimeError(
-                f"target responses incomplete for {split}: missing {len(missing)} records; examples: {sample}. "
-                "Inspect skipped length/EOS messages, adjust the target config, and resume."
+            if not args.drop_incomplete_responses:
+                sample = ", ".join(missing[:8])
+                raise RuntimeError(
+                    f"target responses incomplete for {split}: missing {len(missing)} records; examples: {sample}. "
+                    "Inspect skipped length/EOS messages, adjust the target config, and resume."
+                )
+            missing_ids = set(missing)
+            dropped_rows = [row for row in records if str(row["id"]) in missing_ids]
+            records = [row for row in records if str(row["id"]) not in missing_ids]
+            _write_jsonl(manifest_path, records)
+
+            summary["records"][split] = len(records)
+            summary["unique_videos_by_split"][split] = len({
+                str(row["metadata"]["video_key"]) for row in records
+            })
+            summary["task_counts"][split] = dict(Counter(
+                str(row["metadata"]["task"]) for row in records
+            ))
+            summary["duration_bucket_counts"][split] = dict(Counter(
+                str(row["metadata"]["duration_bucket"]) for row in records
+            ))
+            summary["visual_budget_counts"][split] = dict(Counter(
+                str(row["metadata"]["target_visual_tokens"]) for row in records
+            ))
+            _write_json(summary_path, summary)
+
+            drop_path = data_dir / "incomplete_target_response_drops.jsonl"
+            previous_drops = load_jsonl(drop_path) if drop_path.is_file() else []
+            previous_keys = {
+                (str(row.get("split")), str(row.get("id"))) for row in previous_drops
+            }
+            new_drops = [
+                {
+                    "split": split,
+                    "id": str(row["id"]),
+                    "reason": "no_complete_response_within_configured_limits",
+                    "response_max_new_tokens": config.response_max_new_tokens,
+                }
+                for row in dropped_rows
+                if (split, str(row["id"])) not in previous_keys
+            ]
+            _write_jsonl(drop_path, [*previous_drops, *new_drops])
+            print(
+                f"[targets] dropped {len(dropped_rows)} {split} records without EOS; "
+                f"see {drop_path}",
+                flush=True,
             )
+            input_ids = {str(row["id"]) for row in records}
+            missing = []
+
+        response_counts[split] = {
+            "input": requested_input_count,
+            "generated": len(output_ids),
+            "missing": len(missing),
+            "dropped": requested_input_count - len(input_ids),
+        }
         missing_grids = [row["id"] for row in generated if _actual_visual_tokens(row) is None]
         if missing_grids:
             raise RuntimeError(
@@ -1242,6 +1311,11 @@ def main() -> None:
     targets_parser.add_argument("--splits", nargs="+", choices=["train", "validation", "test"],
                                  default=["train", "validation", "test"])
     targets_parser.add_argument("--resume", action="store_true")
+    targets_parser.add_argument(
+        "--drop-incomplete-responses",
+        action="store_true",
+        help="remove manifest rows whose greedy target response reaches its token limit without EOS",
+    )
 
     validate_parser = subparsers.add_parser("validate", help="validate data manifests and optionally generated targets")
     validate_parser.add_argument("--data-dir", required=True)

@@ -32,11 +32,23 @@ if [[ -f "${REPO_ROOT}/.venv/bin/python" ]]; then
 fi
 
 DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data/dflash-posttraining}"
+RAW_DATA_ROOT="${RAW_DATA_ROOT:-${DATA_ROOT}/raw}"
+PREPARED_DATA_ROOT="${PREPARED_DATA_ROOT:-${DATA_ROOT}/processed}"
+RESPONSE_MAX_NEW_TOKENS="${RESPONSE_MAX_NEW_TOKENS:-4096}"
 CHECKPOINTS_ROOT="${CHECKPOINTS_ROOT:-${REPO_ROOT}/checkpoints}"
 MODELS_ROOT="${MODELS_ROOT:-${REPO_ROOT}/models}"
 
-RAW_DIR="${DATA_ROOT}/raw"
-FEATURES_DIR="${DATA_ROOT}/features"
+if [[ ! "${RESPONSE_MAX_NEW_TOKENS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "RESPONSE_MAX_NEW_TOKENS must be a positive integer, got: ${RESPONSE_MAX_NEW_TOKENS}" >&2
+  exit 2
+fi
+if ((RESPONSE_MAX_NEW_TOKENS > 6744)); then
+  echo "RESPONSE_MAX_NEW_TOKENS must be at most 6744 with the 32768 context and 25000-token visual budget" >&2
+  exit 2
+fi
+
+RAW_DIR="${RAW_DATA_ROOT}"
+FEATURES_DIR="${FEATURES_DIR:-${PREPARED_DATA_ROOT}/features}"
 TEACHER_DIR="${CHECKPOINTS_ROOT}/phase2-dflash"
 SMOKE_OUTPUT_DIR="${CHECKPOINTS_ROOT}/dflash-visual10/smoke_test"
 FULL_OUTPUT_DIR="${CHECKPOINTS_ROOT}/dflash-visual10/run_final_b200"
@@ -47,7 +59,7 @@ else
   TARGET_MODEL="${TARGET_MODEL:-Qwen/Qwen2.5-VL-3B-Instruct}"
 fi
 TARGET_CONFIG="${REPO_ROOT}/configs/target_qwen25vl_3b.json"
-DRAFT_ARCH_CONFIG="${REPO_ROOT}/configs/dflash_configs/high_only.json"
+DRAFT_ARCH_CONFIG="${REPO_ROOT}/configs/dflash_configs/balanced.json"
 TEACHER_CKPT="${TEACHER_DIR}/qwen25vl-3b-dflash-llava68k-h32-depth3-latest/training_state.pt"
 
 # Tự động nhận diện số lượng GPU
@@ -97,19 +109,20 @@ echo ">> Video-DFlash Visual-10% Self-Distillation Automation Pipeline"
 echo ">> Kế hoạch: Smoke Test [${DO_SMOKE}] -> Full Production Train [${DO_FULL}]"
 echo ">> Số GPU B200: ${NUM_GPUS} | Python: ${PYTHON_BIN}"
 echo ">> Data Root: ${DATA_ROOT}"
+echo ">> Prepared Data Root: ${PREPARED_DATA_ROOT}"
 echo ">> Checkpoints Root: ${CHECKPOINTS_ROOT}"
 echo "========================================================================"
 
-mkdir -p "${DATA_ROOT}" "${RAW_DIR}" "${FEATURES_DIR}" "${TEACHER_DIR}" "${MODELS_ROOT}" "${SMOKE_OUTPUT_DIR}" "${FULL_OUTPUT_DIR}"
+mkdir -p "${DATA_ROOT}" "${RAW_DIR}" "${TEACHER_DIR}" "${MODELS_ROOT}" "${SMOKE_OUTPUT_DIR}" "${FULL_OUTPUT_DIR}"
 
 # Tự động đồng bộ đường dẫn target model vào config JSON
-DYNAMIC_TARGET_CONFIG="${DATA_ROOT}/target_config.json"
+DYNAMIC_TARGET_CONFIG="${CHECKPOINTS_ROOT}/dflash-visual10/target_config.json"
 cat <<EOF > "${DYNAMIC_TARGET_CONFIG}"
 {
   "target_model": "${TARGET_MODEL}",
   "mixed_precision": "bf16",
   "max_seq_length": 32768,
-  "response_max_new_tokens": 1024
+  "response_max_new_tokens": ${RESPONSE_MAX_NEW_TOKENS}
 }
 EOF
 TARGET_CONFIG="${DYNAMIC_TARGET_CONFIG}"
@@ -188,11 +201,11 @@ fi
 echo ""
 echo ">> [3/5] Xử lý dữ liệu & sinh target tokens (${TRAIN_RECORDS} train / ${VAL_RECORDS} val)..."
 
-if [[ ! -f "${DATA_ROOT}/manifests/train.jsonl" ]]; then
+if [[ ! -f "${PREPARED_DATA_ROOT}/manifests/train.jsonl" ]]; then
   echo ">> Đang giải nén video và lập manifest train/val/test..."
   "${PYTHON_BIN}" -m src.train_VLM.prepare_posttraining prepare \
     --source "${RAW_DIR}" \
-    --output-dir "${DATA_ROOT}" \
+    --output-dir "${PREPARED_DATA_ROOT}" \
     --train-records "${TRAIN_RECORDS}" \
     --validation-records "${VAL_RECORDS}" \
     --test-records "${TEST_RECORDS}" \
@@ -202,32 +215,37 @@ if [[ ! -f "${DATA_ROOT}/manifests/train.jsonl" ]]; then
     --spatial-tokens-per-temporal-patch 512 \
     --seed 20261104
 else
-  echo ">> Manifests đã tồn tại tại ${DATA_ROOT}/manifests"
+  echo ">> Manifests đã tồn tại tại ${PREPARED_DATA_ROOT}/manifests"
 fi
 
-if [[ ! -f "${DATA_ROOT}/responses/train.jsonl" ]]; then
+if [[ ! -f "${PREPARED_DATA_ROOT}/responses/train.jsonl" ]] || \
+  ! grep -q '"status": "complete"' "${PREPARED_DATA_ROOT}/responses/train.jsonl.meta.json" || \
+  ! grep -q '"status": "complete"' "${PREPARED_DATA_ROOT}/responses/validation.jsonl.meta.json" || \
+  ! grep -q '"status": "complete"' "${PREPARED_DATA_ROOT}/responses/test.jsonl.meta.json"; then
   echo ">> Đang sinh exact greedy target tokens bằng Target model..."
   "${PYTHON_BIN}" -m src.train_VLM.prepare_posttraining targets \
-    --data-dir "${DATA_ROOT}" \
+    --data-dir "${PREPARED_DATA_ROOT}" \
     --config "${TARGET_CONFIG}" \
     --batch-size 4 \
-    --splits train validation
+    --splits train validation test \
+    --resume \
+    --drop-incomplete-responses
 else
-  echo ">> Target responses đã tồn tại tại ${DATA_ROOT}/responses"
+  echo ">> Target responses đã tồn tại tại ${PREPARED_DATA_ROOT}/responses"
 fi
 
 # Thẩm định tính toàn vẹn và cách ly video giữa các split
 echo ">> Kiểm định toàn vẹn dữ liệu..."
 "${PYTHON_BIN}" -m src.train_VLM.prepare_posttraining validate \
-  --data-dir "${DATA_ROOT}" \
+  --data-dir "${PREPARED_DATA_ROOT}" \
   --require-target-responses
 
 # --- 5. Trích Xuất & Lưu Trữ Target Hidden States (5 Layers) ---
 echo ""
-echo ">> [4/5] Trích xuất Target Hidden States (5 Layers: 26, 28, 30, 32, 34)..."
+echo ">> [4/5] Trích xuất Target Hidden States (5 Layers: 1, 9, 17, 25, 33)..."
 if [[ ! -d "${FEATURES_DIR}/train" ]]; then
   "${PYTHON_BIN}" -m src.train_VLM.cache_visual10_selfdistill_features \
-    --data-dir "${DATA_ROOT}" \
+    --data-dir "${PREPARED_DATA_ROOT}" \
     --target-config "${TARGET_CONFIG}" \
     --draft-config "${DRAFT_ARCH_CONFIG}" \
     --output-dir "${FEATURES_DIR}" \
@@ -341,7 +359,7 @@ if [[ "${DO_FULL}" -eq 1 ]]; then
   echo "========================================================================"
 
   # --- 8. TỰ ĐỘNG ĐÁNH GIÁ (EVALUATION TRÊN TEST SET) ---
-  if [[ -f "${DATA_ROOT}/responses/test.jsonl" ]]; then
+  if [[ -f "${PREPARED_DATA_ROOT}/responses/test.jsonl" ]]; then
     echo ""
     echo ">> [EVAL] Đang tiến hành đánh giá tự động trên tập Test (250 mẫu)..."
     mkdir -p "${REPO_ROOT}/results/evaluation_visual10_selfdistill"
@@ -349,7 +367,7 @@ if [[ "${DO_FULL}" -eq 1 ]]; then
       --target-config "${TARGET_CONFIG}" \
       --draft-config "${DRAFT_ARCH_CONFIG}" \
       --checkpoint "${FULL_OUTPUT_DIR}/run-latest" \
-      --manifest "${DATA_ROOT}/responses/test.jsonl" \
+      --manifest "${PREPARED_DATA_ROOT}/responses/test.jsonl" \
       --visual-retention 0.1 \
       --visual-selector temporal_spatial \
       --output "${REPO_ROOT}/results/evaluation_visual10_selfdistill/summary.json"
