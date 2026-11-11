@@ -35,6 +35,10 @@ DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data/dflash-posttraining}"
 RAW_DATA_ROOT="${RAW_DATA_ROOT:-${DATA_ROOT}/raw}"
 PREPARED_DATA_ROOT="${PREPARED_DATA_ROOT:-${DATA_ROOT}/processed}"
 RESPONSE_MAX_NEW_TOKENS="${RESPONSE_MAX_NEW_TOKENS:-4096}"
+TARGET_RESPONSE_BATCH_SIZE="${SPECFORGE_TARGET_RESPONSE_BATCH_SIZE:-4}"
+# The current target config uses torchvision. Set this before Python imports
+# qwen-vl-utils, which caches its video backend during module import.
+export FORCE_QWENVL_VIDEO_READER="${FORCE_QWENVL_VIDEO_READER:-torchvision}"
 CHECKPOINTS_ROOT="${CHECKPOINTS_ROOT:-${REPO_ROOT}/checkpoints}"
 MODELS_ROOT="${MODELS_ROOT:-${REPO_ROOT}/models}"
 
@@ -44,6 +48,10 @@ if [[ ! "${RESPONSE_MAX_NEW_TOKENS}" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if ((RESPONSE_MAX_NEW_TOKENS > 6744)); then
   echo "RESPONSE_MAX_NEW_TOKENS must be at most 6744 with the 32768 context and 25000-token visual budget" >&2
+  exit 2
+fi
+if [[ ! "${TARGET_RESPONSE_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "SPECFORGE_TARGET_RESPONSE_BATCH_SIZE must be a positive integer, got: ${TARGET_RESPONSE_BATCH_SIZE}" >&2
   exit 2
 fi
 
@@ -108,6 +116,7 @@ echo "========================================================================"
 echo ">> Video-DFlash Visual-10% Self-Distillation Automation Pipeline"
 echo ">> Kế hoạch: Smoke Test [${DO_SMOKE}] -> Full Production Train [${DO_FULL}]"
 echo ">> Số GPU B200: ${NUM_GPUS} | Python: ${PYTHON_BIN}"
+echo ">> Video reader: ${FORCE_QWENVL_VIDEO_READER}"
 echo ">> Data Root: ${DATA_ROOT}"
 echo ">> Prepared Data Root: ${PREPARED_DATA_ROOT}"
 echo ">> Checkpoints Root: ${CHECKPOINTS_ROOT}"
@@ -130,6 +139,7 @@ TARGET_CONFIG="${DYNAMIC_TARGET_CONFIG}"
 # --- 2. Kiểm Tra Môi Trường, Authentication & Dependencies ---
 echo ""
 echo ">> [1/5] Kiểm tra môi trường & cài đặt gói SpecForge..."
+echo ">> Target response batch/GPU: ${TARGET_RESPONSE_BATCH_SIZE}"
 
 # Kiểm tra xác thực Hugging Face cho repo private (chỉ khi không bật --skip-download)
 if [[ "${SKIP_DOWNLOAD}" != "1" && ! -f "${RAW_DIR}/download_status.json" ]]; then
@@ -223,10 +233,20 @@ if [[ ! -f "${PREPARED_DATA_ROOT}/responses/train.jsonl" ]] || \
   ! grep -q '"status": "complete"' "${PREPARED_DATA_ROOT}/responses/validation.jsonl.meta.json" || \
   ! grep -q '"status": "complete"' "${PREPARED_DATA_ROOT}/responses/test.jsonl.meta.json"; then
   echo ">> Đang sinh exact greedy target tokens bằng Target model..."
-  "${PYTHON_BIN}" -m src.train_VLM.prepare_posttraining targets \
+  if ((NUM_GPUS > 1)); then
+    echo ">> Chia target generation trên ${NUM_GPUS} GPU (mỗi GPU một shard dữ liệu)."
+    TARGET_GENERATION_COMMAND=(
+      "${PYTHON_BIN}" -m torch.distributed.run
+      --standalone --nproc_per_node="${NUM_GPUS}" --module
+      src.train_VLM.prepare_posttraining
+    )
+  else
+    TARGET_GENERATION_COMMAND=("${PYTHON_BIN}" -m src.train_VLM.prepare_posttraining)
+  fi
+  "${TARGET_GENERATION_COMMAND[@]}" targets \
     --data-dir "${PREPARED_DATA_ROOT}" \
     --config "${TARGET_CONFIG}" \
-    --batch-size 4 \
+    --batch-size "${TARGET_RESPONSE_BATCH_SIZE}" \
     --splits train validation test \
     --resume \
     --drop-incomplete-responses

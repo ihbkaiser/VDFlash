@@ -144,48 +144,96 @@ def prepare_responses_batched(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    completed_ids: set[str] = set()
-    if output_path.exists():
-        if not resume:
-            raise FileExistsError(
-                f"output exists: {output_path}; pass --resume-output or --overwrite-output"
-            )
-        with output_path.open("rb+") as reader:
+    import torch.distributed as dist
+
+    distributed = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if distributed else 0
+    world_size = dist.get_world_size() if distributed else 1
+    part_pattern = f"{output_path.name}.rank-*.partial.jsonl"
+    part_paths = sorted(output_path.parent.glob(part_pattern)) if distributed else []
+
+    def repair_jsonl_tail(path: Path) -> None:
+        if not path.is_file():
+            return
+        with path.open("rb+") as reader:
             raw = reader.read()
             if raw and not raw.endswith(b"\n"):
                 reader.seek(raw.rfind(b"\n") + 1 if b"\n" in raw else 0)
                 reader.truncate()
-        with output_path.open(encoding="utf-8") as reader:
-            for line_number, line in enumerate(reader, 1):
-                if not line.strip():
-                    continue
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    raise ValueError(f"invalid JSON in resumable output {output_path}:{line_number}") from exc
-                if row.get("id") is not None and isinstance(row.get("target_response"), dict):
-                    completed_ids.add(str(row["id"]))
 
-    pending = [row for row in records if str(row.get("id")) not in completed_ids]
+    if distributed:
+        # Rank 0 repairs any interrupted shard before every rank reads resume IDs.
+        dist.barrier()
+        if rank == 0:
+            for path in [output_path, *part_paths]:
+                repair_jsonl_tail(path)
+        dist.barrier()
+    else:
+        repair_jsonl_tail(output_path)
+
+    completed_ids: set[str] = set()
+    existing_outputs = [output_path, *part_paths]
+    if any(path.exists() for path in existing_outputs):
+        if not resume:
+            raise FileExistsError(
+                f"output exists: {output_path}; pass --resume-output or --overwrite-output"
+            )
+        for existing_path in existing_outputs:
+            if not existing_path.is_file():
+                continue
+            with existing_path.open(encoding="utf-8") as reader:
+                for line_number, line in enumerate(reader, 1):
+                    if not line.strip():
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(
+                            f"invalid JSON in resumable output {existing_path}:{line_number}"
+                        ) from exc
+                    if row.get("id") is not None and isinstance(row.get("target_response"), dict):
+                        completed_ids.add(str(row["id"]))
+
+    pending_pool = [row for row in records if str(row.get("id")) not in completed_ids]
+    if distributed:
+        # Keep each original HF batch intact so distributed generation preserves
+        # the existing greedy-generation batch composition.
+        grouped = [pending_pool[start : start + batch_size]
+                   for start in range(0, len(pending_pool), batch_size)]
+        pending = [
+            row
+            for group_index, group in enumerate(grouped)
+            if group_index % world_size == rank
+            for row in group
+        ]
+    else:
+        pending = pending_pool
     print(
-        f"[HF batch] pending={len(pending)} completed={len(completed_ids)} batch_size={batch_size}",
+        f"[HF batch rank={rank}/{world_size}] pending={len(pending)} "
+        f"completed={len(completed_ids)} batch_size={batch_size}",
         flush=True,
     )
     model = adapter.model
     model.eval()
     tokenizer = adapter.processor.tokenizer
     eos_token_ids = _eos_token_ids(adapter)
+    target_provenance = adapter.target_provenance()
     old_padding_side = getattr(tokenizer, "padding_side", "right")
     tokenizer.padding_side = "left"
-    output_mode = "a" if output_path.exists() and resume else "w"
+    shard_path = (
+        output_path.with_name(f"{output_path.name}.rank-{rank:05d}.partial.jsonl")
+        if distributed
+        else output_path
+    )
+    output_mode = "a" if shard_path.exists() and resume else "w"
     written = 0
     skipped_eos = 0
     skipped_length = 0
     try:
-        with output_path.open(output_mode, encoding="utf-8") as writer:
+        with shard_path.open(output_mode, encoding="utf-8") as writer:
             progress = tqdm(
                 range(0, len(pending), batch_size),
-                desc="Generate target responses (HF batch)",
+                desc=f"Generate target responses (rank {rank}/{world_size})",
                 unit="batches",
                 dynamic_ncols=True,
             )
@@ -273,7 +321,7 @@ def prepare_responses_batched(
                             "eos_token_ids": sorted(eos_token_ids),
                         },
                     }
-                    output["provenance"] = adapter.target_provenance()
+                    output["provenance"] = target_provenance
                     # The DFlash post-training manifests contain exactly one
                     # video per sample. Preserve the realized Qwen grid so the
                     # requested visual-token budget can be audited downstream.
@@ -292,9 +340,45 @@ def prepare_responses_batched(
                 )
     finally:
         tokenizer.padding_side = old_padding_side
+    if distributed:
+        dist.barrier()
+        if rank == 0:
+            rows_by_id: dict[str, dict] = {}
+            source_paths = [output_path, *sorted(output_path.parent.glob(part_pattern))]
+            for source_path in source_paths:
+                if not source_path.is_file():
+                    continue
+                with source_path.open(encoding="utf-8") as reader:
+                    for line_number, line in enumerate(reader, 1):
+                        if not line.strip():
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except json.JSONDecodeError as exc:
+                            raise ValueError(
+                                f"invalid JSON in distributed response part "
+                                f"{source_path}:{line_number}"
+                            ) from exc
+                        if row.get("id") is not None:
+                            rows_by_id.setdefault(str(row["id"]), row)
+            ordered_ids = [str(row.get("id")) for row in records]
+            ordered_rows = [rows_by_id[row_id] for row_id in ordered_ids if row_id in rows_by_id]
+            manifest_ids = set(ordered_ids)
+            ordered_rows.extend(
+                row for row_id, row in rows_by_id.items() if row_id not in manifest_ids
+            )
+            merged_path = output_path.with_name(f"{output_path.name}.merge.tmp")
+            with merged_path.open("w", encoding="utf-8") as writer:
+                for row in ordered_rows:
+                    writer.write(json.dumps(row, ensure_ascii=False) + "\n")
+            merged_path.replace(output_path)
+            for source_path in output_path.parent.glob(part_pattern):
+                source_path.unlink()
+        dist.barrier()
     print(
         f"[HF batch summary] newly_written={written} total_completed={len(completed_ids) + written} "
-        f"skipped_without_eos={skipped_eos} skipped_length={skipped_length}",
+        f"skipped_without_eos={skipped_eos} skipped_length={skipped_length} "
+        f"rank={rank}/{world_size}",
         flush=True,
     )
 

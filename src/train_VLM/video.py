@@ -242,6 +242,10 @@ def prepare_qwen_messages(
         }
         return values, VideoProcessorMetadata("", (), ())
 
+    # qwen-vl-utils reads this environment variable when selecting its backend.
+    # Set it before importing qwen-vl-utils: its module caches the selected
+    # backend at import time. setdefault preserves an explicit caller choice.
+    os.environ.setdefault("FORCE_QWENVL_VIDEO_READER", video_reader)
     try:
         from qwen_vl_utils import process_vision_info
     except ImportError as exc:  # pragma: no cover - exercised by the real smoke test
@@ -249,9 +253,6 @@ def prepare_qwen_messages(
             "qwen-vl-utils is required for Qwen2.5-VL image/video records"
         ) from exc
 
-    # qwen-vl-utils reads this environment variable when selecting its backend.
-    # setdefault preserves an explicit choice made by the caller.
-    os.environ.setdefault("FORCE_QWENVL_VIDEO_READER", video_reader)
     try:
         from qwen_vl_utils import vision_process
     except ImportError as exc:  # pragma: no cover - handled by the import above

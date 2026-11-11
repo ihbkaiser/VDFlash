@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
+import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
@@ -958,6 +959,21 @@ def generate_target_responses(args: argparse.Namespace) -> dict[str, Any]:
             f"{config.response_max_new_tokens}); "
             "increase it in the target config before loading the model"
         )
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    distributed = world_size > 1
+    rank = 0
+    local_rank = 0
+    dist = None
+    if distributed:
+        import torch
+        import torch.distributed as dist
+
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", init_method="env://")
+        rank = dist.get_rank()
+        config.device = f"cuda:{local_rank}"
+
     config_contract = {
         "target_model": config.target_model,
         "target_revision": config.target_revision,
@@ -976,9 +992,11 @@ def generate_target_responses(args: argparse.Namespace) -> dict[str, Any]:
         for split in args.splits
     }
     for split, output_path in output_paths.items():
-        if output_path.exists() and not args.resume:
+        partial_paths = list(output_path.parent.glob(f"{output_path.name}.rank-*.partial.jsonl"))
+        has_existing_response = output_path.exists() or bool(partial_paths)
+        if has_existing_response and not args.resume:
             raise FileExistsError(f"response file exists; pass --resume to continue: {output_path}")
-        if output_path.exists() and args.resume:
+        if has_existing_response and args.resume:
             metadata_path = output_path.with_suffix(output_path.suffix + ".meta.json")
             if not metadata_path.is_file():
                 raise ValueError(f"cannot safely resume without response provenance: {metadata_path}")
@@ -1016,16 +1034,19 @@ def generate_target_responses(args: argparse.Namespace) -> dict[str, Any]:
         output_path = output_paths[split]
         output_path.parent.mkdir(parents=True, exist_ok=True)
         metadata_path = output_path.with_suffix(output_path.suffix + ".meta.json")
-        if output_path.exists():
+        partial_paths = list(output_path.parent.glob(f"{output_path.name}.rank-*.partial.jsonl"))
+        if output_path.exists() or partial_paths:
             saved = json.loads(metadata_path.read_text(encoding="utf-8"))
             if saved.get("target_provenance") != target_provenance:
                 raise ValueError(f"target model/processor fingerprint changed for {split}; use a new data directory")
-        else:
+        elif rank == 0:
             _write_json(metadata_path, {
                 "status": "running",
                 "config": config_contract,
                 "target_provenance": target_provenance,
             })
+        if distributed:
+            dist.barrier()
         from .prepare_responses import prepare_responses_batched
 
         prepare_responses_batched(
@@ -1038,6 +1059,9 @@ def generate_target_responses(args: argparse.Namespace) -> dict[str, Any]:
             resume=args.resume,
         )
         generated = load_jsonl(output_path)
+        if distributed and rank != 0:
+            dist.barrier()
+            continue
         input_ids = {str(row["id"]) for row in records}
         output_ids = {str(row["id"]) for row in generated if isinstance(row.get("target_response"), dict)}
         missing = sorted(input_ids - output_ids)
@@ -1120,6 +1144,9 @@ def generate_target_responses(args: argparse.Namespace) -> dict[str, Any]:
             "record_count": len(generated),
         })
         print(f"[targets] {split}: {len(output_ids)}/{len(input_ids)} exact target responses", flush=True)
+        if distributed:
+            dist.barrier()
+
     result = {
         "status": "complete",
         "target_model": config.target_model,
@@ -1132,7 +1159,14 @@ def generate_target_responses(args: argparse.Namespace) -> dict[str, Any]:
         "target_hidden_features_cached": False,
         "full_visual_dflash_logits_cached": False,
     }
-    _write_json(data_dir / "target_generation_summary.json", result)
+    summary_output = data_dir / "target_generation_summary.json"
+    if rank == 0:
+        _write_json(summary_output, result)
+    if distributed:
+        dist.barrier()
+        if rank != 0:
+            result = json.loads(summary_output.read_text(encoding="utf-8"))
+        dist.destroy_process_group()
     return result
 
 
@@ -1332,7 +1366,8 @@ def main() -> None:
         if args.batch_size < 1:
             parser.error("--batch-size must be positive")
         result = generate_target_responses(args)
-        print(json.dumps(result, indent=2, ensure_ascii=False), flush=True)
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(json.dumps(result, indent=2, ensure_ascii=False), flush=True)
     else:
         validate_dataset(args)
 
