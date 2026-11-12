@@ -1,6 +1,10 @@
 # BÁO CÁO PHÂN TÍCH CHUYÊN SÂU: ĐẶC TÍNH TOKEN VÀ NGỮ CẢNH QUYẾT ĐỊNH KHẢ NĂNG CHẤP NHẬN TRONG SPECULATIVE DECODING (MSD TRÊN VDC-50)
 
-- **Thời gian thực hiện:** Ngày 06 tháng 10 năm 2026
+> [!NOTE]
+> **CẬP NHẬT PHƯƠNG PHÁP LUẬN (12/11/2026):** 
+> Báo cáo này lưu giữ các kết quả khảo sát giai đoạn đầu sử dụng danh sách từ vựng heuristic. Để khắc phục tính chủ quan và xem phiên bản **nâng cấp định lượng toán học khách quan qua Target Attention Mass Layer 18 ($m^*=18$)** kèm thẩm định ngữ nghĩa thực nghiệm, vui lòng tham chiếu trực tiếp: [**Báo Cáo 17: Phân Tích Toàn Diện Cấp Độ Token**](17_Comprehensive_Token_Level_Visual_Grounding_Analysis.md).
+
+- **Thời gian thực hiện:** Ngày 06 tháng 10 năm 2026 (Cập nhật đối chiếu ngày 12/11/2026)
 - **Vị trí lưu trữ:** `results/6_10_26/BAO_CAO_PHAN_TICH_TOKEN_ACCEPTANCE.md`
 - **Mã nguồn phân tích:** `scripts/analyze_token_acceptance.py` và `scripts/plot_iteration_performance.py`
 - **Dữ liệu thực nghiệm gốc:** `results/phase1_raw_20260923/h31/msd_retention_vdc50_25k_final.jsonl`

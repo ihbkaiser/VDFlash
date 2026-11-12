@@ -26,6 +26,10 @@ Toàn bộ các tài liệu gốc, báo cáo chuyên sâu và tệp số liệu 
 | **11** | [`11_Sparrow_MSD_vs_DFlash_Comparison.md`](raw_reports/11_Sparrow_MSD_vs_DFlash_Comparison.md) | **Đối chiếu toàn diện Sparrow / MSD và DFlash** qua các mốc context. | So sánh sự khác biệt bản chất giữa Draft tuần tự (AR 1-layer) và Draft song song (Diffusion multi-layer). |
 | **12** | [`12_Text_Suffix_Pruning_After_Visual_Cut.md`](raw_reports/12_Text_Suffix_Pruning_After_Visual_Cut.md) | **Pruning Text Suffix** sau khi đã cắt bỏ 100% visual context. | Khảo sát các mức giữ lại text suffix (100%, 75%, 50%, 25%, 0%); $\tau$ tụt dốc đều đặn khi cắt text từ trái sang phải, chứng minh text context là cốt lõi. |
 | **13** | [`13_Thought_Mechanisms_MSD_vs_DFlash.md`](raw_reports/13_Thought_Mechanisms_MSD_vs_DFlash.md) | **Ghi chú lập luận cơ chế (02/11/2026)**. | Tổng hợp các suy luận giải thích tại sao Visual Cut có tác dụng ngược nhau giữa MSD và DFlash. |
+| **14** | [`14_Visual_Recall_Analysis.md`](raw_reports/14_Visual_Recall_Analysis.md) | **Visual Recall@K & Pareto Attention L18**, 200 pairs, 264.773 draft positions. | L18 Attention phân tán (Top 10% chỉ chiếm 18.66% mass). Ở 25K tokens, Cut vượt trội Full về Recall@1 (+0.67 pp) và Recall@2 (+0.84 pp). |
+| **15** | [`15_DFlash_Depth1_LongVideo_25K_Evaluation.md`](raw_reports/15_DFlash_Depth1_LongVideo_25K_Evaluation.md) | **DFlash 1-Layer (Depth 1) Long Video 25K**, cohort 15 video A100. | Miễn nhiễm sụp đổ baseline ($\tau_{\text{Full}} = 1.918$, $\tau_{\text{Cut}} = 1.962$). Cut vượt trội Full có ý nghĩa thống kê ($p = 0.0275 < 0.05$), speedup $+0.05\text{x}$. |
+| **16** | [`16_DSpark_Phase1_ShareGPT68K_Matrix_Evaluation.md`](raw_reports/16_DSpark_Phase1_ShareGPT68K_Matrix_Evaluation.md) | **DSpark Phase 1 (Text-only) trên Ma Trận VDC-15**, 60 cases đối đầu A100. | Drafter thuần text ShareGPT duy trì 98.77% hiệu năng khi Cut visual ($p > 0.45$ ở $\le 13K$), chứng minh phụ thuộc chính vào Target Text States. |
+| **17** | [`17_Comprehensive_Token_Level_Visual_Grounding_Analysis.md`](raw_reports/17_Comprehensive_Token_Level_Visual_Grounding_Analysis.md) | **Phân tích Toàn diện Cấp độ Token**, định lượng qua L18 Attention & Ngữ nghĩa. | Bác bỏ phân loại thủ công; xác lập ngưỡng toán học ($p_{50}, p_{75}, p_{90}$). Trên các từ nội dung thị giác cốt lõi, Cut đạt 58.3% vs Full 40.6% (+17.7%). Giải mã cơ chế Pre-nominal Visual Anchoring trên hư từ. |
 
 ---
 
@@ -66,7 +70,12 @@ Thực nghiệm đo trực tiếp **Visual Attention Mass của Target Model (`Q
 | **ULTRA-HEAVY** ($> p_{90}$) | 120 | 60.83% | **65.83%** | **$\mathbf{+5.00\%}$** | $[-3.33\%; +13.33\%]$ |
 | **GỘP TOP 25% HEAVY VISUAL** | 300 | 60.67% | **67.00%** | **$\mathbf{+6.33\%}$** | **$[+1.33\%; +11.00\%]$** |
 
-👉 **Ý nghĩa cốt lõi**: Ngay cả trên các token mà Target Model phải dồn sự chú ý thị giác cao nhất (Heavy/Ultra-Heavy Visual), **nhánh `Cut` visual vẫn đạt tỷ lệ chấp nhận cao hơn nhánh `Full` (+6.33% đến +7.22%)**. Điều này chứng minh text hidden states tại Layer 18 đã mang đầy đủ biểu diễn thị giác ngữ cảnh; việc đưa thêm visual tokens thô vào draft model chỉ gây thêm nhiễu attention.
+👉 **Ý nghĩa cốt lõi**: Ngay cả trên các token mà Target Model phải dồn sự chú ý thị giác cao nhất (Heavy/Ultra-Heavy Visual), **nhánh `Cut` visual vẫn đạt tỷ lệ chấp nhận cao hơn nhánh `Full` (+6.33% đến +7.22%)**. 
+
+* **Thẩm định ngữ nghĩa thực tế ([Báo Cáo 17](raw_reports/17_Comprehensive_Token_Level_Visual_Grounding_Analysis.md)):**
+  - **Nhóm từ nội dung (Content Words, chiếm 53%):** 100% là các từ thị giác cụ thể (`dirt bike`, `hammer`, `butterfly stroke`, `swimmer`, `underwater`, `gym`). Trên các từ này, nhánh `Cut` đạt Pass Rate **$58.3\%$** vs `Full` **$40.6\%$** (vượt trội **$+17.7\%$**).
+  - **Nhóm hư từ neo giữ (Function Words, chiếm 47%):** Các từ `'a'`, `'In'`, `'with'` lọt vào top attention do cơ chế **Pre-nominal Visual Anchoring** (mô hình nhìn trước video để chuẩn bị không gian ngữ nghĩa cho danh từ đứng sau).
+  - Điều này chứng minh toàn diện rằng text hidden states tại Layer 18 đã mang đầy đủ biểu diễn thị giác ngữ cảnh; việc đưa thêm các vector visual hidden $H[V]$ vào draft model chỉ gây thêm nhiễu phân tán attention. Chi tiết: [Báo Cáo 17](raw_reports/17_Comprehensive_Token_Level_Visual_Grounding_Analysis.md).
 
 ---
 

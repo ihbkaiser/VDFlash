@@ -6,6 +6,7 @@ Tài liệu này cung cấp quy trình chuẩn hóa từ đầu đến cuối (E
 
 > [!TIP]
 > ### 🚀 CÁCH CHẠY 1 LỆNH TỰ ĐỘNG DUY NHẤT (Dành cho người nhận chuyển giao)
+>
 > Mọi bước tải dữ liệu, tiền xử lý, feature caching, tạo config, chạy test và huấn luyện đã được tích hợp liên hoàn vào script [`scripts/run_visual10_selfdistill_b200.sh`](file:///home/tuantb/VDFlash/scripts/run_visual10_selfdistill_b200.sh). Người thực hiện chỉ cần gõ đúng 1 dòng lệnh:
 >
 > ```bash
@@ -22,13 +23,14 @@ Tài liệu này cung cấp quy trình chuẩn hóa từ đầu đến cuối (E
 ---
 
 ## Mục Lục
-1. [Kiến Trúc & Cơ Chế Huấn Luyện 3 Tín Hiệu](#1-kiến-trúc--cơ-chế-huấn-luyện-3-tín-hiệu)
-2. [Giai Đoạn 1: Kiểm Tra & Chuẩn Bị Môi Trường Server B200](#giai-đoạn-1-kiểm-tra--chuẩn-bị-môi-trường-server-b200)
-3. [Giai Đoạn 2: Tải Dữ Liệu & Checkpoints Từ Hugging Face](#giai-đoạn-2-tải-dữ-liệu--checkpoints-từ-hugging-face)
-4. [Giai Đoạn 3: Tiền Xử Lý Dữ Liệu & Offline Feature Caching](#giai-đoạn-3-tiền-xử-lý-dữ-liệu--offline-feature-caching)
-5. [Giai Đoạn 4: Chạy Smoke Test (Kiểm Tra FlexAttention & Dataloader)](#giai-đoạn-4-chạy-smoke-test-kiểm-tra-flexattention--dataloader)
+
+1. [Kiến Trúc &amp; Cơ Chế Huấn Luyện 3 Tín Hiệu](#1-kiến-trúc--cơ-chế-huấn-luyện-3-tín-hiệu)
+2. [Giai Đoạn 1: Kiểm Tra &amp; Chuẩn Bị Môi Trường Server B200](#giai-đoạn-1-kiểm-tra--chuẩn-bị-môi-trường-server-b200)
+3. [Giai Đoạn 2: Tải Dữ Liệu &amp; Checkpoints Từ Hugging Face](#giai-đoạn-2-tải-dữ-liệu--checkpoints-từ-hugging-face)
+4. [Giai Đoạn 3: Tiền Xử Lý Dữ Liệu &amp; Offline Feature Caching](#giai-đoạn-3-tiền-xử-lý-dữ-liệu--offline-feature-caching)
+5. [Giai Đoạn 4: Chạy Smoke Test (Kiểm Tra FlexAttention &amp; Dataloader)](#giai-đoạn-4-chạy-smoke-test-kiểm-tra-flexattention--dataloader)
 6. [Giai Đoạn 5: Huấn Luyện Full-Scale](#giai-đoạn-5-huấn-luyện-full-scale)
-7. [Giai Đoạn 6: Đánh Giá & Đo Đạc Acceptance Length ($\tau$)](#giai-đoạn-6-đánh-giá--đo-đạc-acceptance-length-tau)
+7. [Giai Đoạn 6: Đánh Giá &amp; Đo Đạc Acceptance Length ($\tau$)](#giai-đoạn-6-đánh-giá--đo-đạc-acceptance-length-tau)
 8. [Xử Lý Lỗi Thường Gặp (Troubleshooting)](#xử-lý-lỗi-thường-gặp-troubleshooting)
 
 ---
@@ -42,24 +44,24 @@ flowchart TD
     VideoPrompt["Video + Câu hỏi (Prompt)"] --> TargetM["Target Model (Qwen2.5-VL-3B) Full Visual [ĐÓNG BĂNG]"]
     TargetM --> TargetTokens["1. Target Greedy Tokens (Ground Truth)"]
     TargetM --> HiddenStates["Target Hidden States (5 Layers: 26, 28, 30, 32, 34)"]
-    
+  
     HiddenStates --> FullTeacher["Full DFlash Teacher [ĐÓNG BĂNG] (100% Visual Context)"]
     HiddenStates --> VisualSelector["Selector: Giữ 10% Visual Positions"]
-    
+  
     VisualSelector --> StudentDraft["Student DFlash [CẬP NHẬT WEIGHTS] (10% Visual Context)"]
-    
+  
     TargetTokens --> LossCE["Loss 1: Target-token CE"]
     StudentDraft --> LossCE
-    
+  
     FullTeacher --> TeacherProposals["2. Teacher Proposal Distribution"]
     StudentDraft --> LossKL["Loss 2: KL Divergence (Chưng cất)"]
     TeacherProposals --> LossKL
-    
+  
     TargetTokens --> GateCheck{"3. Target Gate: Teacher có đúng target?"}
     TeacherProposals --> GateCheck
     GateCheck -- "Đúng" --> ApplyKL["Cộng Full KL Loss"]
     GateCheck -- "Sai" --> MaskKL["Triệt tiêu hoặc giảm trọng số KL (Tránh học vẹt lỗi)"]
-    
+  
     LossCE --> TotalLoss["Total Loss: L_total = L_CE + lambda_KD * L_KL_gated"]
     ApplyKL --> TotalLoss
     MaskKL --> TotalLoss
@@ -70,12 +72,14 @@ flowchart TD
 ## Giai Đoạn 1: Kiểm Tra & Chuẩn Bị Môi Trường Server B200
 
 ### 1.1. Yêu cầu hệ thống
+
 - **Hệ điều hành**: Linux x86_64 (Ubuntu 22.04 LTS khuyến nghị).
 - **Phần cứng**: Tối thiểu 2x NVIDIA B200 (Blackwell SXM / PCIe) hoặc tương đương.
 - **CUDA & Driver**: CUDA $\ge 12.4$ / Driver R550+.
 - **Python**: 3.10 hoặc 3.11/3.12.
 
 ### 1.2. Kiểm tra GPU & Interconnect
+
 ```bash
 # 1. Kiểm tra trạng thái GPU và Driver
 nvidia-smi
@@ -85,7 +89,9 @@ nvidia-smi topo -m
 ```
 
 ### 1.3. Thiết lập Môi trường & Cài đặt Thư viện
+
 Từ thư mục gốc của repository:
+
 ```bash
 cd /home/tuantb/VDFlash
 
@@ -106,7 +112,9 @@ hf auth login
 ```
 
 ### 1.4. Kiểm tra FlexAttention (Backend Tăng Tốc Phần Cứng Mặc Định)
+
 GPU B200 tối ưu hóa việc training thông qua PyTorch 2.5+ `flex_attention`:
+
 ```bash
 python -c "
 import torch
@@ -134,7 +142,46 @@ sudo mkdir -p /models/Qwen2.5-VL-3B-Instruct
 sudo chown -R $USER:$USER /data /checkpoints /models
 ```
 
+### Sơ đồ cấu trúc thư mục tổng thể (Directory Tree)
+
+Dù lưu ở thư mục hệ thống `/data` hay lưu cục bộ ngay trong thư mục repository (`VDFlash/data/...`), toàn bộ cấu trúc dữ liệu được tổ chức thống nhất như sau:
+
+```text
+/data/dflash-posttraining/ (hoặc VDFlash/data/dflash-posttraining/)
+├── raw/                                # [TẢI VỀ] Raw video pool từ Hugging Face
+│   ├── annotations/
+│   ├── 0_30_s.tar.gz
+│   ├── 30_60_s.tar.gz
+│   ├── 1_2_m.tar.gz
+│   ├── 2_3_m.tar.gz
+│   └── download_status.json
+├── videos/                             # [TỰ ĐỘNG SINH] Video đã giải nén sau bước prepare
+├── manifests/                          # [TỰ ĐỘNG SINH] Danh sách mẫu train/val/test disjoint
+│   ├── train.jsonl
+│   ├── validation.jsonl
+│   └── test.jsonl
+├── responses/                          # [TỰ ĐỘNG SINH] Nhãn greedy tokens sinh bởi Target model
+│   ├── train.jsonl
+│   ├── validation.jsonl
+│   └── test.jsonl
+└── features/                           # [TỰ ĐỘNG SINH] DỮ LIỆU INPUT TRỰC TIẾP ĐỂ TRAIN
+    ├── train/                          # Chứa các shard hidden states (.pt) của tập train
+    └── validation/                     # Chứa các shard hidden states (.pt) của tập val
+
+/checkpoints/ (hoặc VDFlash/checkpoints/)
+├── phase2-dflash/                      # [TẢI VỀ] Checkpoint Teacher Phase 2
+│   └── qwen25vl-3b-dflash-llava68k-h32-depth3-latest/
+│       └── training_state.pt
+└── dflash-visual10/                    # [OUTPUT TRAIN] Nơi lưu checkpoint student sau khi train
+    ├── smoke_test/
+    └── run_final_b200/
+
+/models/ (hoặc VDFlash/models/)
+└── Qwen2.5-VL-3B-Instruct/             # [TẢI VỀ] Target Model gốc từ Hugging Face
+```
+
 ### 2.1. Tải Raw Video Pool từ Hugging Face
+
 Bộ dữ liệu thô phục vụ post-training được lưu tại repo dataset [`Tphuc15/dflash-posttraining-raw`](https://huggingface.co/datasets/Tphuc15/dflash-posttraining-raw):
 
 ```bash
@@ -148,6 +195,7 @@ hf download Tphuc15/dflash-posttraining-raw \
 > Thư mục tải về sẽ chứa các file `annotations/`, các tệp `.tar.gz` video đã được chia cụm theo thời lượng (`0_30_s`, `30_60_s`, `1_2_m`, `2_3_m`), kèm theo bản ghi checksum `download_status.json`.
 
 ### 2.2. Tải Checkpoint Teacher DFlash Phase 2
+
 Teacher DFlash được dùng để chưng cất proposal logits là checkpoint 3-layer (hoặc 5-layer) đã hoàn thành Phase 2 trên LLaVA-68K:
 
 ```bash
@@ -158,6 +206,7 @@ hf download Tphuc15/qwen25vl-3b-depth1-depth3 \
 ```
 
 ### 2.3. Tải mô hình Base Target (`Qwen2.5-VL-3B-Instruct`)
+
 ```bash
 hf download Qwen/Qwen2.5-VL-3B-Instruct \
   --local-dir /models/Qwen2.5-VL-3B-Instruct
@@ -178,6 +227,7 @@ flowchart LR
 ```
 
 ### Bước 3.1: Trích xuất video và lập manifests phân chia train/val/test
+
 Lệnh này phân chia 3.000 mẫu train, 250 mẫu validation, và 250 mẫu test bảo đảm **cách ly video 100% (video-disjoint)**:
 
 ```bash
@@ -195,6 +245,7 @@ python -m src.train_VLM.prepare_posttraining prepare \
 ```
 
 ### Bước 3.2: Sinh nhãn Target greedy tokens
+
 Sử dụng Target model `Qwen2.5-VL-3B-Instruct` full-visual để decode greedy các nhãn token chuẩn:
 
 ```bash
@@ -206,15 +257,18 @@ python -m src.train_VLM.prepare_posttraining targets \
 ```
 
 ### Bước 3.3: Thẩm định toàn vẹn dữ liệu
+
 ```bash
 python -m src.train_VLM.prepare_posttraining validate \
   --data-dir /data/dflash-posttraining \
   --require-target-responses
 ```
+
 > [!IMPORTANT]
 > Chỉ tiếp tục bước tiếp theo khi `validation_report.json` trả về `"status": "valid"` và `"video_split_overlap": 0`.
 
 ### Bước 3.4: Cache target hidden states (5 Layers)
+
 Để quá trình train student đạt throughput tối đa trên B200, toàn bộ target hidden states ở 5 layer (`[26, 28, 30, 32, 34]`) được pre-compute và lưu thành các shard tensor nén:
 
 ```bash
@@ -233,6 +287,7 @@ python -m src.train_VLM.cache_visual10_selfdistill_features \
 Trước khi chạy toàn bộ 3.000 mẫu, cần tạo file config smoke test để xác nhận tính ổn định của memory và distributed execution trên B200.
 
 ### 4.1. Tạo config smoke test
+
 Tạo file [`configs/smoke_visual10_b200.yaml`](file:///home/tuantb/VDFlash/configs/smoke_visual10_b200.yaml):
 
 ```yaml
@@ -284,6 +339,7 @@ deployment:
 ```
 
 ### 4.2. Chạy lệnh Smoke Run
+
 ```bash
 torchrun --nproc_per_node=2 \
   -m specforge.cli train \
@@ -292,6 +348,7 @@ torchrun --nproc_per_node=2 \
 ```
 
 **Tiêu chí pass Smoke Run:**
+
 - Step 0 JIT compile Triton mask kernel thành công không có exception.
 - Loss CE và Loss KL giảm dần hoặc ổn định.
 - Không phát sinh CUDA OOM trong quá trình forward full-vocabulary projection.
@@ -303,6 +360,7 @@ torchrun --nproc_per_node=2 \
 Sau khi Smoke Run đạt chuẩn, khởi chạy production run với file cấu hình chuẩn [`src/train_Dflash_SpecForge/examples/configs/qwen25vl-3b-dflash-visual10-selfdistill.yaml`](file:///home/tuantb/VDFlash/src/train_Dflash_SpecForge/examples/configs/qwen25vl-3b-dflash-visual10-selfdistill.yaml):
 
 ### 5.1. File cấu hình chuẩn sản xuất
+
 ```yaml
 model:
   target_model_path: /models/Qwen2.5-VL-3B-Instruct
@@ -359,6 +417,7 @@ deployment:
 ```
 
 ### 5.2. Khởi chạy huấn luyện Full trong phiên `tmux`
+
 ```bash
 tmux new -s train_visual10
 
@@ -386,6 +445,7 @@ python -m src.train_VLM.evaluate_visual10_selfdistill \
 ```
 
 ### Các chỉ số nghiệm thu cốt lõi:
+
 1. **$\tau$ (Prefix Acceptance Length)**: Số token trung bình mà Target chấp nhận trong mỗi block proposal. Ngưỡng kỳ vọng: $\tau_{\text{student-10\%}} \ge 0.95 \times \tau_{\text{teacher-full}}$.
 2. **Speedup Thực Tế (Wall-clock speedup)**: Đo tốc độ sinh token tổng thể bao gồm cả prefill + verify. Ngưỡng kỳ vọng: Tăng tốc $1.8\times - 2.5\times$ so với autoregressive chuẩn của Target.
 3. **Draft Latency**: Giảm $\ge 70\%$ thời gian tính toán draft forward do chỉ xử lý 10% visual tokens qua Triton sparse block kernel.
@@ -394,9 +454,9 @@ python -m src.train_VLM.evaluate_visual10_selfdistill \
 
 ## Xử Lý Lỗi Thường Gặp (Troubleshooting)
 
-| Tình huống lỗi | Nguyên nhân | Biện pháp xử lý |
-| :--- | :--- | :--- |
+| Tình huống lỗi                               | Nguyên nhân                                                                    | Biện pháp xử lý                                                                                                         |
+| :---------------------------------------------- | :------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------- |
 | **CUDA OOM tại bước logit projection** | Vocab size của Qwen2.5 là 152.064 tokens, khi nhân tensor lớn dễ tràn VRAM | Giảm `objective_chunk_blocks` từ `4` xuống `1` hoặc `2` trong config YAML để chia nhỏ chunk tính toán loss |
-| **FlexAttention compile fail ở Step 0** | PyTorch chưa được build kèm Triton tương thích với kiến trúc GPU | Cài đặt PyTorch nightly hoặc bản build chính thức hỗ trợ CUDA 12.4+/Blackwell |
-| **Missing visual features trong cache** | Video bị lỗi giải mã hoặc đường dẫn video tương đối không khớp | Kiểm tra lại `validation_report.json`, đảm bảo cờ `--resume` được bật khi chạy lại feature caching |
-| **Overlap giữa train và validation** | Bộ sinh số ngẫu nhiên bị duplicate hash | Sử dụng `prepare_posttraining validate` kiểm tra `video_split_overlap == 0` |
+| **FlexAttention compile fail ở Step 0**  | PyTorch chưa được build kèm Triton tương thích với kiến trúc GPU      | Cài đặt PyTorch nightly hoặc bản build chính thức hỗ trợ CUDA 12.4+/Blackwell                                      |
+| **Missing visual features trong cache**   | Video bị lỗi giải mã hoặc đường dẫn video tương đối không khớp    | Kiểm tra lại `validation_report.json`, đảm bảo cờ `--resume` được bật khi chạy lại feature caching          |
+| **Overlap giữa train và validation**    | Bộ sinh số ngẫu nhiên bị duplicate hash                                     | Sử dụng `prepare_posttraining validate` kiểm tra `video_split_overlap == 0`                                          |

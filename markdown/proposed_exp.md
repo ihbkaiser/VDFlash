@@ -17,6 +17,20 @@ Báo cáo chi tiết, hình và bảng truy vết: [bộ tổng hợp 6/11/2026]
   - *Draft Proposal Recall:* Toàn cục suy giảm cực nhỏ khi Cut visual: R@1 = 19,50% (Cut) vs 19,59% (Full), R@5 = 42,99% (Cut) vs 43,65% (Full).
   - *Slot 1 áp đảo:* Drafter đạt R@1 = 65,00%, R@2 = 78,72%, R@5 = 89,19% ngay cả khi Cut visual (Median rank = 1,0 cả Full và Cut).
   - *Nghịch lý đảo chiều ở Long Video 25K:* Ở 25.000 tokens, **Cut vượt trội hơn Full** cả về R@1 (+0,67 điểm %), R@2 (+0,84 điểm %) và R@5 (+0,45 điểm %). Visual context ở 25K gây loãng attention của drafter nhỏ; Cut visual giúp Drafter tập trung vào text states và đạt proposal recall sắc bén hơn. Chi tiết: [Báo cáo 14](Visualcut_retention_report/raw_reports/14_Visual_Recall_Analysis.md).
+- **Đánh giá DFlash 1-Layer (Depth 1) trên Long Video 25.000 Tokens (11/11/2026 - Báo cáo 15):**
+  - Thử nghiệm trên toàn bộ cohort 15 video dài VDC-15 tại mốc 25K tokens (24.192 – 25.800 visual tokens).
+  - *Miễn nhiễm sụp đổ baseline:* DFlash 1-layer (98M params, 1 Transformer layer) giữ vững $\tau_{\text{Full}} = 1,9180 \pm 0,1287$ và $\tau_{\text{Cut}} = 1,9617 \pm 0,1206$, bác bỏ giả thuyết 1-layer sụp đổ như ở kiến trúc Sparrow/MSD.
+  - *Visual Cut vượt trội có ý nghĩa thống kê:* $\Delta \tau = +0,0437$ (+2,28%), paired t-test $t = 2,460$, **$p = 0,0275 < 0,05$** (11/15 video tăng hoặc giữ nguyên).
+  - *Tăng tốc thực tế:* Speedup tăng từ $0,92\text{x} \to 0,97\text{x}$ nhờ triệt tiêu chi phí KV routing trên 25.000 visual vectors. Chi tiết: [Báo cáo 15](Visualcut_retention_report/raw_reports/15_DFlash_Depth1_LongVideo_25K_Evaluation.md).
+- **Đánh giá DSpark Phase 1 (ShareGPT-68K Text-Only) trên Ma Trận VDC-15 (11/11/2026 - Báo cáo 16):**
+  - Thử nghiệm trên 60 trường hợp đối đầu (4 budgets: 400, 3K, 13K, 25K $\times$ 15 video VDC-15) với Drafter 3-layer thuần text chưa từng học visual data.
+  - *Duy trì tỷ lệ chấp nhận 98,77% toàn cục:* Overall $\tau_{\text{Full}} = 1,5037$, $\tau_{\text{Cut}} = 1,4852$ ($\Delta \tau = -0,0184$, giảm chỉ 1,23%).
+  - *Tương đương hoàn toàn ở 400, 3K, 13K:* Ở Budget 400 ($p = 0,9927$), Budget 3K ($p = 0,4584$), Budget 13K ($p = 0,6109$), sự khác biệt giữa Full và Cut không có ý nghĩa thống kê.
+  - *Xác nhận tính phổ quát:* Drafter thuần text vẫn suy luận video xuất sắc nhờ kênh Target Text States đã được Teacher nội tại hóa toàn diện. Chi tiết: [Báo cáo 16](Visualcut_retention_report/raw_reports/16_DSpark_Phase1_ShareGPT68K_Matrix_Evaluation.md).
+- **Phân tích toàn diện cấp độ Token & Thẩm định Ngữ nghĩa (12/11/2026 - Báo cáo 17):**
+  - Khắc phục tính chủ quan của phân loại heuristic; xác lập ngưỡng toán học khách quan qua Target Attention Layer 18 ($m^* = 18$) với các phân vị $p_{50}=1,1124$, $p_{75}=1,5054$ (Heavy) và $p_{90}=1,9700$ (Ultra).
+  - *Thẩm định ngữ nghĩa:* Nhóm Content Words (~53% Heavy/Ultra) là 100% từ thị giác chuyên biệt (`dirt bike`, `butterfly stroke`, `hammer`, `swimmer`). Trên nhóm này, nhánh Cut đạt Pass Rate **58,3%** vs Full **40,6%** (vượt trội **+17,7%**).
+  - *Cơ chế Pre-nominal Anchoring:* Hư từ (`a`, `In`, `with`, chiếm ~47%) có attention L18 cao do cơ chế neo giữ thông tin thị giác tiền danh từ trong mô hình autoregressive. Chi tiết: [Báo cáo 17](Visualcut_retention_report/raw_reports/17_Comprehensive_Token_Level_Visual_Grounding_Analysis.md).
 
 ### Prefix acceptance, first rejection và lexical proxy
 
@@ -41,10 +55,12 @@ Báo cáo chi tiết, hình và bảng truy vết: [bộ tổng hợp 6/11/2026]
 1. Không có quy tắc chung rằng video càng dài thì càng nên Cut visual; hiệu ứng phụ thuộc budget, layer selection và corpus.
 2. `τ_effective` có thể che khuất thay đổi ở vị trí proposal; acceptance, answer quality và latency phải đo riêng.
 3. **Target text states là kênh truyền tải thông tin video chủ đạo sang DFlash:** Khi Target bị triệt tiêu thông tin video (A), số token đề xuất đúng liên tiếp của DFlash sụt giảm đều đặn **~32,4% ở Full** và **~31,7% ở Cut**.
-4. **Visual tokens trực tiếp trong DFlash không bù đắp được khi text states bị hỏng:** ở nhánh A, visual tokens trực tiếp chỉ giúp kéo lại $+0,040$ token/round (thấp hơn cả $+0,073$ ở G). Do đó, nhồi 100% visual context vào DFlash khi xử lý long video là không cần thiết và tốn kém conditioning cost.
+4. **Target visual hidden states $H[V]$ không bù đắp được khi text states bị hỏng:** Cần lưu ý DFlash chỉ nhận đầu vào là Target Hidden States chứ không nhận raw visual tokens. Ở nhánh A, dù Drafter vẫn được cấp đầy đủ Target visual hidden states chuẩn $H_G[V]$, sự hiện diện của $H_G[V]$ chỉ giúp kéo lại $+0,040$ token/round (thấp hơn cả $+0,073$ ở G). Do đó, nhồi hàng vạn vector visual hidden $H[V]$ vào KV cache của DFlash khi xử lý long video là không cần thiết và tốn kém chi phí attention.
 5. Noise control cho contrast khác A; một seed và một cách match norm chưa đủ để phân biệt can thiệp video với OOD/perturbation nói chung.
 6. Lexical overlap cho kết luận nhạy với estimand và matched control; chỉ nên giữ làm phân tích phụ.
 7. Động lực thực nghiệm vững chắc cho **Self-Distillation 10% Visual DFlash**: Huấn luyện student chỉ cần 10% visual context bằng Target CE + Full-DFlash KL để tận dụng tối đa kênh text states mà tiết kiệm 90% chi phí conditioning.
+8. **DFlash 1-layer miễn nhiễm sụp đổ baseline và Visual Cut vượt trội ở 25K tokens:** Target text states $H[T]$ đã nội tại hóa (internalised) toàn bộ thông tin thị giác tinh chế. Drafter 1-layer cắt bỏ 100% visual context ($H[V]$) giúp triệt tiêu hiện tượng loãng chú ý (attention dispersion), cải thiện có ý nghĩa thống kê $\tau_{\text{eff}}$ từ 1,918 lên 1,962 ($p = 0,0275 < 0,05$) và tăng tốc độ suy luận thêm $+0,05\text{x}$.
+9. **Drafter thuần text (DSpark Phase 1) duy trì 98,77% hiệu năng khi Cut visual:** DSpark chỉ nhận Target hidden states. Khi chỉ train trên text ShareGPT, Drafter vẫn đạt $\tau \approx 1,50$ trên cả 4 budgets, và Cut (bỏ $H[V]$) hoàn toàn tương đương Full ở 400, 3K, 13K ($p > 0,45$). Điều này chứng minh Drafter hoạt động chủ yếu dựa trên Target text states $H[T]$ chứ không phụ thuộc vào việc duy trì các Target visual vectors $H[V]$ trong KV cache.
 
 ## 3. Hướng thực nghiệm tiếp theo
 

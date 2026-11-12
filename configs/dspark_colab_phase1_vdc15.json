@@ -1,0 +1,32 @@
+{
+  "repo_root": "/content/vdflash",
+  "run_id": "dspark_3layer_1_9_17_25_33_phase1_vdc15",
+  "manifest": "/content/vdc50_data/test.jsonl",
+  "video_root": "/content/vdc50_data",
+  "calibration": "/content/vdflash_dspark/results/calibration_v5_decord/calibration.jsonl",
+  "cohort_selection": "/content/vdflash_dspark/results/calibration_v5_decord/cohort_selection.json",
+  "target_model": "/content/models/Qwen2.5-VL-3B-Instruct",
+  "checkpoint_names": [
+    "dspark_3layer_1_9_17_25_33_phase1"
+  ],
+  "checkpoint_root": "/content/vdflash_dspark/extracted",
+  "output_dir": "/content/experiment/dspark_phase1_vdc15",
+  "target_visual_tokens": [
+    400,
+    3000,
+    13000,
+    25000
+  ],
+  "conditions": [
+    "full",
+    "zero",
+    "cut",
+    "retained_75",
+    "retained_50",
+    "retained_25"
+  ],
+  "sample_limit_per_chunk": 15,
+  "max_new_tokens": 256,
+  "device": "cuda:0",
+  "dtype": "bf16"
+}
